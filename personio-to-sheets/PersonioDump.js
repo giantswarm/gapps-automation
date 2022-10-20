@@ -9,7 +9,7 @@
  *          Script Property Value: FULL_PERSONIO_API_URL|PERSONIO_CLIENT_ID|PERSONIO_CLIENT_SECRET
  *
  *     EXAMPLE:
- *         "personio-dump.1wX-VnjLVkBL74SC-8qMt_oeib4VGMlDpZuJzrd_NZUE": "/company/employees|lkjklasdj|lkjakasd|"
+ *         "PersonioDump.1wX-VnjLVkBL74SC-8qMt_oeib4VGMlDpZuJzrd_NZUE": "/company/employees|lkjklasdj|lkjakasd|"
  *
  *   - The target sheet must be accessible (shared with) the account running the script, for example:
  *
@@ -28,7 +28,7 @@ const DEFAULT_VALUE_INPUT_OPTION = VALUE_INPUT_OPTIONS.RAW;
  *
  * Making this dynamic didn't work as DriveApp.getFileById() tends to throw 500s and is otherwise quite slow.
  */
-const PROPERTY_PREFIX = 'personio-dump.';
+const PROPERTY_PREFIX = 'PersonioDump.';
 
 
 /** Main entry point.
