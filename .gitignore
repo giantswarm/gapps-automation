@@ -1,3 +1,5 @@
 .clasp.json
 .idea
 gapps-automation.iml
+venv
+credentials.json

@@ -9,7 +9,7 @@
  *          Script Property Value: FULL_PERSONIO_API_URL|PERSONIO_CLIENT_ID|PERSONIO_CLIENT_SECRET
  *
  *     EXAMPLE:
- *         "PersonioDump.1wX-VnjLVkBL74SC-8qMt_oeib4VGMlDpZuJzrd_NZUE": "/company/employees|lkjklasdj|lkjakasd|"
+ *         "PersonioDump.1wX-VnjLVkBL74SC-8qMt_oeib4VGMlDpZuJzrd_NZUE": "/company/employees.json|lkjklasdj|lkjakasd|"
  *
  *   - The target sheet must be accessible (shared with) the account running the script, for example:
  *
@@ -30,12 +30,15 @@ const DEFAULT_VALUE_INPUT_OPTION = VALUE_INPUT_OPTIONS.RAW;
  */
 const PROPERTY_PREFIX = 'PersonioDump.';
 
+/** The trigger handler function to call in time based triggers. */
+const TRIGGER_HANDLER_FUNCTION = 'dumpPersonio';
+
 
 /** Main entry point.
  *
  * Take configuration from ScriptProperties and perform synchronization.
  */
-function sync() {
+function dumpPersonio() {
 
     let firstError = null;
 
@@ -72,6 +75,36 @@ function sync() {
     if (firstError) {
         throw firstError;
     }
+}
+
+
+/** Uninstall time based execution trigger for this script. */
+function uninstall() {
+    // Remove pre-existing triggers
+    const triggers = ScriptApp.getProjectTriggers();
+    for (const trigger of triggers) {
+        if (trigger.getHandlerFunction() === TRIGGER_HANDLER_FUNCTION) {
+            ScriptApp.deleteTrigger(trigger);
+            Logger.log("Uninstalled time based trigger for %s", TRIGGER_HANDLER_FUNCTION);
+        }
+    }
+}
+
+
+/** Setup for periodic execution and do some checks. */
+function install(delayMinutes) {
+    uninstall();
+
+    Logger.log("Installing time based trigger: %s", delayMinutes);
+    const delay = delayMinutes || 30;
+
+    ScriptApp.newTrigger(TRIGGER_HANDLER_FUNCTION)
+        .timeBased()
+        .everyMinutes(delay)
+        //.everyHours(1)
+        .create();
+
+    Logger.log("Installed time based trigger for %s every %s minutes", TRIGGER_HANDLER_FUNCTION, delay);
 }
 
 
