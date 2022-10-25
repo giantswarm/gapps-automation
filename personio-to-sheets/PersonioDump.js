@@ -171,59 +171,145 @@ function getTasks_() {
  */
 function transformPersonioDataToRelations_(data) {
 
-    const relations = {};  // ie. types
+    const relations = {};  // ie. tables in a relational schema
 
-    for (const item of data) {
+    const hasParentOfType = (parents, relType) => !!parents.find(parent => parent.type === relType);
 
-        // make multiple relations (by field type) support optional?
-        if (!item || !item.type)
-            continue;
+    const getItemType = (item) => item?.type;
 
-        // TODO Implement more fields here?
+    const getItemId = (item) => {
+        if (item?.attributes) {
+            const idOrObject = item.attributes['id'];
+            return Util.isObject(idOrObject) ? idOrObject.value : idOrObject;
+        }
+        return '';
+    };
+
+    // scan an object, recursively, returns true if object was handled, false otherwise
+    // TODO Are there more field values (except attributes)?
+    const scanObject = (item, parents) => {
+
         // map attribute labels to columns
-        const attrs = item.attributes;
-        if (!attrs)
-            continue;
+        const attrs = item?.attributes;
+        const itemType = getItemType(item);
+        if (!Util.isObject(attrs) || !itemType)
+            return undefined;  // can't handle in a meaningful way (has no attributes or type)
 
-        if (relations[item.type] === undefined) {
-            relations[item.type] = {headers: {}, rows: []};
+        if (hasParentOfType(parents, itemType))
+            return itemType;
+
+        if (!relations[itemType]) {
+            relations[itemType] = {headers: {}, rows: [], ids: {'': false}};
         }
 
-        const relation = relations[item.type];
+        const relation = relations[itemType];
 
         for (const id in attrs) {
             if (!relation.headers[id]) {
-                // track columns
-                // TODO Can we guarantee they are always the same for each object?
                 const attr = attrs[id];
-                const label = (attr.label || '').trim();
-                const uniform_id = (attr.uniform_id || '').trim();
-                relation.headers[id] = label || uniform_id || id.trim();
+                // track nested types
+                const value = attr && attr.value !== undefined ? attr.value : attr;
+
+                const values = Array.isArray(value) ? value : [value];
+                for (const unpackedValue of values)
+                {
+                    if (unpackedValue === null || unpackedValue === undefined) {
+                        // skip or register later
+                        // TODO This will drop columns/relations with all values set to NULL
+                        // TODO This could lead to schema inconsistencies without schema LOAD/SAVE support
+                        continue;
+                    }
+
+                    // TODO We support only uniform values in arrays
+                    let foreignType = null;
+                    if (Util.isObject(unpackedValue)) {
+                        foreignType = scanObject(unpackedValue, parents.concat([item]));
+                        if (!foreignType) {
+                            continue;
+                        }
+
+                        // nested (possibly circular object)
+                    }
+
+                    // track columns
+                    const label = (attr?.label || '').trim();
+                    const uniform_id = (attr?.uniform_id || '').trim();
+                    relation.headers[id] = {
+                        title: (label || uniform_id || id.trim()) + (foreignType ? '_' + foreignType + '_id' : ''),
+                        foreignType: foreignType
+                    };
+                }
             }
         }
-    }
 
-    // first rows for each relation (headers)
-    for (const relType in relations) {
-        const relation = relations[relType];
-        relation.rows.push(Object.values(relation.headers));
-    }
+        return itemType;
+    };
 
+    // convert values recursively, returns true if item was handled, false if not
     // TODO Are there more field values (except attributes)?
-    for (const item of data) {
+    const convertObject = (item, parents) => {
 
-        if (!item || !item.type)
-            continue;
-
-        const relation = relations[item.type];
+        const itemType = getItemType(item);
+        const relation = relations[itemType];
         if (!relation)
-            continue;
+            return undefined;
+
+        if (hasParentOfType(parents, itemType))
+            return itemType;
+
+        // filter out duplicate rows by ID
+        const itemId = getItemId(item);
+        if (relation.ids[itemId]) {
+            return itemType;
+        } else {
+            relation.ids[itemId] = true;
+        }
 
         const row = [];
-        for (const header in relation.headers) {
-            row.push(item.attributes[header]?.value);
+        for (const column in relation.headers) {
+            const header = relation.headers[column];
+            const attr = item.attributes[column];
+            const value = attr && attr.value !== undefined ? attr.value : attr;
+
+            const values = Array.isArray(value) ? value : [value];
+            let field = [];
+            for (const unpackedValue of values) {
+                if (header.foreignType) {
+                    // TODO Should we push "name" or smth else or just the foreign key?
+                    field.push(getItemId(unpackedValue));
+
+                    // nested type, in case of loop just store id
+                    convertObject(unpackedValue, parents.concat([item]));
+                } else {
+                    // plain value, null/undefined -> ''
+                    field.push(unpackedValue === null || unpackedValue === undefined ? '' : unpackedValue);
+                }
+            }
+
+            row.push(field.join(','));
         }
+
         relation.rows.push(row);
+
+        return itemType;
+    };
+
+    // #1 Build schema (scan data returned from API)
+    // TODO LOAD schema support in ScriptProperty? (To be able to automatically version control a stable schema)
+    for (const item of data) {
+        scanObject(item, []);
+    }
+    // TODO STORE schema support in ScriptProperty? (To be able to automatically version control a stable schema)
+
+    // #2 Set headers (first rows for each relation)
+    for (const relType in relations) {
+        const relation = relations[relType];
+        relation.rows.push(Object.values(relation.headers).map(header => header.title));
+    }
+
+    // #3 Convert data (rows)
+    for (const item of data) {
+        convertObject(item, []);
     }
 
     return relations;
