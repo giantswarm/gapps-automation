@@ -166,13 +166,13 @@ function getTasks_() {
                 if (sourceSpec.url && sourceSpec.clientId && sourceSpec.clientSecret) {
                     tasks.push({spreadsheetId: spreadsheetId, source: sourceSpec});
                 } else {
-                    Logger.log("Empty fields in property value for key %s: %s", key, rawProperty);
+                    Logger.log("Skipped task: Empty fields in property value for key %s: %s", key, rawProperty);
                 }
             } else {
-                Logger.log("Expected 3 fields (URL, CLIENT_ID, CLIENT_SECRET) in property value for key %s: %s", key, rawProperty);
+                Logger.log("Skipped task: Expected 3 fields (URL, CLIENT_ID, CLIENT_SECRET) in property value for key %s: %s", key, rawProperty);
             }
         } catch (e) {
-            Logger.log('Incorrect API config for property key %s: %s', key, e.message);
+            Logger.log('Skipped task: Incorrect API config for property key %s: %s', key, e.message);
         }
     }
 
@@ -365,7 +365,7 @@ function writeRelationsToSheet_(spreadsheetId, relations, valueInputOption) {
         switch (typeof value) {
             case 'boolean':
                 return {boolValue: value};
-            case 'number':
+            case 'number': // fall-through
             case 'bigint':
                 return {numberValue: value};
             case 'string':
