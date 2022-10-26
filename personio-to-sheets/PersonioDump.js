@@ -169,7 +169,7 @@ function getTasks_() {
                     Logger.log("Empty fields in property value for key %s: %s", key, rawProperty);
                 }
             } else {
-                Logger.log("Expect 3 fields (URL, CLIENT_ID, CLIENT_SECRET) in property value for key %s: %s", key, rawProperty);
+                Logger.log("Expected 3 fields (URL, CLIENT_ID, CLIENT_SECRET) in property value for key %s: %s", key, rawProperty);
             }
         } catch (e) {
             Logger.log('Incorrect API config for property key %s: %s', key, e.message);
