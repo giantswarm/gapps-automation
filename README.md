@@ -15,35 +15,37 @@ Extensive documentation here: https://developers.google.com/apps-script/guides/c
 
  1. Enable Google Apps Script API
     https://script.google.com/u/1/home/usersettings
- 2. Login using clasp:
-    1. Globally with a valid Google account:
-       ```sh
-       clasp login
-       ```
-       The login info is stored in `~/.clasprc.json`.
-    2. Then "locally" inside the relevant script project directory:
-       ```sh
-       clasp login --creds <OAUTH2_GOOGLE_CLOUD_PROJECT_CLIENT_SECRET_FILE>
-       ```
+ 2. Login globally using clasp
+    ```sh
+    clasp login
+    ```
+    The login info is stored in `~/.clasprc.json`.
  3. Change into the relevant project sub directory
- 4. Upload local files to drive:
+    ```sh
+    cd personio-to-sheets
+    ```
+ 4. Login "locally" inside the script project directory:
+    ```sh
+    clasp login --creds <OAUTH2_GOOGLE_CLOUD_PROJECT_CLIENT_SECRET_FILE>
+    ```
+ 5. Upload local files to drive:
     ```sh
     clasp push
     ```
- 5. Deploy this new version:
+ 6. Deploy this new version:
     ```sh
     clasp deploy
     ```
- 6. Configure properties for the scripts using the builtin helper function:
+ 7. Configure properties for the scripts using the builtin helper function:
     ```sh
     clasp run 'setProperties' --params '[{"KEY": "VALUE"}, true]'
     ```
- 7. Install automated script functions:
+ 8. Install automated script functions:
     ```sh
     # install a script (argument "5" could be the delay in minutes)
     clasp run 'install' --params '[5]'  
     ```
- 8. Uninstall automated script function:
+ 9. Uninstall automated script function:
     ```sh
     clasp run 'uninstall' # remove trigger(s) for the relevant project
     ```
