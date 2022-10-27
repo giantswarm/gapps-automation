@@ -1,7 +1,7 @@
 
 # Apps Script Automation Projects
 
-Apps Script based automation uses Google's `clasp` tool for automating the build/release/deploy workflow.
+Apps Script based automation, managed via Google's `clasp` tool (build/release/deploy).
 
 Extensive documentation here: https://developers.google.com/apps-script/guides/clasp
 
