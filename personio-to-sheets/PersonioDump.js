@@ -124,7 +124,9 @@ function install(delayMinutes) {
 /** Helper function to configure the required script properties.
  *
  * USAGE EXAMPLE:
- *   clasp run 'setProperties' --params '[{"persionio-dump.SHEET_ID": "SOME_PERSONIO_URL|CLIENT_ID|CLIENT_SECRET"}, true]'
+ *   clasp run 'setProperties' --params '[{"persionio-dump.SHEET_ID": "SOME_PERSONIO_URL|CLIENT_ID|CLIENT_SECRET"}, false]'
+ *
+ * Warning: passing argument true for parameter deleteAllOthers will also cause the schema to be reset!
  */
 function setProperties(properties, deleteAllOthers) {
     PropertiesService.getScriptProperties().setProperties(properties, deleteAllOthers);
@@ -144,7 +146,7 @@ function getTasks_() {
     for (const key in properties) {
 
         const safeKey = key.trim();
-        if (!safeKey.startsWith(PROPERTY_PREFIX))
+        if (!safeKey.startsWith(PROPERTY_PREFIX) || safeKey === PROPERTY_PREFIX + 'schema')
             continue;
 
         const spreadsheetId = safeKey.replace(PROPERTY_PREFIX, '');
@@ -192,7 +194,46 @@ function getTasks_() {
  */
 function transformPersonioDataToRelations_(data) {
 
-    const relations = {};  // ie. tables in a relational schema
+    const relations = {version: 0};  // ie. tables in a relational schema
+
+    const calculateUtf8Size = str => {
+        // returns the byte length of an utf8 string
+        let s = str.length;
+        for (let i = str.length - 1; i >= 0; i--) {
+            let code = str.charCodeAt(i);
+            if (code > 0x7f && code <= 0x7ff) s++;
+            else if (code > 0x7ff && code <= 0xffff) s += 2;
+            if (code >= 0xDC00 && code <= 0xDFFF) i--; //trail surrogate
+        }
+        return s;
+    };
+
+    const loadSchema = () => {
+        const existingSchema = PropertiesService.getScriptProperties().getProperty(PROPERTY_PREFIX + 'schema');
+        if (existingSchema) {
+            const schema = JSON.parse(existingSchema);
+            // copy properties
+            for (const relType in schema) {
+                relations[relType] = schema[relType];
+            }
+
+            Logger.log("Loaded schema: version=%s, size=%s (max 9216)", relations.version, calculateUtf8Size(existingSchema));
+        } else {
+            Logger.log("No existing schema found");
+        }
+    };
+
+    const saveSchema = () => {
+        // Persist updated schema version
+        const schema = {version: relations.version};
+        for (const relType in schema) {
+            schema[relType] = {headers: relations[relType].headers};
+        }
+
+        const updatedSchema = JSON.stringify(relations);
+        Logger.log("Saving schema: version=%s, size=%s (max 9216)", relations.version, calculateUtf8Size(updatedSchema));
+        PropertiesService.getScriptProperties().setProperty(PROPERTY_PREFIX + 'schema', updatedSchema);
+    };
 
     const hasParentOfType = (parents, relType) => !!parents.find(parent => parent.type === relType);
 
@@ -227,8 +268,11 @@ function transformPersonioDataToRelations_(data) {
 
         for (const id in attributes) {
 
-            if (relation.headers[id])
-                continue; // already registered
+            let header = relation.headers[id];
+            if (header && header.v === relations.version) {
+                // header already scanned
+                continue;
+            }
 
             const attribute = attributes[id];
             const value = unboxValue(attribute);
@@ -254,10 +298,13 @@ function transformPersonioDataToRelations_(data) {
                 // add column header
                 const label = (attribute?.label || '').trim();
                 const uniform_id = (attribute?.uniform_id || '').trim();
-                relation.headers[id] = {
-                    title: (label || uniform_id || id.trim()) + (foreignType ? '_' + foreignType + '_id' : ''),
-                    foreignType: foreignType
-                };
+                if (!header) {
+                    // new column found
+                    relation.headers[id] = header = {};
+                }
+                header.title = (label || uniform_id || id.trim()) + (foreignType ? '_' + foreignType + '_id' : '');
+                header.foreignType = foreignType != null ? foreignType : undefined;
+                header.v = relations.version;
             }
         }
 
@@ -312,15 +359,23 @@ function transformPersonioDataToRelations_(data) {
     };
 
     // #1 Build schema (scan data returned from API)
+    loadSchema();
+    ++relations.version;
     for (const item of data) {
         scanObject(item, []);
     }
+    // Persist updated schema version
+    saveSchema();
 
     // #2 Set headers (first rows for each relation)
     for (const relType in relations) {
+        if (relType === 'version')
+            continue;
+
         const relation = relations[relType];
         relation.rows.push(Object.values(relation.headers).map(header => header.title));
     }
+
 
     // #3 Convert data (rows)
     for (const item of data) {
@@ -380,6 +435,9 @@ function writeRelationsToSheet_(spreadsheetId, relations, valueInputOption) {
     const batch = {requests: []};
 
     for (const [relType, relation] of Object.entries(relations)) {
+
+        if (relType === 'version')
+            continue;
 
         const sheetProperties = getOrAddSheet_(spreadsheetId, relType);
         const sheetId = getOrAddSheet_(spreadsheetId, relType).sheetId;
