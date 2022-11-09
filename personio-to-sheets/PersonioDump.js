@@ -440,7 +440,7 @@ function writeRelationsToSheet_(spreadsheetId, relations, valueInputOption) {
             continue;
 
         const sheetProperties = getOrAddSheet_(spreadsheetId, relType);
-        const sheetId = getOrAddSheet_(spreadsheetId, relType).sheetId;
+        const sheetId = sheetProperties.sheetId;
         const rowCount = sheetProperties.gridProperties.rowCount;
         const columnCount = sheetProperties.gridProperties.columnCount;
         const targetRowCount = relation.rows.length;
