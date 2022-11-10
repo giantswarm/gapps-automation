@@ -79,8 +79,7 @@ const calculateVesting = function (shares, start, end1, end2, end3, excludedMont
         const cliffMonthsRemaining = milliesToMonths((start + monthsToMillies(VESTING_CLIFF_MONTHS)) - now);
         return richOutput ? 'vesting cliff not reached, yet: remaining months: ' + Math.ceil(cliffMonthsRemaining) : 0;
     }
-
-    // TODO Probably need some rounding (to days?) here?
+    
     const vesting25_months_total = Math.max(0, milliesToMonths(end1 - start));
     const vesting50_months_total = Math.max(0, milliesToMonths(end2 - end1));
     const vesting100_months_total = Math.max(0, milliesToMonths(end3 - end2));
