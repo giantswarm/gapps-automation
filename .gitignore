@@ -1,4 +1,5 @@
 .clasp.json
+.clasprc.json
 .idea
 gapps-automation.iml
 venv
