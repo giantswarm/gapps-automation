@@ -126,7 +126,7 @@ function install(delayMinutes) {
 /** Helper function to configure the required script properties.
  *
  * USAGE EXAMPLE:
- *   clasp run 'setProperties' --params '[{"persionio-dump.SHEET_ID": "SOME_PERSONIO_URL|CLIENT_ID|CLIENT_SECRET"}, false]'
+ *   clasp run 'setProperties' --params '[{"PersonioDump.SHEET_ID": "SOME_PERSONIO_URL|CLIENT_ID|CLIENT_SECRET"}, false]'
  *
  * Warning: passing argument true for parameter deleteAllOthers will also cause the schema to be reset!
  */
