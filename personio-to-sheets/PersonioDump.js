@@ -16,6 +16,8 @@
  *     automation@giantswarm.io
  *
  * This script uses the Advanced Sheets Service, make sure to enable it in the Google Cloud Project.
+ *
+ * Managed via: https://github.com/giantswarm/gapps-automation
  */
 
 
