@@ -14,7 +14,7 @@ const VESTING_CLIFF_MONTHS = 24;
 /**
  * Calculates the shares vested at a certain point in time.
  *
- * @param input {Array<Array<any>>} The shares and westing info, the following fields are required:
+ * @param input {Array<Array<any>>} The shares and vesting info, the following fields are required:
  *         Amount of shares,
  *         Vesting Start Date,
  *         25% vested,
