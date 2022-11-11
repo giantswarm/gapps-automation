@@ -20,7 +20,6 @@
  * Managed via: https://github.com/giantswarm/gapps-automation
  */
 
-
 const VALUE_INPUT_OPTIONS = {RAW: 'RAW', USER_ENTERED: 'USER_ENTERED'};
 
 /** How to store values in sheet fields (with or without parsing). */
@@ -47,7 +46,7 @@ function dumpPersonio() {
     // we keep operating if a single sync task fails
     for (const task of getTasks_()) {
 
-        const personio = new PersonioClientV1(task.source.clientId, task.source.clientSecret);
+        const personio = new lib.PersonioClientV1(task.source.clientId, task.source.clientSecret);
 
         let data = null;
         try {
@@ -256,7 +255,7 @@ function transformPersonioDataToRelations_(data) {
         // map attribute labels to columns
         const attributes = item?.attributes;
         const itemType = item?.type;
-        if (!Util.isObject(attributes) || !itemType)
+        if (!lib.isObject(attributes) || !itemType)
             throw new Error(`Unknown object without type or attributes: ${JSON.stringify(item)}`);
 
         if (hasParentOfType(parents, itemType))
@@ -289,7 +288,7 @@ function transformPersonioDataToRelations_(data) {
 
                 // We support varying values in arrays, but that shouldn't occur
                 let foreignType = null;
-                if (Util.isObject(unpackedValue)) {
+                if (lib.isObject(unpackedValue)) {
                     foreignType = scanObject(unpackedValue, parents.concat([item]));
                     if (!foreignType) {
                         continue;

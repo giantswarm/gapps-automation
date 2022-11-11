@@ -1,8 +1,11 @@
 const PERSONIO_API_BASE_URL = 'https://api.personio.de/v1';
 
 
-/** Simple wrapper around UrlFetchApp that performs authenticated requests against Personio API v1. */
-class PersonioClientV1 {
+/** Simple wrapper around UrlFetchApp that performs authenticated requests against Personio API v1.
+ *
+ * Export to global namespace, otherwise ES6 declarative constructs are not available outside the library.
+ */
+var PersonioClientV1 = class PersonioClientV1 {
 
     constructor(clientId, clientSecret) {
         this.clientId = clientId;

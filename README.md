@@ -69,3 +69,9 @@ https://cloud.google.com/sdk/docs/cheatsheet
 * Name: `gapps-automation`
 * ID: `gapps-automation-2022`
 * Number: `216505013251`
+
+### Library
+
+According to Google docs Apps Script Libraries should be used sparingly to avoid decreasing performance.
+
+We maintain a single library project, called `library`, which includes all our shared code for App Script work.
