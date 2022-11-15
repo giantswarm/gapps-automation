@@ -7,14 +7,6 @@
         "serviceId": "sheets",
         "version": "v4"
       }
-    ],
-    "libraries": [
-      {
-        "developmentMode": true,
-        "libraryId": "1EDv3qsp2roNsEcrhuKPFroiwJtHa3z290i_ektr28qIivHsd-hQtwSy8",
-        "userSymbol": "lib",
-        "version": "stable"
-      }
     ]
   },
   "oauthScopes": [

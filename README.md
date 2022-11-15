@@ -7,7 +7,7 @@ Extensive documentation here: https://developers.google.com/apps-script/guides/c
 
 ## Dependencies
 
- * Advanced Sheets Service
+ * Advanced SheetUtil Service
    * Can be enabled in Google Cloud Console or via `clasp apis enable sheets`
  * Personio API v1
 
@@ -50,13 +50,31 @@ Extensive documentation here: https://developers.google.com/apps-script/guides/c
     clasp run 'uninstall' # remove trigger(s) for the relevant project
     ```
 
+### Using Makefile
+
+A Makefile is provided to ease development and deployment on CI.
+
+#### Examples
+
+ * Assemble and push all projects (must be locally logged in, see above):
+
+    ```make```
+
+ * Assemble and push the logged in project `options-sheets`:
+
+    ```make options-sheets/```
+
+ * Clean all generated files (for example `$project/lib`):
+
+    ```make clean```
+
 ## Usage
 
 Apps Scripts projects have differing forms of deployments.
 
 Many are deployed as API Endpoint to be called via REST API or triggers.
 
-Other possibilities include Sheets Macros and GApps Addons.
+Other possibilities include SheetUtil Macros and GApps Addons.
 
 ### GCloud
 
@@ -74,4 +92,9 @@ https://cloud.google.com/sdk/docs/cheatsheet
 
 According to Google docs Apps Script Libraries should be used sparingly to avoid decreasing performance.
 
-We maintain a single library project, called `library`, which includes all our shared code for App Script work.
+We maintain a shared directory based library, called `lib`, which includes all our shared code for App Script work.
+
+This directory is symlinked into each project that uses it.
+
+For external Apps Script projects, vendoring or GIT sub-modules are possible solutions.
+
