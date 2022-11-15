@@ -20,12 +20,6 @@
  * Managed via: https://github.com/giantswarm/gapps-automation
  */
 
-
-const VALUE_INPUT_OPTIONS = {RAW: 'RAW', USER_ENTERED: 'USER_ENTERED'};
-
-/** How to store values in sheet fields (with or without parsing). */
-const DEFAULT_VALUE_INPUT_OPTION = VALUE_INPUT_OPTIONS.RAW;
-
 /** The prefix for properties specific to this script in the project.
  *
  * Making this dynamic didn't work as DriveApp.getFileById() tends to throw 500s and is otherwise quite slow.
@@ -60,7 +54,7 @@ function dumpPersonio() {
 
         let relations = null;
         try {
-            relations = transformPersonioDataToRelations_(data);
+            relations = transformPersonioDataToRelations_(data, task.spreadsheetId);
         } catch (e) {
             Logger.log('Failed to transform Personio data for sheet %s: %s', task.spreadsheetId, e.message);
             firstError = firstError || e;
@@ -68,7 +62,7 @@ function dumpPersonio() {
         }
 
         try {
-            writeRelationsToSheet_(task.spreadsheetId, relations, DEFAULT_VALUE_INPUT_OPTION);
+            writeRelationsToSheet_(task.spreadsheetId, relations);
         } catch (e) {
             Logger.log('Failed to write rows to sheet %s: %s', task.spreadsheetId, e.message);
             firstError = firstError || e;
@@ -81,57 +75,21 @@ function dumpPersonio() {
 }
 
 
-/** Sanitize delay minutes input.
- *
- * ClockTriggerBuilder supported only a limited number of values, see:
- * https://developers.google.com/apps-script/reference/script/clock-trigger-builder#everyMinutes(Integer)
- */
-function sanitizeDelayMinutes_(delayMinutes) {
-    return [1, 5, 10, 15, 30].reduceRight((v, prev) =>
-        typeof +delayMinutes === 'number' && v <= +delayMinutes ? v : prev);
-}
-
-
-/** Uninstall time based execution trigger for this script. */
+/** Uninstall triggers. */
 function uninstall() {
-    // Remove pre-existing triggers
-    const triggers = ScriptApp.getProjectTriggers();
-    for (const trigger of triggers) {
-        if (trigger.getHandlerFunction() === TRIGGER_HANDLER_FUNCTION) {
-            ScriptApp.deleteTrigger(trigger);
-            Logger.log("Uninstalled time based trigger for %s", TRIGGER_HANDLER_FUNCTION);
-        }
-    }
+    TriggerUtil.uninstall(TRIGGER_HANDLER_FUNCTION);
 }
 
 
-/** Setup for periodic execution and do some checks.
- * Supported values for delayMinutes: 1, 5, 10, 15 or 30
- */
+/** Install periodic execution trigger. */
 function install(delayMinutes) {
-    uninstall();
-
-    const delay = sanitizeDelayMinutes_(delayMinutes);
-    Logger.log("Installing time based trigger (every %s minutes)", delayMinutes);
-
-    ScriptApp.newTrigger(TRIGGER_HANDLER_FUNCTION)
-        .timeBased()
-        .everyMinutes(delay)
-        .create();
-
-    Logger.log("Installed time based trigger for %s every %s minutes", TRIGGER_HANDLER_FUNCTION, delay);
+    TriggerUtil.install(TRIGGER_HANDLER_FUNCTION, delayMinutes);
 }
 
 
-/** Helper function to configure the required script properties.
- *
- * USAGE EXAMPLE:
- *   clasp run 'setProperties' --params '[{"persionio-dump.SHEET_ID": "SOME_PERSONIO_URL|CLIENT_ID|CLIENT_SECRET"}, false]'
- *
- * Warning: passing argument true for parameter deleteAllOthers will also cause the schema to be reset!
- */
+/** Allow setting properties. */
 function setProperties(properties, deleteAllOthers) {
-    PropertiesService.getScriptProperties().setProperties(properties, deleteAllOthers);
+    TriggerUtil.setProperties(properties, deleteAllOthers);
 }
 
 
@@ -148,7 +106,7 @@ function getTasks_() {
     for (const key in properties) {
 
         const safeKey = key.trim();
-        if (!safeKey.startsWith(PROPERTY_PREFIX) || safeKey === PROPERTY_PREFIX + 'schema')
+        if (!safeKey.startsWith(PROPERTY_PREFIX) || safeKey.startsWith(PROPERTY_PREFIX + 'schema'))
             continue;
 
         const spreadsheetId = safeKey.replace(PROPERTY_PREFIX, '');
@@ -194,24 +152,14 @@ function getTasks_() {
  *  }
  *
  */
-function transformPersonioDataToRelations_(data) {
+function transformPersonioDataToRelations_(data, schemaKey) {
 
     const relations = {version: 0};  // ie. tables in a relational schema
 
-    const calculateUtf8Size = str => {
-        // returns the byte length of an utf8 string
-        let s = str.length;
-        for (let i = str.length - 1; i >= 0; i--) {
-            let code = str.charCodeAt(i);
-            if (code > 0x7f && code <= 0x7ff) s++;
-            else if (code > 0x7ff && code <= 0xffff) s += 2;
-            if (code >= 0xDC00 && code <= 0xDFFF) i--; //trail surrogate
-        }
-        return s;
-    };
+    const buildSchemaPropertyKey = (schemaKey) => PROPERTY_PREFIX + 'schema.' + schemaKey;
 
-    const loadSchema = () => {
-        const existingSchema = PropertiesService.getScriptProperties().getProperty(PROPERTY_PREFIX + 'schema');
+    const loadSchema = (schemaKey) => {
+        const existingSchema = PropertiesService.getScriptProperties().getProperty(buildSchemaPropertyKey(schemaKey));
         if (existingSchema) {
             const schema = JSON.parse(existingSchema);
             // copy properties
@@ -219,13 +167,13 @@ function transformPersonioDataToRelations_(data) {
                 relations[relType] = schema[relType];
             }
 
-            Logger.log("Loaded schema: version=%s, size=%s (max 9216)", relations.version, calculateUtf8Size(existingSchema));
+            Logger.log("Loaded schema: version=%s, size=%s (max 9216)", relations.version, Util.calculateUtf8Size(existingSchema));
         } else {
             Logger.log("No existing schema found");
         }
     };
 
-    const saveSchema = () => {
+    const saveSchema = (schemaKey) => {
         // Persist updated schema version
         const schema = {version: relations.version};
         for (const relType in schema) {
@@ -233,13 +181,24 @@ function transformPersonioDataToRelations_(data) {
         }
 
         const updatedSchema = JSON.stringify(relations);
-        Logger.log("Saving schema: version=%s, size=%s (max 9216)", relations.version, calculateUtf8Size(updatedSchema));
-        PropertiesService.getScriptProperties().setProperty(PROPERTY_PREFIX + 'schema', updatedSchema);
+        Logger.log("Saving schema: version=%s, size=%s (max 9216)", relations.version, Util.calculateUtf8Size(updatedSchema));
+        PropertiesService.getScriptProperties().setProperty(buildSchemaPropertyKey(schemaKey), updatedSchema);
     };
 
     const hasParentOfType = (parents, relType) => !!parents.find(parent => parent.type === relType);
 
-    const unboxValue = boxedValue => boxedValue?.value !== undefined ? boxedValue.value : boxedValue;
+    const unboxValue = boxed => {
+        if (boxed?.value !== undefined) {
+            // we perform type conversions here
+            if (boxed?.type === 'date' && boxed.value !== null) {
+                return new Date(boxed.value);
+            }
+
+            return boxed.value;
+        }
+
+        return boxed;
+    };
 
     const getItemId = (item) => {
         if (item?.attributes) {
@@ -288,10 +247,10 @@ function transformPersonioDataToRelations_(data) {
                 }
 
                 // We support varying values in arrays, but that shouldn't occur
-                let foreignType = null;
+                let rel = null;
                 if (Util.isObject(unpackedValue)) {
-                    foreignType = scanObject(unpackedValue, parents.concat([item]));
-                    if (!foreignType) {
+                    rel = scanObject(unpackedValue, parents.concat([item]));
+                    if (!rel) {
                         continue;
                     }
                     // nested, possibly circular type was registered
@@ -304,8 +263,8 @@ function transformPersonioDataToRelations_(data) {
                     // new column found
                     relation.headers[id] = header = {};
                 }
-                header.title = (label || uniform_id || id.trim()) + (foreignType ? '_' + foreignType + '_id' : '');
-                header.foreignType = foreignType != null ? foreignType : undefined;
+                header.t = (label || uniform_id || id.trim()) + (rel ? '_' + rel + '_id' : '');
+                header.rel = rel != null ? rel : undefined;
                 header.v = relations.version;
             }
         }
@@ -342,7 +301,7 @@ function transformPersonioDataToRelations_(data) {
             const values = Array.isArray(value) ? value : [value];
             let fields = [];
             for (const unpackedValue of values) {
-                if (header.foreignType) {
+                if (header.rel) {
                     // nested type, just store id and row in a separate relation
                     const itemId = getItemId(unpackedValue);
                     fields.push(itemId);
@@ -352,22 +311,34 @@ function transformPersonioDataToRelations_(data) {
                 }
             }
 
-            // plain value null/undefined -> ''
-            // arrays joined by ',' (comma)
-            row.push(fields.map(v => v == null ? '' : v).join(','));
+            if (values.length > 1) {
+                // plain value null/undefined -> ''
+                // arrays joined by ',' (comma)
+                row.push(fields.map(v => {
+                    if (v instanceof Date) {
+                        return v.toISOString();
+                    } else if (v == null) {
+                        return '';
+                    } else {
+                        return '' + v;
+                    }
+                }).join(','));
+            } else {
+                row.push(fields[0]);
+            }
         }
 
         relation.rows.push(row);
     };
 
     // #1 Build schema (scan data returned from API)
-    loadSchema();
+    loadSchema(schemaKey);
     ++relations.version;
     for (const item of data) {
         scanObject(item, []);
     }
     // Persist updated schema version
-    saveSchema();
+    saveSchema(schemaKey);
 
     // #2 Set headers (first rows for each relation)
     for (const relType in relations) {
@@ -375,7 +346,7 @@ function transformPersonioDataToRelations_(data) {
             continue;
 
         const relation = relations[relType];
-        relation.rows.push(Object.values(relation.headers).map(header => header.title));
+        relation.rows.push(Object.values(relation.headers).map(header => header.t));
     }
 
 
@@ -414,24 +385,7 @@ function getOrAddSheet_(spreadsheetId, sheetTitle) {
 
 
 /** Write relations structure to the specified spreadsheet, creating the necessary sheets. */
-function writeRelationsToSheet_(spreadsheetId, relations, valueInputOption) {
-
-    // Extended Value for CellData fields see:
-    // https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets/other#extendedvalue
-    const toExtendedValue = (value) => {
-        switch (typeof value) {
-            case 'boolean':
-                return {boolValue: value};
-            case 'number': // fall-through
-            case 'bigint':
-                return {numberValue: value};
-            case 'string':
-                return {stringValue: value};
-            default:  // null, undefined, object, symbol, function
-                return {errorValue: {type: 'NULL_VALUE'}};
-        }
-    };
-
+function writeRelationsToSheet_(spreadsheetId, relations) {
 
     // Prepare Sheets API requests in advance
     const batch = {requests: []};
@@ -441,8 +395,10 @@ function writeRelationsToSheet_(spreadsheetId, relations, valueInputOption) {
         if (relType === 'version')
             continue;
 
-        const sheetProperties = getOrAddSheet_(spreadsheetId, relType);
+        const spreadsheet = SheetUtil.getSpreadsheet(spreadsheetId);
+        const sheetProperties = SheetUtil.ensureSheet(spreadsheet, relType).properties;
         const sheetId = sheetProperties.sheetId;
+        const timeZoneOffsetMillies = SheetUtil.getTimeZoneOffset(spreadsheet.properties.timeZone);
         const rowCount = sheetProperties.gridProperties.rowCount;
         const columnCount = sheetProperties.gridProperties.columnCount;
         const targetRowCount = relation.rows.length;
@@ -490,10 +446,11 @@ function writeRelationsToSheet_(spreadsheetId, relations, valueInputOption) {
                         startColumnIndex: 0,
                         endColumnIndex: relation.rows.length ? relation.rows[0].length : 0
                     },
-                    fields: 'userEnteredValue',
+                    fields: 'userEnteredValue,userEnteredFormat',
                     rows: relation.rows.map(row => ({
                         values: row.map(v => ({
-                            userEnteredValue: toExtendedValue(v)
+                            userEnteredValue: SheetUtil.toExtendedValue(v, timeZoneOffsetMillies),
+                            userEnteredFormat: SheetUtil.toDefaultCellFormat(v)
                         }))
                     }))
                 }
