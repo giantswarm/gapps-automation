@@ -6,8 +6,6 @@
 
 const DAYS_PER_MONTH = 30.42;
 
-const MILLISECONDS_PER_DAY = 60 * 60 * 24 * 1000;
-
 const VESTING_CLIFF_MONTHS = 24;
 
 
