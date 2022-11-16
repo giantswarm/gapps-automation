@@ -47,45 +47,45 @@ function addCalendarsToNewJoiners() {
         return;
     }
 
-    // TODO REMOVE THIS!
-    const newJoinerEmails = getPersonioEmployeeEmailsByStatus_('active');
-    //const newJoinerEmails = getPersonioEmployeeEmailsByStatus_('onboarding');
+    Logger.log('Configured to ensure calendars: %s', calendarIds);
+
+    const newJoinerEmails = getPersonioEmployeeEmailsByStatus_('onboarding');
 
     let firstError = null;
 
     for (const primaryEmail of newJoinerEmails) {
-
-        // TODO REMOVE THIS!
-        if (primaryEmail !== 'jonas@giantswarm.io') {
-            Logger.log("skipping %s", primaryEmail);
-            continue;
-        }
-
         // we keep operating if handling calendars of a single user fails
         try {
-            const calendarList = CalendarListClient.withImpersonatingService(getServiceAccountCredentials_(), primaryEmail);
-
-            const existingCalendars = calendarList.list();
-            for (const calendarId of calendarIds) {
-                if (!existingCalendars.some(calendar => calendar.id === calendarId)) {
-                    // continue operating if adding a single calendar fails
-                    try {
-                        const newItem = calendarList.insert({id: calendarId});
-                        existingCalendars.push(newItem); // to handle duplicates in calendarIds
-                        Logger.log('Added calendar %s to user %s', calendarId, primaryEmail);
-                    } catch (e) {
-                        Logger.log('Failed to add calendar %s to user %s: %s', calendarId, primaryEmail, e.message);
-                    }
-                }
-            }
+            subscribeUserCalendars_(getServiceAccountCredentials_(), primaryEmail, calendarIds);
         } catch (e) {
-            Logger.log('Failed to access calendars of user %s: %s', primaryEmail, e.message);
+            Logger.log('Failed to ensure calendars of user %s: %s', primaryEmail, e.message);
             firstError = firstError || e;
         }
     }
 
     if (firstError) {
         throw firstError;
+    }
+}
+
+
+/** Subscribe a single account to all the specified calendars. */
+function subscribeUserCalendars_(serviceAccountCredentials, primaryEmail, calendarIds) {
+
+    const calendarList = CalendarListClient.withImpersonatingService(serviceAccountCredentials, primaryEmail);
+
+    const existingCalendars = calendarList.list();
+    for (const calendarId of calendarIds) {
+        if (!existingCalendars.some(calendar => calendar.id === calendarId)) {
+            // continue operating if adding a single calendar fails
+            try {
+                const newItem = calendarList.insert({id: calendarId});
+                existingCalendars.push(newItem); // to handle duplicates in calendarIds
+                Logger.log('Added calendar %s to user %s', calendarId, primaryEmail);
+            } catch (e) {
+                Logger.log('Failed to add calendar %s to user %s: %s', calendarId, primaryEmail, e.message);
+            }
+        }
     }
 }
 
@@ -123,7 +123,9 @@ function getScriptProperties_() {
 function getRequiredCalendars_() {
     const requiredCalendarsList = getScriptProperties_().getProperty(REQUIRED_CALENDARS_KEY) || '';
 
-    return requiredCalendarsList.split(',').map(calId => calId.trim());
+    return requiredCalendarsList.split(',')
+        .map(calId => calId.trim())
+        .map(calId => Utilities.newBlob(Utilities.base64Decode(calId)).getDataAsString());
 }
 
 
