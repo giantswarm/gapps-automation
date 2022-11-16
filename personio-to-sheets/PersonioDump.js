@@ -41,11 +41,11 @@ function dumpPersonio() {
     // we keep operating if a single sync task fails
     for (const task of getTasks_()) {
 
-        const personio = new PersonioClientV1(task.source.clientId, task.source.clientSecret);
+        const personio = PersonioClientV1.withApiCredentials(task.source.clientId, task.source.clientSecret);
 
         let data = null;
         try {
-            data = personio.fetch(task.source.url);
+            data = personio.getPersonioJson(task.source.url);
         } catch (e) {
             Logger.log('Failed to fetch Personio data for sheet %s: %s', task.spreadsheetId, e.message);
             firstError = firstError || e;

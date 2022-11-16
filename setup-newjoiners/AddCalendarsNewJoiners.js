@@ -27,31 +27,50 @@ const TRIGGER_HANDLER_FUNCTION = 'addCalendarsNewJoiners';
  *
  * This requires a configured Personio access token and the user impersonation API enabled for the cloud project:
  *  https://cloud.google.com/iam/docs/impersonating-service-accounts
+ *
+ * Requires the following script properties for operation:
+ *
+ *   AddCalendars.personioToken              CLIENT_ID|CLIENT_SECRET
+ *   AddCalendars.serviceAccountCredentials  {...SERVICE_ACCOUNT_CREDENTIALS...}
+ *
+ * One can use the following command line to compress the service account creds into one line:
+ *   $ cat credentials.json | tr -d '\n '
+ *
+ * The service account must be configured correctly and have at least permission for these scopes:
+ *   https://www.googleapis.com/auth/calendar
  */
 function addCalendarsToNewJoiners() {
 
-    const calendarIds = getRequiredCalendars();
+    const calendarIds = getRequiredCalendars_();
     if (!calendarIds || calendarIds.length === 0) {
         Logger.log("No calendars configured, exiting");
         return;
     }
 
-    const newJoinerEmails = getPersonioEmployeeEmailsByStatus_('onboarding');
+    // TODO REMOVE THIS!
+    const newJoinerEmails = getPersonioEmployeeEmailsByStatus_('active');
+    //const newJoinerEmails = getPersonioEmployeeEmailsByStatus_('onboarding');
 
     let firstError = null;
 
     for (const primaryEmail of newJoinerEmails) {
 
+        // TODO REMOVE THIS!
+        if (primaryEmail !== 'jonas@giantswarm.io') {
+            Logger.log("skipping %s", primaryEmail);
+            continue;
+        }
+
         // we keep operating if handling calendars of a single user fails
         try {
-            const calendarListService = new CalendarListService(getServiceAccountCredentials_(), primaryEmail);
+            const calendarList = CalendarListClient.withImpersonatingService(getServiceAccountCredentials_(), primaryEmail);
 
-            const existingCalendars = calendarListService.list();
+            const existingCalendars = calendarList.list();
             for (const calendarId of calendarIds) {
                 if (!existingCalendars.some(calendar => calendar.id === calendarId)) {
                     // continue operating if adding a single calendar fails
                     try {
-                        const newItem = calendarListService.insert({id: calendarId});
+                        const newItem = calendarList.insert({id: calendarId});
                         existingCalendars.push(newItem); // to handle duplicates in calendarIds
                         Logger.log('Added calendar %s to user %s', calendarId, primaryEmail);
                     } catch (e) {
@@ -71,57 +90,21 @@ function addCalendarsToNewJoiners() {
 }
 
 
-/** Uninstall time based execution trigger for this script. */
+/** Uninstall triggers. */
 function uninstall() {
-    // Remove pre-existing triggers
-    const triggers = ScriptApp.getProjectTriggers();
-    for (const trigger of triggers) {
-        if (trigger.getHandlerFunction() === TRIGGER_HANDLER_FUNCTION) {
-            ScriptApp.deleteTrigger(trigger);
-            Logger.log("Uninstalled time based trigger for %s", TRIGGER_HANDLER_FUNCTION);
-        }
-    }
+    TriggerUtil.uninstall(TRIGGER_HANDLER_FUNCTION);
 }
 
 
-/** Setup for periodic execution and do some checks.
- * Supported values for delayMinutes: 1, 5, 10, 15 or 30
- */
+/** Install periodic execution trigger. */
 function install(delayMinutes) {
-    uninstall();
-
-    const delay = sanitizeDelayMinutes_(delayMinutes);
-    Logger.log("Installing time based trigger (every %s minutes)", delayMinutes);
-
-    ScriptApp.newTrigger(TRIGGER_HANDLER_FUNCTION)
-        .timeBased()
-        .everyMinutes(delay)
-        .create();
-
-    Logger.log("Installed time based trigger for %s every %s minutes", TRIGGER_HANDLER_FUNCTION, delay);
+    TriggerUtil.install(TRIGGER_HANDLER_FUNCTION, delayMinutes);
 }
 
 
-/** Helper function to configure the required script properties.
- *
- * USAGE EXAMPLE:
- *   clasp run 'setProperties' --params '[{"persionio-dump.SHEET_ID": "SOME_PERSONIO_URL|CLIENT_ID|CLIENT_SECRET"}, false]'
- *
- * Warning: passing argument true for parameter deleteAllOthers will also cause the schema to be reset!
- */
+/** Allow setting properties. */
 function setProperties(properties, deleteAllOthers) {
-    PropertiesService.getScriptProperties().setProperties(properties, deleteAllOthers);
-}
-
-
-/** Sanitize delay minutes input.
- *
- * ClockTriggerBuilder supported only a limited number of values, see:
- * https://developers.google.com/apps-script/reference/script/clock-trigger-builder#everyMinutes(Integer)
- */
-function sanitizeDelayMinutes_(delayMinutes) {
-    return [1, 5, 10, 15, 30].reduceRight((v, prev) =>
-        typeof +delayMinutes === 'number' && v <= +delayMinutes ? v : prev);
+    TriggerUtil.setProperties(properties, deleteAllOthers);
 }
 
 
@@ -129,8 +112,7 @@ function sanitizeDelayMinutes_(delayMinutes) {
 function getScriptProperties_() {
     const scriptProperties = PropertiesService.getScriptProperties();
     if (!scriptProperties) {
-        Logger.log('ScriptProperties not accessible');
-        return throw new Error("ScriptProperties not accessible");
+        throw new Error('ScriptProperties not accessible');
     }
 
     return scriptProperties;
@@ -173,9 +155,9 @@ function getPersonioCreds_() {
 function getPersonioEmployeeEmailsByStatus_(status) {
 
     const personioCreds = getPersonioCreds_();
-    const personio = new PersonioClientV1(personioCreds.clientId, personioCreds.clientSecret);
+    const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
 
-    const data = personio.fetch('/company/employees.json');
+    const data = personio.getPersonioJson('/company/employees');
     const emails = [];
     for (const item of data) {
         const attributes = item?.attributes;
