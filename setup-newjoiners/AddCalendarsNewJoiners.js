@@ -17,6 +17,9 @@ const PERSONIO_TOKEN_KEY = PROPERTY_PREFIX + 'personioToken';
 /** Service account credentials (in JSON format, as downloaded from Google Management Console. */
 const SERVICE_ACCOUNT_CREDENTIALS_KEY = PROPERTY_PREFIX + 'serviceAccountCredentials';
 
+/** Filter for allowed domains (to avoid working and failing on users present on foreign domains). */
+const ALLOWED_DOMAINS_KEY = PROPERTY_PREFIX + 'allowedDomains';
+
 /** The trigger handler function to call in time based triggers. */
 const TRIGGER_HANDLER_FUNCTION = 'addCalendarsNewJoiners';
 
@@ -32,6 +35,7 @@ const TRIGGER_HANDLER_FUNCTION = 'addCalendarsNewJoiners';
  *
  *   AddCalendars.personioToken              CLIENT_ID|CLIENT_SECRET
  *   AddCalendars.serviceAccountCredentials  {...SERVICE_ACCOUNT_CREDENTIALS...}
+ *   AddCalendars.allowedDomains             giantswarm.io,giantswarm.com
  *
  * One can use the following command line to compress the service account creds into one line:
  *   $ cat credentials.json | tr -d '\n '
@@ -46,10 +50,16 @@ function addCalendarsToNewJoiners() {
         Logger.log("No calendars configured, exiting");
         return;
     }
-
     Logger.log('Configured to ensure calendars: %s', calendarIds);
 
-    const newJoinerEmails = getPersonioEmployeeEmailsByStatus_('onboarding');
+    const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
+        .split(',')
+        .map(d => d.trim());
+    const isEmailDomainAllowed = email => allowedDomains.includes(email.substring(email.lastIndexOf('@') + 1));
+
+    Logger.log('Configured to handle users on domains: %s', allowedDomains);
+
+    const newJoinerEmails = getPersonioEmployeeEmailsByStatus_('onboarding').filter(email => isEmailDomainAllowed(email));
 
     let firstError = null;
 
@@ -165,7 +175,7 @@ function getPersonioEmployeeEmailsByStatus_(status) {
         const attributes = item?.attributes;
 
         if (attributes?.status?.value === status) {
-            const email = attributes?.email?.value;
+            const email = (attributes?.email?.value || '').trim();
             if (email) {
                 emails.push(email);
             }

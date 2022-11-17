@@ -1,3 +1,9 @@
+/** Apps Script Oauth2 library:
+ *   version: v1.42.1
+ *   upstream repo: https://github.com/googleworkspace/apps-script-oauth2
+ *   reason for vendoring: performance (see project README) and ease of use
+ */
+
 (function (host, expose) {
    var module = { exports: {} };
    var exports = module.exports;

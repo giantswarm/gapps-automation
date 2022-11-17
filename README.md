@@ -1,25 +1,45 @@
 # Apps Script Automation Projects
 
-Apps Script based automation, managed via Google's `clasp` tool (build/release/deploy).
+Apps Script based automation for a company that uses GApps with Personio.
 
-Extensive documentation here: https://developers.google.com/apps-script/guides/clasp
+Uses Google's `clasp` tool for deployment.
+
 
 ## Dependencies
 
-* Advanced SheetUtil Service
-    * Can be enabled in Google Cloud Console or via `clasp apis enable sheets`
-* Personio API v1
+### Local Dependencies
+
+* `clasp`  
+    Automates Apps Script deployment tasks.  
+    **Install:** `sudo npm install -g clasp`.  
+    **Documentation:** https://developers.google.com/apps-script/guides/clasp  
+
+* `clasp-env`  
+    Links sub-directories to clasp projects.  
+    **Install:** `sudo npm install -g clasp-env`.  
+    **Documentation:** https://medium.com/geekculture/if-you-use-clasp-with-google-apps-script-you-need-this-utility-right-now-de61fd4e67c8  
+
+### Cloud Services for Deployment
+
+* Advanced Sheets Service  
+  Enable via Google Cloud Console or `clasp apis enable sheets`
+* Google Calendar API  
+  Enable via Google Cloud Console or `clasp apis enable calendar`
+* Personio API v1  
+  Create an API token with the necessary fields on Personio
+
 
 ## Deployment
 
-1. Enable Google Apps Script API
-   https://script.google.com/u/1/home/usersettings
-2. Login globally using clasp
+1. Enable Google Apps Script API  
+   https://script.google.com/u/1/home/usersettings  
+   * Some scripts need additional configuration (service accounts, scopes, ...). Refer to the function comments for that.
+2. Login globally using clasp  
    ```sh
    clasp login
    ```
    The login info is stored in `~/.clasprc.json`.
-3. Change into the relevant project sub directory
+3. Change into the relevant project sub-directory
    ```sh
    cd personio-to-sheets
    ```
@@ -27,27 +47,33 @@ Extensive documentation here: https://developers.google.com/apps-script/guides/c
    ```sh
    clasp login --creds <OAUTH2_GOOGLE_CLOUD_PROJECT_CLIENT_SECRET_FILE>
    ```
-5. Upload local files to drive:
+5. Prepare for pushing from working copy to an Apps Script project  
+   * Link to existing Apps Script project:
+     ```
+     echo '{}' > .clasp.json ; clasp-env --folder . --scriptId SCRIPT_ID
+     ```
+   * Link to new project (with or without parent sheets/docs document):
+     ```
+     clasp create --help  # see documentation for parameter '--type'
+     clasp create --title "$(basename "$(pwd)")" --type standalone --parentId OPTIONAL_PARENT_DOCUMENT_ID
+     ```
+6. Upload local files to drive:
    ```sh
    clasp push
    ```
-6. Deploy this new version:
+8. Configure properties for the scripts using the builtin helper function:
    ```sh
-   clasp deploy
+   clasp run 'setProperties' --params '[{"KEY": "VALUE"}, false]'
    ```
-7. Configure properties for the scripts using the builtin helper function:
-   ```sh
-   clasp run 'setProperties' --params '[{"KEY": "VALUE"}, true]'
-   ```
-8. Install automated script functions:
+9. Install automated script functions:
    ```sh
    # install a script (argument "5" could be the delay in minutes)
    clasp run 'install' --params '[5]'  
    ```
-9. Uninstall automated script function:
-   ```sh
-   clasp run 'uninstall' # remove trigger(s) for the relevant project
-   ```
+10. Uninstall automated script function:
+    ```sh
+    clasp run 'uninstall' # remove trigger(s) for the relevant project
+    ```
 
 ### Using Makefile
 
@@ -77,15 +103,9 @@ Other possibilities include SheetUtil Macros and GApps Addons.
 
 ### GCloud
 
-Install `gcloud` (CLI) to manage execution, settings and logging of the automation:
+Optionally install `gcloud` (CLI) to manage execution, settings and logging of the automation:
 
 https://cloud.google.com/sdk/docs/cheatsheet
-
-### Default Giant Swarm GCP Project for Execution
-
-* Name: `gapps-automation`
-* ID: `gapps-automation-2022`
-* Number: `216505013251`
 
 ### Library
 
