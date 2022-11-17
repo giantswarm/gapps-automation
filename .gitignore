@@ -1,6 +1,7 @@
+.clasp.json
 .clasprc.json
 .idea
 gapps-automation.iml
 venv
 credentials.json
-*/lib/*
+*/lib.js
