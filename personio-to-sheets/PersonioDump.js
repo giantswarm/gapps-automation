@@ -341,11 +341,10 @@ function transformPersonioDataToRelations_(data, schemaKey) {
     saveSchema(schemaKey);
 
     // #2 Set headers (first rows for each relation)
-    for (const relType in relations) {
-        if (relType === 'version')
+    for (const [relType, relation] of Object.entries(relations)) {
+        if (relType === 'version' || !Util.isObject(relation))
             continue;
 
-        const relation = relations[relType];
         relation.rows.push(Object.values(relation.headers).map(header => header.t));
     }
 
@@ -353,6 +352,23 @@ function transformPersonioDataToRelations_(data, schemaKey) {
     // #3 Convert data (rows)
     for (const item of data) {
         convertObject(item, []);
+    }
+
+    // #4 Sort numerically, ascending, by ID (if present)
+    for (const [relType, relation] of Object.entries(relations)) {
+
+        if (relType === 'version' || !Util.isObject(relation))
+            continue;
+
+        // find ID row index
+        const idIndex = Object.entries(relation.headers).findIndex(([key]) => key === 'id');
+        if (idIndex >= 0) {
+            relation.rows = relation.rows.slice(0, 1).concat(relation.rows.slice(1).sort((a, b) => {
+                const aId = +a[idIndex];
+                const bId = +b[idIndex];
+                return aId - bId;
+            }));
+        }
     }
 
     return relations;
@@ -392,7 +408,7 @@ function writeRelationsToSheet_(spreadsheetId, relations) {
 
     for (const [relType, relation] of Object.entries(relations)) {
 
-        if (relType === 'version')
+        if (relType === 'version' || !Util.isObject(relation))
             continue;
 
         const spreadsheet = SheetUtil.getSpreadsheet(spreadsheetId);
