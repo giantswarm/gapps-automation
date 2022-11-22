@@ -50,7 +50,7 @@ Uses Google's `clasp` tool for deployment.
 5. Prepare for pushing from working copy to an Apps Script project  
    * Link to existing Apps Script project:
      ```
-     echo '{}' > .clasp.json ; clasp-env --folder . --scriptId SCRIPT_ID
+     SCRIPT_ID=1UFv9QvLUjFqqUmpqNqDoq2C9NZAsBTGR2S63hScrqWFcyPMTUrV99Q3m make personio-to-sheets/
      ```
    * Link to new project (with or without parent sheets/docs document):
      ```
