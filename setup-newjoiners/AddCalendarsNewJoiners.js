@@ -21,7 +21,7 @@ const SERVICE_ACCOUNT_CREDENTIALS_KEY = PROPERTY_PREFIX + 'serviceAccountCredent
 const ALLOWED_DOMAINS_KEY = PROPERTY_PREFIX + 'allowedDomains';
 
 /** The trigger handler function to call in time based triggers. */
-const TRIGGER_HANDLER_FUNCTION = 'addCalendarsNewJoiners';
+const TRIGGER_HANDLER_FUNCTION = 'addCalendarsToNewJoiners';
 
 
 /** Main entry point.
