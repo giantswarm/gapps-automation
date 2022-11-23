@@ -156,16 +156,6 @@ function getScriptProperties_() {
 }
 
 
-/** Get the list of required calendars. */
-function getRequiredCalendars_() {
-    const requiredCalendarsList = getScriptProperties_().getProperty(REQUIRED_CALENDARS_KEY) || '';
-
-    return requiredCalendarsList.split(',')
-        .map(calId => calId.trim())
-        .map(calId => Utilities.newBlob(Utilities.base64Decode(calId)).getDataAsString());
-}
-
-
 /** Get the service account credentials. */
 function getServiceAccountCredentials_() {
     const creds = getScriptProperties_().getProperty(SERVICE_ACCOUNT_CREDENTIALS_KEY);
@@ -174,40 +164,4 @@ function getServiceAccountCredentials_() {
     }
 
     return JSON.parse(creds);
-}
-
-
-/** Get the Personio token. */
-function getPersonioCreds_() {
-    const credentialFields = (getScriptProperties_().getProperty(PERSONIO_TOKEN_KEY) || '|')
-        .split('|')
-        .map(field => field.trim());
-
-    return {clientId: credentialFields[0], clientSecret: credentialFields[1]};
-}
-
-
-/** Get the list of new joiner primary organization emails.
- *
- * @param status One of: onboarding, active, offboarding, inactive
- */
-function getPersonioEmployeeEmailsByStatus_(status) {
-
-    const personioCreds = getPersonioCreds_();
-    const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
-
-    const data = personio.getPersonioJson('/company/employees');
-    const emails = [];
-    for (const item of data) {
-        const attributes = item?.attributes;
-
-        if (attributes?.status?.value === status) {
-            const email = (attributes?.email?.value || '').trim();
-            if (email) {
-                emails.push(email);
-            }
-        }
-    }
-
-    return emails;
 }
