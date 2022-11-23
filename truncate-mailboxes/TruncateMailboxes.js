@@ -1,45 +1,41 @@
 /**
- * Ensure new joiners see all required Google Calendars.
+ * Truncate mailboxes of certain (automated) users or to save space.
  *
  * Managed via: https://github.com/giantswarm/gapps-automation
  */
 
 
 /** The prefix for properties specific to this script in the project. */
-const PROPERTY_PREFIX = 'AddCalendars.';
+const PROPERTY_PREFIX = 'TruncateMailboxes.';
 
-/** Comma-separated list of calendar IDs required for new joiners. */
-const REQUIRED_CALENDARS_KEY = PROPERTY_PREFIX + 'required';
-
-/** Personio clientId and clientSecret, separated by '|'. */
-const PERSONIO_TOKEN_KEY = PROPERTY_PREFIX + 'personioToken';
-
-/** Service account credentials (in JSON format, as downloaded from Google Management Console. */
+/** Service account credentials. */
 const SERVICE_ACCOUNT_CREDENTIALS_KEY = PROPERTY_PREFIX + 'serviceAccountCredentials';
 
-/** Filter for allowed domains (to avoid working and failing on users present on foreign domains). */
-const ALLOWED_DOMAINS_KEY = PROPERTY_PREFIX + 'allowedDomains';
-
 /** The trigger handler function to call in time based triggers. */
-const TRIGGER_HANDLER_FUNCTION = 'addCalendarsNewJoiners';
+const TRIGGER_HANDLER_FUNCTION = 'truncateMailboxes';
 
 
 /** Main entry point.
  *
- * Add required calendars to all GApps organization users tagged as "onboarding" in Personio.
- *
- * This requires a configured Personio access token and the user impersonation API enabled for the cloud project:
- *  https://cloud.google.com/iam/docs/impersonating-service-accounts
+ * Truncate mailboxes of users listed in the Script Properties by search filters.
  *
  * Requires the following script properties for operation:
  *
- *   AddCalendars.personioToken              CLIENT_ID|CLIENT_SECRET
- *   AddCalendars.serviceAccountCredentials  {...SERVICE_ACCOUNT_CREDENTIALS...}
- *   AddCalendars.allowedDomains             giantswarm.io,giantswarm.com
+ *   TruncateMailboxes.serviceAccountCredentials  {...SERVICE_ACCOUNT_CREDENTIALS...}
+ *   TruncateMailboxes.EMAIL_1                    CLEAN_FILTER
+ *   TruncateMailboxes.EMAIL_2                    CLEAN_FILTER
+ *   ...
+ *
+ *   EMAIL should be a primary email within this organization.
+ *
+ *   CLEAN_FILTER is a gmail search expression, adhering to: https://support.google.com/mail/answer/7190?hl=en
+ *      Examples:
+ *        older_than:30d
+ *        size:1000000
  *
  * Requires service account credentials (with domain-wide delegation enabled) to be set, for example via:
  *
- *   $ clasp run 'setProperties' --params '[{"AddCalendars.serviceAccountCredentials": "{...ESCAPED_JSON...}"}, false]'
+ *   $ clasp run 'setProperties' --params '[{"TruncateMailboxes.serviceAccountCredentials": "{...ESCAPED_JSON...}"}, false]'
  *
  * One may use the following command line to compress the service account creds into one line:
  *
@@ -47,33 +43,21 @@ const TRIGGER_HANDLER_FUNCTION = 'addCalendarsNewJoiners';
  *
  * The service account must be configured correctly and have at least permission for these scopes:
  *   https://www.googleapis.com/auth/calendar
+ *
+ * Ensure that this methods ExecutionApi scope is limited to MYSELF in the manifest,
+ * to prevent other unauthorized domain users from using its features.
  */
-function addCalendarsToNewJoiners() {
-
-    const calendarIds = getRequiredCalendars_();
-    if (!calendarIds || calendarIds.length === 0) {
-        Logger.log("No calendars configured, exiting");
-        return;
-    }
-    Logger.log('Configured to ensure calendars: %s', calendarIds);
-
-    const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
-        .split(',')
-        .map(d => d.trim());
-    const isEmailDomainAllowed = email => allowedDomains.includes(email.substring(email.lastIndexOf('@') + 1));
-
-    Logger.log('Configured to handle users on domains: %s', allowedDomains);
-
-    const newJoinerEmails = getPersonioEmployeeEmailsByStatus_('onboarding').filter(email => isEmailDomainAllowed(email));
+function truncateMailboxes() {
 
     let firstError = null;
 
-    for (const primaryEmail of newJoinerEmails) {
-        // we keep operating if handling calendars of a single user fails
+    // we keep operating if a single sync task fails
+    for (const task of getTasks_()) {
+
         try {
-            subscribeUserCalendars_(getServiceAccountCredentials_(), primaryEmail, calendarIds);
+            cleanUserMailbox_(getServiceAccountCredentials_(), task.primaryEmail, task.cleanFilter);
         } catch (e) {
-            Logger.log('Failed to ensure calendars of user %s: %s', primaryEmail, e.message);
+            Logger.log('Failed to clean mailbox %s: %s', task.primaryEmail, e.message);
             firstError = firstError || e;
         }
     }
@@ -84,24 +68,62 @@ function addCalendarsToNewJoiners() {
 }
 
 
-/** Subscribe a single account to all the specified calendars. */
-function subscribeUserCalendars_(serviceAccountCredentials, primaryEmail, calendarIds) {
+/** Clean the specified user's mailbox based on search expression.
+ *
+ * WARNING: This is intended to be used for emergencies, adhering to regulatory requirements or to
+ *          keep automated account's inboxes clean. Use with utmost care!
+ */
+function cleanUserMailbox_(serviceAccountCredentials, primaryEmail, searchExpression) {
 
-    const calendarList = CalendarListClient.withImpersonatingService(serviceAccountCredentials, primaryEmail);
+    const gmail = GmailClientV1.withImpersonatingService(serviceAccountCredentials, primaryEmail);
 
-    const existingCalendars = calendarList.list();
-    for (const calendarId of calendarIds) {
-        if (!existingCalendars.some(calendar => calendar.id === calendarId)) {
-            // continue operating if adding a single calendar fails
-            try {
-                const newItem = calendarList.insert({id: calendarId});
-                existingCalendars.push(newItem); // to handle duplicates in calendarIds
-                Logger.log('Added calendar %s to user %s', calendarId, primaryEmail);
-            } catch (e) {
-                Logger.log('Failed to add calendar %s to user %s: %s', calendarId, primaryEmail, e.message);
+    const cleanMessages = (messages) => {
+
+        //gmail.deleteUserMessages(primaryEmail, messages.map(message => message.id));
+        Logger.log("mailbox %s: deleted %s messages", primaryEmail, messages.length);
+
+        return []; // no need to accumulate
+    };
+
+    gmail.listUserMessages(primaryEmail, searchExpression, cleanMessages);
+}
+
+
+function getTasks_() {
+
+    const scriptProperties = PropertiesService.getScriptProperties();
+    if (!scriptProperties) {
+        Logger.log('ScriptProperties not accessible');
+        return [];
+    }
+
+    const properties = PropertiesService.getScriptProperties().getProperties() || {};
+    const tasks = [];
+    for (const key in properties) {
+
+        const safeKey = key.trim();
+        if (!safeKey.startsWith(PROPERTY_PREFIX))
+            continue;
+
+        const primaryEmail = safeKey.replace(PROPERTY_PREFIX, '');
+        // an email should at least look like x@y.z
+        if (!primaryEmail || !primaryEmail.includes('@') || primaryEmail.length < 5) {
+            continue;
+        }
+
+        try {
+            const cleanFilter = properties[key] || '';
+            if (cleanFilter) {
+                tasks.push({primaryEmail: primaryEmail, cleanFilter: cleanFilter});
+            } else {
+                Logger.log("Skipped task: key %s: value (CLEAN_FILTER) must be a gmail search expression", key);
             }
+        } catch (e) {
+            Logger.log('Skipped task: Incorrect config for property key %s: %s', key, e.message);
         }
     }
+
+    return tasks;
 }
 
 
