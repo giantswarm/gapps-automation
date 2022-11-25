@@ -37,7 +37,12 @@ const TRIGGER_HANDLER_FUNCTION = 'addCalendarsToNewJoiners';
  *   AddCalendars.serviceAccountCredentials  {...SERVICE_ACCOUNT_CREDENTIALS...}
  *   AddCalendars.allowedDomains             giantswarm.io,giantswarm.com
  *
- * One can use the following command line to compress the service account creds into one line:
+ * Requires service account credentials (with domain-wide delegation enabled) to be set, for example via:
+ *
+ *   $ clasp run 'setProperties' --params '[{"AddCalendars.serviceAccountCredentials": "{...ESCAPED_JSON...}"}, false]'
+ *
+ * One may use the following command line to compress the service account creds into one line:
+ *
  *   $ cat credentials.json | tr -d '\n '
  *
  * The service account must be configured correctly and have at least permission for these scopes:
