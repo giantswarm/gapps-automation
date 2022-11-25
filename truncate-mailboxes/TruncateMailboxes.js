@@ -32,6 +32,8 @@ const TRIGGER_HANDLER_FUNCTION = 'truncateMailboxes';
  *      Examples:
  *        older_than:30d
  *        size:1000000
+ *        from:prince938182@hotmail.com
+ *        subject:Dogecoin
  *
  * Requires service account credentials (with domain-wide delegation enabled) to be set, for example via:
  *
@@ -42,7 +44,7 @@ const TRIGGER_HANDLER_FUNCTION = 'truncateMailboxes';
  *   $ cat credentials.json | tr -d '\n '
  *
  * The service account must be configured correctly and have at least permission for these scopes:
- *   https://www.googleapis.com/auth/calendar
+ *   https://mail.google.com/
  *
  * Ensure that this methods ExecutionApi scope is limited to MYSELF in the manifest,
  * to prevent other unauthorized domain users from using its features.
