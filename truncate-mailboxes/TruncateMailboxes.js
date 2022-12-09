@@ -80,8 +80,12 @@ function cleanUserMailbox_(serviceAccountCredentials, primaryEmail, searchExpres
     const gmail = GmailClientV1.withImpersonatingService(serviceAccountCredentials, primaryEmail);
 
     const cleanMessages = (messages) => {
-        gmail.deleteUserMessages(primaryEmail, messages.map(message => message.id));
-        return [messages.length]; // accumulate only stats
+        if (Array.isArray(messages) && messages.length > 0)
+        {
+            gmail.deleteUserMessages(primaryEmail, messages.map(message => message.id));
+            return [messages.length]; // accumulate only stats
+        }
+        return [0]
     };
 
     const batches = gmail.listUserMessages(primaryEmail, searchExpression, cleanMessages);
