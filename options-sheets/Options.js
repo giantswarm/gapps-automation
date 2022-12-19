@@ -87,17 +87,20 @@ const calculateVesting = function (shares, start, end1, end2, end3, excludedMont
 
     // phase 1 (0 -> 25%)
     const phase1Months = Math.min(vestedMonths, vesting25_months_total);
-    vestedShares += (phase1Months * (shares * 0.25)) / vesting25_months_total;
+    const phase1Shares = shares * 0.25;
+    vestedShares += vesting25_months_total > 0 ? ((phase1Months * phase1Shares) / vesting25_months_total) : phase1Shares;
     vestedMonths -= phase1Months;
 
     // phase 2 (25 -> 50%)
     const phase2Months = Math.min(vestedMonths, vesting50_months_total);
-    vestedShares += (phase2Months * (shares * 0.25)) / vesting50_months_total;
+    const phase2Shares = shares * 0.25;
+    vestedShares += vesting50_months_total > 0 ? ((phase2Months * phase2Shares) / vesting50_months_total) : phase2Shares;
     vestedMonths -= phase2Months;
 
     // phase 3 (50 -> 100%)
     const phase3Months = Math.min(vestedMonths, vesting100_months_total);
-    vestedShares += (phase3Months * (shares * 0.50)) / vesting100_months_total;
+    const phase3Shares = shares * 0.50;
+    vestedShares += vesting100_months_total > 0 ? ((phase3Months * phase3Shares) / vesting100_months_total) : phase3Shares;
     vestedMonths -= phase3Months;
 
     return +(new Number(vestedShares).toFixed(2));
