@@ -213,10 +213,13 @@ function transformPersonioDataToRelations_(data, schemaKey) {
     const scanObject = (item, parents) => {
 
         // map attribute labels to columns
-        const attributes = item?.attributes;
-        const itemType = item?.type;
-        if (!Util.isObject(attributes) || !itemType)
-            throw new Error(`Unknown object without type or attributes: ${JSON.stringify(item)}`);
+        let attributes = item?.attributes;
+        let itemType = item?.type;
+        if (!Util.isObject(attributes) || !itemType) {
+            // just serialize as key/value map, separated by commas
+            // this could be TimeOffPeriod.attributes.certificate or similar "irregular objects"
+            return null;
+        }
 
         if (hasParentOfType(parents, itemType))
             return itemType;
@@ -250,10 +253,7 @@ function transformPersonioDataToRelations_(data, schemaKey) {
                 let rel = null;
                 if (Util.isObject(unpackedValue)) {
                     rel = scanObject(unpackedValue, parents.concat([item]));
-                    if (!rel) {
-                        continue;
-                    }
-                    // nested, possibly circular type was registered
+                    // rel != null: nested, possibly circular type was registered
                 }
 
                 // add column header
@@ -293,6 +293,16 @@ function transformPersonioDataToRelations_(data, schemaKey) {
             }
         }
 
+        const serializeNestedFieldValue = v => {
+            if (v instanceof Date) {
+                return v.toISOString();
+            } else if (v == null) {
+                return '';
+            } else {
+                return '' + v;
+            }
+        };
+
         const row = [];
         for (const column in relation.headers) {
             const header = relation.headers[column];
@@ -306,23 +316,21 @@ function transformPersonioDataToRelations_(data, schemaKey) {
                     const itemId = getItemId(unpackedValue);
                     fields.push(itemId);
                     convertObject(unpackedValue, parents.concat([item]));
+                }
+                else if (Util.isObject(value)) {
+                    // this is a plain object (wihout type/attributes)
+                    for (const [k, v] of Object.entries(value)) {
+                        fields.push(('' + k + '=') + serializeNestedFieldValue(v));
+                    }
                 } else {
                     fields.push(unpackedValue);
                 }
             }
 
-            if (values.length > 1) {
+            if (fields.length > 1) {
                 // plain value null/undefined -> ''
                 // arrays joined by ',' (comma)
-                row.push(fields.map(v => {
-                    if (v instanceof Date) {
-                        return v.toISOString();
-                    } else if (v == null) {
-                        return '';
-                    } else {
-                        return '' + v;
-                    }
-                }).join(','));
+                row.push(fields.map(v => serializeNestedFieldValue(v)).join(','));
             } else {
                 row.push(fields[0]);
             }
@@ -335,7 +343,10 @@ function transformPersonioDataToRelations_(data, schemaKey) {
     loadSchema(schemaKey);
     ++relations.version;
     for (const item of data) {
-        scanObject(item, []);
+        if (scanObject(item, []) == null)
+        {
+            throw new Error(`Invalid top level object (no type/attributes field): ${JSON.stringify(item)}`)
+        }
     }
     // Persist updated schema version
     saveSchema(schemaKey);
@@ -347,7 +358,6 @@ function transformPersonioDataToRelations_(data, schemaKey) {
 
         relation.rows.push(Object.values(relation.headers).map(header => header.t));
     }
-
 
     // #3 Convert data (rows)
     for (const item of data) {
