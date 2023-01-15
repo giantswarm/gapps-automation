@@ -5,7 +5,7 @@ gas_projects_clean = $(subst /.clasp.json,-clean,$(clasp_files))
 # unfortunately order matters here
 # see: https://stackoverflow.com/questions/68379711/google-apps-script-hoisting-and-referenceerror
 # (in Apps Script Editor one could set file position manually)
-lib_files = lib/OAuth2.gs lib/UrlFetchJsonClient.js lib/CalendarListClient.js lib/PersonioAuthV1.js \
+lib_files = lib/OAuth2.gs lib/UrlFetchJsonClient.js lib/CalendarListClient.js lib/CalendarClient.js lib/PersonioAuthV1.js \
 	lib/PersonioClientV1.js lib/GmailClientV1.js lib/SheetUtil.js lib/TriggerUtil.js lib/Util.js
 
 .PHONY: all
@@ -16,7 +16,7 @@ all: $(gas_projects)
 	@echo Pushing project $@
 	cd $@ && clasp push -f
 
-.PRECIOUS: %/lib.js
+#.PRECIOUS: %/lib.js
 %/lib.js: $(lib_files)
 	@echo Updating library $@
 	cat $^ > $@
