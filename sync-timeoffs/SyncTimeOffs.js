@@ -490,7 +490,9 @@ function indexPersonioTimeOffs_(timeOffs) {
 
         // Certain (all?) Personio timestamps are invalid. They must be shifted by "-01:00" (1 hour in the past) or the other way for uploads.
         // see: https://community.personio.com/attendances-absences-87/absences-api-updated-at-and-created-at-timestamp-values-invalid-1743?postid=5870#post5870
-        const updatedAt = Util.addDateMillies(new Date(attributes.updated_at), -1 * 60 * 60 * 1000); // -1h
+        const updatedAt = (attributes.created_by !== 'API')
+            ? Util.addDateMillies(new Date(attributes.updated_at), -1 * 60 * 60 * 1000) // -1h
+            : new Date(attributes.updated_at);
 
         const timeOff = {
             id: attributes.id,
