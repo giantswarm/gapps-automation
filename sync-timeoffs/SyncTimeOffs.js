@@ -38,38 +38,19 @@ const MINIMUM_OUT_OF_OFFICE_DURATION_HALF_DAY_MILLIES = 3 * 60 * 60 * 1000;  // 
 /** The minimum duration of a whole day or longe out-of-office event. */
 const MINIMUM_OUT_OF_OFFICE_DURATION_WHOLE_DAY_MILLIES = 6 * 60 * 60 * 1000; // whole-day >= 6h
 
-
-
-
-/** People time is supposed to make handling rough local times a bit easier
- * without having to pull in Joda Time or similar libs.
+/** Maximum number of attempts to retry doing something with the Personio API, per event.
+ *
+ * This is intended as a forward oriented measure to avoid wasting resources
+ * in case there are "hanging" events (for example after configuration or API changes).
+ *
+ * In case of long-lasting Personio problems (outage or similar) a few events may stop being synced.
+ *
+ * There are three options to handle this situation:
+ *    - increase this fail count by 1 (so one more retry is allowed)
+ *    - reset fail count for all or the relevant events
+ *    - ignore the situation
  */
-class PeopleTime {
-    constructor(year, month, day, hour) {
-        this.year = year;
-        this.month = month;
-        this.day = day;
-        this.hour = hour;
-    }
-
-    isFirstHalfDay() {
-        return this.hour < 12;
-    }
-
-    /** Get a PeopleTime instance from a ISO8601 timestamp like (ie. "2016-05-13" or "2018-09-24T20:15:13.123+01:00" .*/
-    fromISO8601(ts) {
-        // we care about local date-time
-        if (ts) {
-            const dateAndTime = ts.trim().split('T');
-            const ymd = dateAndTime[0].split('-').map(field => +field);
-            const hour = dateAndTime[1] ? +(dateAndTime[1].substring(0, 2)) : 0;
-
-            return new PeopleTime(ymd[0], ymd[1], ymd[2], hour);
-        }
-
-        return undefined;
-    }
-}
+const MAX_SYNC_FAIL_COUNT = 10;
 
 
 /** Main entry point.
@@ -136,17 +117,17 @@ function syncTimeOffs() {
             continue;
         }
 
-        if (!isEmailDomainAllowed(email)) {
-            Logger.log('Not synchronizing employee with email %s: mail domain not white-listed', email);
-            continue;
-        }
-
-        // we keep operating if handling calendar of a single user fails
-        try {
-            syncUserTimeOffs_(personio, employee, epoch, timeOffTypes, fetchTimeMin, fetchTimeMax)
-        } catch (e) {
-            Logger.log('Failed to sync time-offs/out-of-offices of user %s: %s', email, e);
-            firstError = firstError || e;
+        if (isEmailDomainAllowed(email)) {
+            // we keep operating if handling calendar of a single user fails
+            try {
+                const calendar = CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), email);
+                syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchTimeMin, fetchTimeMax)
+            } catch (e) {
+                Logger.log('Failed to sync time-offs/out-of-offices of user %s: %s', email, e);
+                firstError = firstError || e;
+            }
+        } else {
+            Logger.log('Not synchronizing employee with email %s: domain not white-listed', email);
         }
     }
 
@@ -221,6 +202,7 @@ function getLookbackDays_() {
     return lookbackDays;
 }
 
+
 /** Get the Personio token. */
 function getPersonioCreds_() {
     const credentialFields = (getScriptProperties_().getProperty(PERSONIO_TOKEN_KEY) || '|')
@@ -232,7 +214,7 @@ function getPersonioCreds_() {
 
 
 /** Subscribe a single account to all the specified calendars. */
-function syncUserTimeOffs_(personio, employee, epoch, timeOffTypes, fetchTimeMin, fetchTimeMax) {
+function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchTimeMin, fetchTimeMax) {
 
     const primaryEmail = employee.attributes.email.value;
 
@@ -240,23 +222,13 @@ function syncUserTimeOffs_(personio, employee, epoch, timeOffTypes, fetchTimeMin
     const updateDeadZoneMillies = 120 * 1000; // 120 seconds, to avoid races and workaround lack of transactions
     const updateMax = Util.addDateMillies(new Date(epoch), -updateDeadZoneMillies);
 
-    // load timeOffs
-    const params = {
-        start_date: fetchTimeMin.toISOString().split("T")[0],
-        end_date: fetchTimeMax.toISOString().split("T")[0]
-    };
-    params['employees[]'] = employee.attributes.id.value;  // WTF Personio, ugly query params
-    const timeOffs = indexPersonioTimeOffs_(personio.getPersonioJson('/company/time-offs' + UrlFetchJsonClient.buildQuery(params)));
+    // load timeOffs indexed by ID
+    const timeOffs = queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, employee.attributes.id.value);
 
-    const calendar = CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), primaryEmail);
-    const eventListParams = {
-        singleEvents: true,
-        showDeleted: true,
-        timeMin: fetchTimeMin.toISOString(),
-        timeMax: fetchTimeMax.toISOString()
-    };
-    const allEvents = calendar.list('primary', eventListParams);
+    const allEvents = queryCalendarEvents_(calendar, 'primary', fetchTimeMin, fetchTimeMax);
     for (const event of allEvents) {
+        let failed = false;
+        const failCount = event.extendedProperties?.private?.syncFailCount || 0;
         const eventUpdatedAt = new Date(event.updated);
         const timeOffId = event.extendedProperties?.private?.timeOffId;
         if (timeOffId) {
@@ -267,32 +239,32 @@ function syncUserTimeOffs_(personio, employee, epoch, timeOffTypes, fetchTimeMin
 
                 delete timeOffs[timeOffId];
 
-                if (timeOff.updatedAt > updateMax || eventUpdatedAt > updateMax) {
+                if (timeOff.updatedAt > updateMax || eventUpdatedAt > updateMax || failCount > MAX_SYNC_FAIL_COUNT) {
                     // dead zone
                     continue;
                 }
 
                 if (event.status === 'cancelled') {
-                    syncActionDeleteTimeOff_(personio, primaryEmail, timeOff);
+                    failed = !syncActionDeleteTimeOff_(personio, primaryEmail, timeOff) || failed;
                 } else {
                     // need to convert to be able to compare start/end timestamps (Personio is whole-day/half-day only)
                     const updatedTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, timeOff);
-                    if (updatedTimeOff
-                        && (Math.abs(+updatedTimeOff.startAt - +timeOff.startAt) > 2000 || Math.abs(+updatedTimeOff.endAt - +timeOff.endAt) > 2000)) {
+                    if (updatedTimeOff && (!updatedTimeOff.startAt.equals(timeOff.startAt) || !updatedTimeOff.endAt.equals(timeOff.endAt))) {
                         // start/end timestamps differ by more than 2s, now compare which (Personio/Gcal) is more up-to-date
-                        if (+timeOff.updatedAt > +(eventUpdatedAt)) {
+                        if (+timeOff.updatedAt < +(eventUpdatedAt)) {
                             console.log("events differed OoO is newer: ", event, updatedTimeOff, timeOff);
                             syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff);
                         } else {
                             console.log("events differed TimeOff is newer: ", event, updatedTimeOff, timeOff);
-                            syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff);
+                            failed = !syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff) || failed;
                         }
                     }
                 }
             } else if (event.status !== 'cancelled') {
                 // check for dead zone
+                // we allow event cancellation even in case MAX_SYNC_FAIL_COUNT was reached
                 if (eventUpdatedAt <= updateMax) {
-                    syncActionDeleteEvent_(personio, calendar, primaryEmail, event);
+                    syncActionDeleteEvent_(calendar, primaryEmail, event);
                 }
             }
         } else if (event.status !== 'cancelled') {
@@ -303,12 +275,17 @@ function syncUserTimeOffs_(personio, employee, epoch, timeOffTypes, fetchTimeMin
             }
 
             // check for dead zone
-            if (eventUpdatedAt <= updateMax) {
+            if (eventUpdatedAt <= updateMax || failCount > MAX_SYNC_FAIL_COUNT) {
                 const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, undefined);
                 if (newTimeOff) {
-                    syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff);
+                    failed = !syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff) || failed;
                 }
             }
+        }
+
+        // register failure for Personio client circuit breaker
+        if (failed) {
+            syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCount + 1);
         }
     }
 
@@ -321,29 +298,36 @@ function syncUserTimeOffs_(personio, employee, epoch, timeOffTypes, fetchTimeMin
     }
 }
 
+
 /** Delete Personio TimeOffs for cancelled Google Calendar events */
 function syncActionDeleteTimeOff_(personio, primaryEmail, timeOff) {
     try {
         // event deleted in google calendar, delete in Personio
         deletePersonioTimeOff_(personio, timeOff);
         Logger.log('Deleted TimeOff "%s" at %s for user %s', timeOff.typeName, timeOff.startAt, primaryEmail);
+        return true;
     } catch (e) {
         Logger.log('Failed to delete TimeOff "%s" at %s for user %s: %s', timeOff.comment, timeOff.startAt, primaryEmail, e);
+        return false;
     }
 }
+
 
 /** Update Personio TimeOff -> Google Calendar event */
 function syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff) {
     try {
         // Update event timestamps
-        event.start.dateTime = timeOff.startAt.toISOString();
-        event.end.dateTime = timeOff.endAt.toISOString();
+        event.start.dateTime = timeOff.startAt.toISOString(timeOff.timeZoneOffset);
+        event.end.dateTime = timeOff.endAt.toISOString(timeOff.timeZoneOffset);
         calendar.update('primary', event.id, event);
         Logger.log('Updated event "%s" at %s for user %s', event.summary, event.start.dateTime, primaryEmail);
+        return true;
     } catch (e) {
         Logger.log('Failed to update event "%s" at %s for user %s: %s', event.summary, event.start.dateTime, primaryEmail, e);
+        return false;
     }
 }
+
 
 /** Update Google Calendar event -> Personio TimeOff */
 function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff) {
@@ -352,100 +336,96 @@ function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeO
         // updating by ID is not possible (according to docs AND trial and error)
         // since overlapping time-offs are not allowed (HTTP 400) no "more-safe" update operation is possible
         deletePersonioTimeOff_(personio, timeOff);
-        insertPersonioTimeOffAndUpdateEvent_(calendar, personio, updatedTimeOff, event);
+        const createdTimeOff = createPersonioTimeOff_(personio, updatedTimeOff)?.data;
+        setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.attributes.id);
+        calendar.update('primary', event.id, event);
         Logger.log('Updated TimeOff "%s" at %s for user %s', updatedTimeOff.typeName, updatedTimeOff.startAt, primaryEmail);
+        return true;
     } catch (e) {
         Logger.log('Failed to update TimeOff "%s" at %s for user %s: %s', timeOff.comment, timeOff.startAt, primaryEmail, e);
+        return false;
     }
 }
+
 
 /** Personio TimeOff -> New Google Calendar event */
 function syncActionInsertEvent_(calendar, primaryEmail, timeOffTypes, timeOff) {
     try {
         const newEvent = createEventFromTimeOff(timeOffTypes, timeOff);
         calendar.insert('primary', newEvent);
-        Logger.log('Created Out-of-Office "%s" at %s for user %s', newEvent.summary, timeOff.startAt, primaryEmail);
+        Logger.log('Inserted Out-of-Office "%s" at %s for user %s', timeOff.typeName, timeOff.startAt, primaryEmail);
+        return true;
     } catch (e) {
-        Logger.log('Failed to create Out-of-Office "%s" at %s for user %s: %s', timeOff.comment, timeOff.startAt, primaryEmail, e);
+        Logger.log('Failed to insert Out-of-Office "%s" at %s for user %s: %s', timeOff.typeName, timeOff.startAt, primaryEmail, e);
+        return false;
     }
 }
 
+
 /** Delete from Google Calendar */
-function syncActionDeleteEvent_(personio, calendar, primaryEmail, event) {
+function syncActionDeleteEvent_(calendar, primaryEmail, event) {
     try {
         event.status = 'cancelled';
         calendar.update('primary', event.id, event);
-        Logger.log('Cancelled out-of-office "%s" at %s for user %s', event.summary, event.startAt, primaryEmail);
+        Logger.log('Cancelled out-of-office "%s" at %s for user %s', event.summary, event.start.dateTime, primaryEmail);
+        return true;
     } catch (e) {
         Logger.log('Failed to cancel Out-Of-Office "%s" at %s for user %s: %s', event.summary, event.start.dateTime, primaryEmail, e);
+        return false;
     }
 }
+
 
 /** Google Calendar -> New Personio TimeOff */
 function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff) {
     try {
-        insertPersonioTimeOffAndUpdateEvent_(calendar, personio, newTimeOff, event);
+        const createdTimeOff = createPersonioTimeOff_(personio, newTimeOff)?.data;
+        setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.attributes.id);
+        calendar.update('primary', event.id, event);
         Logger.log('Inserted TimeOff "%s" at %s for user %s', newTimeOff.typeName, newTimeOff.startAt, primaryEmail);
+        return true;
     } catch (e) {
-        Logger.log('Failed to create new TimeOff "%s" at %s for user %s: %s', event.summary, event.start.dateTime, primaryEmail, e);
+        Logger.log('Failed to insert new TimeOff "%s" at %s for user %s: %s', event.summary, event.start.dateTime, primaryEmail, e);
+        return false;
     }
 }
 
-/** Convert time-offs in Personio API format to intermediate format and index by ID. */
-function indexPersonioTimeOffs_(timeOffs) {
-    const userTimeOffs = {};
-    for (const item of timeOffs) {
-        const attributes = item.attributes || {};
 
-        const startAt = new Date(attributes.start_date);
-        const endAt = new Date(attributes.end_date);
-        const timeZoneOffset = Util.getTimestampOffset(attributes.start_date);
-        const daysCount = 0.0 + attributes.days_count;
-        const halfDayStart = !!attributes.half_day_start;
-        const halfDayEnd = !!attributes.half_day_end;
-
-        // TODO Include work schedule info for correct translation, shouldn't matter for us now
-        const halfDayMillies = 12 * 60 * 60 * 1000;
-        const fullDayMillies = (24 * 60 * 60 * 1000) - 1000; // minus one second to stay at same day
-        if (daysCount > 1.0) {
-            Util.addDateMillies(startAt, halfDayStart ? halfDayMillies : 0);
-            Util.addDateMillies(endAt, halfDayEnd ? halfDayMillies : fullDayMillies);
-        } else {
-            Util.addDateMillies(startAt, halfDayEnd && !halfDayStart ? halfDayMillies : 0);
-            Util.addDateMillies(endAt, halfDayStart && !halfDayEnd ? halfDayMillies : fullDayMillies);
-        }
-
-        // Web UI created Personio created_at/updated_at timestamps are shifted +1h.
-        // see: https://community.personio.com/attendances-absences-87/absences-api-updated-at-and-created-at-timestamp-values-invalid-1743
-        const updatedAt = (attributes.created_by !== 'API')
-            ? Util.addDateMillies(new Date(attributes.updated_at), -1 * 60 * 60 * 1000) // -1h
-            : new Date(attributes.updated_at);
-
-        const timeOff = {
-            id: attributes.id,
-            startAt: startAt,
-            endAt: endAt,
-            typeId: attributes.time_off_type?.attributes.id,
-            typeName: attributes.time_off_type?.attributes.name,
-            timezoneOffset: timeZoneOffset,
-            comment: attributes.comment,
-            status: attributes.status,
-            updatedAt: updatedAt,
-            employeeId: attributes.employee?.attributes.id?.value,
-            email: (attributes.employee?.attributes.email?.value || '').trim()
-        };
-
-        userTimeOffs[timeOff.id] = timeOff;
+/** Update the event's syncFailCount property. */
+function syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCount) {
+    try {
+        setEventPrivateProperty_(event, 'syncFailCount', failCount);
+        calendar.update('primary', event.id, event);
+        return true;
+    } catch (e) {
+        Logger.log('Failed to set syncFailCount to %s for event at %s for user %s: %s', failCount, event.start.dateTime, primaryEmail, e);
+        return false;
     }
+}
 
-    return userTimeOffs;
+
+/** Fetch Google Calendar events.
+ *
+ * @param {CalendarClient} calendar Initialized and authenticated Google Calendar custom client.
+ * @param {string} calendarId Id of the calendar to query, or 'primary'.
+ * @param {Date} timeMin Minimum time to fetch events for.
+ * @param {Date} timeMax Maximum time to fetch events for.
+ *
+ * @return {Array<Object>} Array of Google Calendar event resources.
+ */
+function queryCalendarEvents_(calendar, calendarId, timeMin, timeMax) {
+    const eventListParams = {
+        singleEvents: true,
+        showDeleted: true,
+        timeMin: timeMin.toISOString(),
+        timeMax: timeMax.toISOString()
+    };
+    return calendar.list(calendarId, eventListParams);
 }
 
 /** Guess timeOffType from a text (description of out-of-office events usually). */
 function guessTimeOffType_(timeOffTypes, event) {
 
-    const start = new Date(event.start.dateTime);
-    const end = new Date(event.end.dateTime);
     const text = ((event?.source?.title || '') + ' '
         + (event?.location || '') + ' '
         + (event?.description || '') + ' '
@@ -461,6 +441,82 @@ function guessTimeOffType_(timeOffTypes, event) {
     }
 
     return matchedTimeOfType;
+}
+
+
+/** Convert time-offs in Personio API format to intermediate format. */
+function normalizePersonioTimeOffPeriod_(timeOffPeriod) {
+    const attributes = timeOffPeriod.attributes || {};
+
+    // parse start/end dates assuming whole-days
+    const startAt = PeopleTime.fromISO8601(attributes.start_date, 0);
+    const endAt = PeopleTime.fromISO8601(attributes.end_date, 24);
+
+    // Handle "half day logic"
+    // NOTE: Full addHours() calculations shouldn't be required,
+    //       as we operate in the same time-zone (same day) and only care about wall-clock times.
+    const halfDayStart = !!attributes.half_day_start;
+    const halfDayEnd = !!attributes.half_day_end;
+    if (startAt.isAtSameDay(endAt)) {
+        // single-day events can have a have day in the morning or in the afternoon
+        if (halfDayStart && !halfDayEnd) {
+            endAt.hour = 12;
+        } else if (!halfDayStart && halfDayEnd) {
+            startAt.hour = 12;
+        }
+    } else {
+        // for multi-day events, half-days can occur on each end
+        if (halfDayStart) {
+            startAt.hour = 12;
+        }
+        if (halfDayEnd) {
+            endAt.hour = 12;
+        }
+    }
+
+    // Web UI created Personio created_at/updated_at timestamps are shifted +1h.
+    // see: https://community.personio.com/attendances-absences-87/absences-api-updated-at-and-created-at-timestamp-values-invalid-1743
+    const updatedAtOffset = (attributes.created_by !== 'API') ? -1 * 60 * 60 * 1000 : 0; // -1h if creator isn't API
+    const updatedAt = Util.addDateMillies(new Date(attributes.updated_at), updatedAtOffset)
+
+    return {
+        id: attributes.id,
+        startAt: startAt,
+        endAt: endAt,
+        typeId: attributes.time_off_type?.attributes.id,
+        typeName: attributes.time_off_type?.attributes.name,
+        comment: attributes.comment,
+        status: attributes.status,
+        timeZoneOffset: Util.getTimestampOffset(attributes.start_date),
+        updatedAt: updatedAt,
+        employeeId: attributes.employee?.attributes.id?.value,
+        email: (attributes.employee?.attributes.email?.value || '').trim()
+    };
+}
+
+/** Convert time-offs in Personio API format to intermediate format and index by ID.
+ *
+ * @param {PersonioClientV1} personio Initialized and authenticated PersonioClientV1 instance.
+ * @param {Date} timeMin Minimum TimeOffPeriod fetch time.
+ * @param {Date} timeMax Maximum TimeOffPeriod fetch time.
+ * @param {number} employeeId Employee ID to query TimeOffPeriods for.
+ *
+ * @return {Object} Normalized TimeOff structures indexed by TimeOffPeriod ID.
+ */
+function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
+    const params = {
+        start_date: timeMin.toISOString().split("T")[0],
+        end_date: timeMax.toISOString().split("T")[0],
+        ['employees[]']: employeeId
+    };
+    const timeOffPeriods = personio.getPersonioJson('/company/time-offs' + UrlFetchJsonClient.buildQuery(params));
+    const timeOffs = {};
+    for (const timeOffPeriod of timeOffPeriods) {
+        const timeOff = normalizePersonioTimeOffPeriod_(timeOffPeriod);
+        timeOffs[timeOff.id] = timeOff;
+    }
+
+    return timeOffs;
 }
 
 
@@ -481,82 +537,33 @@ function convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, existingTim
         timeOffType = previousType;
     }
 
-    const start = new Date(event.start.dateTime);
-    const end = new Date(event.end.dateTime);
+    const halfDaysAllowed = !!timeOffType.attributes?.half_day_requests_enabled;
     if (!existingTimeOff) {
-        // if we create a new time-off, we don't accept events which do not cover a half-day/whole-day respectively
-        const minimumDurationMillies = timeOffType.attributes?.half_day_requests_enabled
+        // if we consider creating a new time-off (previously untracked),
+        // we ignore events which do not cover a certain minimum of hours
+        const minimumDurationMillies = halfDaysAllowed
             ? MINIMUM_OUT_OF_OFFICE_DURATION_HALF_DAY_MILLIES
             : MINIMUM_OUT_OF_OFFICE_DURATION_WHOLE_DAY_MILLIES;
-        if (end - start < minimumDurationMillies) {
+        if (+(new Date(event.end.dateTime)) - +(new Date(event.start.dateTime)) < minimumDurationMillies) {
             return undefined;
         }
     }
 
-    const startDateParts = event.start.dateTime.split('T');
-    const endDateParts = event.end.dateTime.split('T');
-    const startDate = startDateParts[0];
-    const endDate = endDateParts[0];
-    const startHourRaw = +startDateParts[1].split(':')[0];
-    const endHourRaw = +endDateParts[1].split(':')[0];
-    const startHour = (startHourRaw > 12 && startHourRaw <= 22) ? 12 : 0;
-    const endHour = (endHourRaw >= 2 && endHourRaw <= 12) ? 12 : 23;
-
-    // different day?
-    // This is all based on Berlin/Paris TZ (+01:00), we may have to do some minor adjustments in future!
-    // (Personio needs to become more "conformant"/"precise" in their API work.)
-
-    // default: whole-day
-    let half_day_start = false;
-    let half_day_end = false;
-
-    if (timeOffType.attributes?.half_day_requests_enabled) {
-        if (startDate !== endDate) {
-            if (startHour >= 12) {
-                half_day_start = true;
-            }
-            if (endHour <= 12) {
-                half_day_end = true;
-            }
-        } else {
-            if (startHour >= 12) {
-                half_day_end = true;
-            } else if (endHour <= 12) {
-                half_day_start = true;
-            }
-        }
-    }
-
-    const startAt = new Date(start);
-    startAt.setHours(startHour, 0, 0, 0);
-    const endAt = new Date(end);
-    if (endHour === 23) {
-        endAt.setHours(23, 59, 59, 0);
-    } else {
-        endAt.setHours(endHour, 0, 0, 0);
-    }
-
-    // We try to adjust for Personio's weird/incorrect ISO8601 timestamp handling here.
-    // TODO Can we handle timestamps correctly somehow?
+    const startAt = PeopleTime.fromISO8601(event.start.dateTime).normalizeHalfDay(false, halfDaysAllowed);
+    const endAt = PeopleTime.fromISO8601(event.end.dateTime).normalizeHalfDay(true, halfDaysAllowed);
     const timeZoneOffset = Util.getTimestampOffset(event.start.dateTime);
-    //Util.addDateMillies(startAt, timeZoneOffset);
-    // event.end maybe at 0 o'clock on the _next day_
-    if (endAt.getHours() === 24 && endAt.getMinutes() === 0 && endAt.getSeconds() === 0) {
-        Util.addDateMillies(endAt, -1000); // minus one second to roll back into previous day
-    }
 
     return {
         startAt: startAt,
         endAt: endAt,
         typeId: timeOffType.attributes.id,
         typeName: timeOffType.attributes.name,
-        timezoneOffset: timeZoneOffset,
+        timeZoneOffset: timeZoneOffset,
         comment: event.summary.replace(' [synced]', ''),
         updatedAt: new Date(event.updated),
         employeeId: employee.attributes.id.value,
         email: employee.attributes.email.value,
-        half_day_start: half_day_start,
-        half_day_end: half_day_end
+        status: existingTimeOff ? existingTimeOff.status : 'pending'
     };
 }
 
@@ -571,18 +578,23 @@ function deletePersonioTimeOff_(personio, timeOff) {
 
 /** Insert a new Personio TimeOff. */
 function createPersonioTimeOff_(personio, timeOff) {
+
+    const isMultiDay = !timeOff.startAt.isAtSameDay(timeOff.endAt);
+    const halfDayStart = isMultiDay ? timeOff.startAt.isHalfDay() : timeOff.endAt.isHalfDay();
+    const halfDayEnd = isMultiDay ? timeOff.endAt.isHalfDay() : timeOff.startAt.isHalfDay();
+
     return personio.fetchJson('/company/time-offs', {
         method: 'post',
         payload: {
             employee_id: timeOff.employeeId.toFixed(0),
             time_off_type_id: timeOff.typeId.toFixed(0),
             // Reminder: there may be adjustments needed to handle timezones better to avoid switching days, here
-            start_date: timeOff.startAt.toISOString().split('T')[0],
-            end_date: timeOff.endAt.toISOString().split('T')[0],
-            half_day_start: timeOff.half_day_start ? "1" : "0",
-            half_day_end: timeOff.half_day_end ? "1" : "0",
+            start_date: timeOff.startAt.toISODate(),
+            end_date: timeOff.endAt.toISODate(),
+            half_day_start: halfDayStart ? "1" : "0",
+            half_day_end: halfDayEnd ? "1" : "0",
             comment: timeOff.comment,
-            skip_approval: timeOff.status === 'approved'
+            skip_approval: timeOff.status === 'approved' ? "1" : "0"
         }
     });
 }
@@ -593,10 +605,10 @@ function createEventFromTimeOff(timeOffTypes, timeOff) {
     const newEvent = {
         kind: 'calendar#event',
         start: {
-            dateTime: timeOff.startAt.toISOString()
+            dateTime: timeOff.startAt.toISOString(timeOff.timeZoneOffset)
         },
         end: {
-            dateTime: timeOff.endAt.toISOString()
+            dateTime: timeOff.endAt.switchHour24ToHour0().toISOString(timeOff.timeZoneOffset)
         },
         eventType: 'outOfOffice',
         extendedProperties: {
@@ -608,23 +620,17 @@ function createEventFromTimeOff(timeOffTypes, timeOff) {
     };
 
     // if we can't guess the corresponding time-off-type, prefix the event summary with its name
-    if (guessTimeOffType_(timeOffTypes, newEvent) === undefined) {
-        newEvent.summary = timeOff.typeName + ': ' + newEvent.summary
+    const guessedType = guessTimeOffType_(timeOffTypes, newEvent);
+    if (!guessedType || guessedType.attributes.id !== timeOff.typeId) {
+        newEvent.summary = timeOff.typeName.split('(')[0].trim() + ': ' + newEvent.summary
     }
 
     return newEvent;
 }
 
-
-/** Insert Personio time-off and update "timeOffId" property of existing Gcal event. */
-function insertPersonioTimeOffAndUpdateEvent_(calendar, personio, newTimeOff, event) {
-    const createdTimeOff = createPersonioTimeOff_(personio, newTimeOff)?.data;
-    if (!event.extendedProperties) {
-        event.extendedProperties = {};
-    }
-    if (!event.extendedProperties.private) {
-        event.extendedProperties.private = {};
-    }
-    event.extendedProperties.private.timeOffId = createdTimeOff.attributes.id;
-    calendar.update('primary', event.id, event);
+/** Set a private property on an event. */
+function setEventPrivateProperty_(event, key, value) {
+    const props = event.extendedProperties ? event.extendedProperties : event.extendedProperties = {};
+    const privateProps = props.private ? props.private : props.private = {};
+    privateProps[key] = value;
 }
