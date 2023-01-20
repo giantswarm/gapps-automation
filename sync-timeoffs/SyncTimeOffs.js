@@ -29,6 +29,21 @@ const LOOKAHEAD_DAYS_KEY = PROPERTY_PREFIX + 'lookaheadDays';
  */
 const LOOKBACK_DAYS_KEY = PROPERTY_PREFIX + 'lookbackDays';
 
+/** Maximum number of attempts to retry doing something with the Personio API, per event.
+ *
+ * This is intended as a forward oriented measure to avoid wasting resources
+ * in case there are "hanging" events (for example after configuration or API changes).
+ *
+ * In case of long-lasting Personio problems (outage or similar) a few events may stop being synced.
+ *
+ * There are ways to handle this situation:
+ *    - increase MAX_SYNC_FAIL_COUNT by 1 (so one more retry is allowed)
+ *    - reset fail count for the affected events (using scripting here or some tool)
+ *    - delete the Gcal events and create new ones (failCount: 0)
+ *    - ignore the situation (it's just a few events)
+ */
+const MAX_SYNC_FAIL_COUNT_KEY = PROPERTY_PREFIX + 'maxSyncFailCount';
+
 /** The trigger handler function to call in time based triggers. */
 const TRIGGER_HANDLER_FUNCTION = 'syncTimeOffs';
 
@@ -37,20 +52,6 @@ const MINIMUM_OUT_OF_OFFICE_DURATION_HALF_DAY_MILLIES = 3 * 60 * 60 * 1000;  // 
 
 /** The minimum duration of a whole day or longe out-of-office event. */
 const MINIMUM_OUT_OF_OFFICE_DURATION_WHOLE_DAY_MILLIES = 6 * 60 * 60 * 1000; // whole-day >= 6h
-
-/** Maximum number of attempts to retry doing something with the Personio API, per event.
- *
- * This is intended as a forward oriented measure to avoid wasting resources
- * in case there are "hanging" events (for example after configuration or API changes).
- *
- * In case of long-lasting Personio problems (outage or similar) a few events may stop being synced.
- *
- * There are three options to handle this situation:
- *    - increase this fail count by 1 (so one more retry is allowed)
- *    - reset fail count for all or the relevant events
- *    - ignore the situation
- */
-const MAX_SYNC_FAIL_COUNT = 10;
 
 
 /** Main entry point.
@@ -95,6 +96,8 @@ function syncTimeOffs() {
     const lookbackMillies = -Math.round(getLookbackDays_() * 24 * 60 * 60 * 1000);
     // how far into the future to sync events/time-offs
     const lookaheadMillies = Math.round(getLookaheadDays_() * 24 * 60 * 60 * 1000);
+    // how many Personio action retries per event?
+    const maxFailCount = getMaxSyncFailCount_();
 
     const fetchTimeMin = Util.addDateMillies(new Date(epoch), lookbackMillies);
     fetchTimeMin.setUTCHours(0, 0, 0, 0); // round down to start of day
@@ -121,7 +124,7 @@ function syncTimeOffs() {
             // we keep operating if handling calendar of a single user fails
             try {
                 const calendar = CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), email);
-                syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchTimeMin, fetchTimeMax)
+                syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchTimeMin, fetchTimeMax, maxFailCount)
             } catch (e) {
                 Logger.log('Failed to sync time-offs/out-of-offices of user %s: %s', email, e);
                 firstError = firstError || e;
@@ -203,6 +206,19 @@ function getLookbackDays_() {
 }
 
 
+/** Get the number of tries to act using the Personio API, per event. The default is 10. */
+function getMaxSyncFailCount_() {
+    const value = (getScriptProperties_().getProperty(MAX_SYNC_FAIL_COUNT_KEY) || '').trim();
+    const maxFailCount = Math.abs(Math.round(+value));
+    if (!maxFailCount || Number.isNaN(maxFailCount)) {
+        // use default: try 10 times
+        return 10;
+    }
+
+    return maxFailCount;
+}
+
+
 /** Get the Personio token. */
 function getPersonioCreds_() {
     const credentialFields = (getScriptProperties_().getProperty(PERSONIO_TOKEN_KEY) || '|')
@@ -214,7 +230,7 @@ function getPersonioCreds_() {
 
 
 /** Subscribe a single account to all the specified calendars. */
-function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchTimeMin, fetchTimeMax) {
+function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchTimeMin, fetchTimeMax, maxFailCount) {
 
     const primaryEmail = employee.attributes.email.value;
 
@@ -239,7 +255,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
 
                 delete timeOffs[timeOffId];
 
-                if (timeOff.updatedAt > updateMax || eventUpdatedAt > updateMax || failCount > MAX_SYNC_FAIL_COUNT) {
+                if (timeOff.updatedAt > updateMax || eventUpdatedAt > updateMax || failCount > maxSyncFail) {
                     // dead zone
                     continue;
                 }
@@ -262,7 +278,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
                 }
             } else if (event.status !== 'cancelled') {
                 // check for dead zone
-                // we allow event cancellation even in case MAX_SYNC_FAIL_COUNT was reached
+                // we allow event cancellation even in case maxSyncFail was reached
                 if (eventUpdatedAt <= updateMax) {
                     syncActionDeleteEvent_(calendar, primaryEmail, event);
                 }
@@ -275,7 +291,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
             }
 
             // check for dead zone
-            if (eventUpdatedAt <= updateMax || failCount > MAX_SYNC_FAIL_COUNT) {
+            if (eventUpdatedAt <= updateMax || failCount > maxSyncFail) {
                 const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, undefined);
                 if (newTimeOff) {
                     failed = !syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff) || failed;
