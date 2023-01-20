@@ -243,8 +243,8 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
 
     const allEvents = queryCalendarEvents_(calendar, 'primary', fetchTimeMin, fetchTimeMax);
     for (const event of allEvents) {
-        let failed = false;
         const failCount = event.extendedProperties?.private?.syncFailCount || 0;
+        let nextFailCount = failCount;
         const eventUpdatedAt = new Date(event.updated);
         const timeOffId = event.extendedProperties?.private?.timeOffId;
         if (timeOffId) {
@@ -255,13 +255,13 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
 
                 delete timeOffs[timeOffId];
 
-                if (timeOff.updatedAt > updateMax || eventUpdatedAt > updateMax || failCount > maxSyncFail) {
+                if (timeOff.updatedAt > updateMax || eventUpdatedAt > updateMax || failCount > maxFailCount) {
                     // dead zone
                     continue;
                 }
 
                 if (event.status === 'cancelled') {
-                    failed = !syncActionDeleteTimeOff_(personio, primaryEmail, timeOff) || failed;
+                    nextFailCount += !syncActionDeleteTimeOff_(personio, primaryEmail, timeOff);
                 } else {
                     // need to convert to be able to compare start/end timestamps (Personio is whole-day/half-day only)
                     const updatedTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, timeOff);
@@ -272,36 +272,31 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
                             syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff);
                         } else {
                             console.log("events differed TimeOff is newer: ", event, updatedTimeOff, timeOff);
-                            failed = !syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff) || failed;
+                            nextFailCount += !syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff);
                         }
                     }
                 }
             } else if (event.status !== 'cancelled') {
                 // check for dead zone
-                // we allow event cancellation even in case maxSyncFail was reached
+                // we allow event cancellation even in case maxFailCount was reached
                 if (eventUpdatedAt <= updateMax) {
                     syncActionDeleteEvent_(calendar, primaryEmail, event);
                 }
             }
         } else if (event.status !== 'cancelled') {
 
-            if (event.summary.trim() === 'Out of office') {
-                // ignore events created by Cronofy for now (summary always exactly "Out of office")
-                continue;
-            }
-
-            // check for dead zone
-            if (eventUpdatedAt <= updateMax || failCount > maxSyncFail) {
+            // check for dead zone, ignore events created by Cronofy
+            if (eventUpdatedAt <= updateMax && failCount <= maxFailCount && !event.iCalUID.includes('cronofy.com')) {
                 const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, undefined);
                 if (newTimeOff) {
-                    failed = !syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff) || failed;
+                    nextFailCount += !syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff);
                 }
             }
         }
 
         // register failure for Personio client circuit breaker
-        if (failed) {
-            syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCount + 1);
+        if (failCount !== nextFailCount) {
+            syncActionUpdateEventFailCount_(calendar, primaryEmail, event, nextFailCount);
         }
     }
 
@@ -442,11 +437,7 @@ function queryCalendarEvents_(calendar, calendarId, timeMin, timeMax) {
 /** Guess timeOffType from a text (description of out-of-office events usually). */
 function guessTimeOffType_(timeOffTypes, event) {
 
-    const text = ((event?.source?.title || '') + ' '
-        + (event?.location || '') + ' '
-        + (event?.description || '') + ' '
-        + (event?.summary || '')
-    ).toLowerCase();
+    const text = (event.summary || '').toLowerCase();
 
     let matchedTimeOfType = undefined;
     for (const timeOffType of timeOffTypes) {
@@ -503,7 +494,7 @@ function normalizePersonioTimeOffPeriod_(timeOffPeriod) {
         typeName: attributes.time_off_type?.attributes.name,
         comment: attributes.comment,
         status: attributes.status,
-        timeZoneOffset: Util.getTimestampOffset(attributes.start_date),
+        timeZoneOffset: Util.getTimeZoneOffset(attributes.start_date),
         updatedAt: updatedAt,
         employeeId: attributes.employee?.attributes.id?.value,
         email: (attributes.employee?.attributes.email?.value || '').trim()
@@ -567,7 +558,7 @@ function convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, existingTim
 
     const startAt = PeopleTime.fromISO8601(event.start.dateTime).normalizeHalfDay(false, halfDaysAllowed);
     const endAt = PeopleTime.fromISO8601(event.end.dateTime).normalizeHalfDay(true, halfDaysAllowed);
-    const timeZoneOffset = Util.getTimestampOffset(event.start.dateTime);
+    const timeZoneOffset = Util.getTimeZoneOffset(event.start.dateTime);
 
     return {
         startAt: startAt,
@@ -620,13 +611,14 @@ function createPersonioTimeOff_(personio, timeOff) {
 function createEventFromTimeOff(timeOffTypes, timeOff) {
     const newEvent = {
         kind: 'calendar#event',
+        iCalUID: '' + Util.generateUUIDv4() + '-p-' - timeOff.id + '-sync-timeoffs@giantswarm.io',
         start: {
             dateTime: timeOff.startAt.toISOString(timeOff.timeZoneOffset)
         },
         end: {
             dateTime: timeOff.endAt.switchHour24ToHour0().toISOString(timeOff.timeZoneOffset)
         },
-        eventType: 'outOfOffice',
+        eventType: 'outOfOffice',  // left here for completeness, still not fully supported by Google Calendar
         extendedProperties: {
             private: {
                 timeOffId: timeOff.id
