@@ -245,6 +245,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
     for (const event of allEvents) {
         const failCount = event.extendedProperties?.private?.syncFailCount || 0;
         let nextFailCount = failCount;
+        const isEventCancelled = event.status === 'cancelled';
         const eventUpdatedAt = new Date(event.updated);
         const timeOffId = event.extendedProperties?.private?.timeOffId;
         if (timeOffId) {
@@ -260,31 +261,28 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
                     continue;
                 }
 
-                if (event.status === 'cancelled') {
+                if (isEventCancelled) {
                     nextFailCount += !syncActionDeleteTimeOff_(personio, primaryEmail, timeOff);
                 } else {
                     // need to convert to be able to compare start/end timestamps (Personio is whole-day/half-day only)
                     const updatedTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, timeOff);
                     if (updatedTimeOff && (!updatedTimeOff.startAt.equals(timeOff.startAt) || !updatedTimeOff.endAt.equals(timeOff.endAt))) {
-                        // start/end timestamps differ by more than 2s, now compare which (Personio/Gcal) is more up-to-date
-                        if (+timeOff.updatedAt < +(eventUpdatedAt)) {
-                            console.log("events differed OoO is newer: ", event, updatedTimeOff, timeOff);
+                        // start/end timestamps differ, now check which (Personio/Google Calendar) has more recent changes
+                        if (+timeOff.updatedAt >= +eventUpdatedAt) {
                             syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff);
                         } else {
-                            console.log("events differed TimeOff is newer: ", event, updatedTimeOff, timeOff);
                             nextFailCount += !syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff);
                         }
                     }
                 }
-            } else if (event.status !== 'cancelled') {
+            } else if (!isEventCancelled) {
                 // check for dead zone
                 // we allow event cancellation even in case maxFailCount was reached
                 if (eventUpdatedAt <= updateMax) {
                     syncActionDeleteEvent_(calendar, primaryEmail, event);
                 }
             }
-        } else if (event.status !== 'cancelled') {
-
+        } else if (!isEventCancelled) {
             // check for dead zone, ignore events created by Cronofy
             if (eventUpdatedAt <= updateMax && failCount <= maxFailCount && !event.iCalUID.includes('cronofy.com')) {
                 const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, undefined);
@@ -483,8 +481,12 @@ function normalizePersonioTimeOffPeriod_(timeOffPeriod) {
 
     // Web UI created Personio created_at/updated_at timestamps are shifted +1h.
     // see: https://community.personio.com/attendances-absences-87/absences-api-updated-at-and-created-at-timestamp-values-invalid-1743
-    const updatedAtOffset = (attributes.created_by !== 'API') ? -1 * 60 * 60 * 1000 : 0; // -1h if creator isn't API
-    const updatedAt = Util.addDateMillies(new Date(attributes.updated_at), updatedAtOffset)
+    //   - checking for created_by isn't enough: later updates by the UI won't change the "created_by" field but still set a shifted updated_at :/
+    //   - while this issue persists, one has to make sure this runs at least every 30 minutes and catch "updated_at" values that lie in the future
+    const updatedAt = new Date(attributes.updated_at);
+    if (attributes.created_by !== 'API' || +updatedAt >= Date.now()) {
+        Util.addDateMillies(updatedAt, -1 * 60 * 60 * 1000);
+    }
 
     return {
         id: attributes.id,
