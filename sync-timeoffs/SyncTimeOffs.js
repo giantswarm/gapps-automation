@@ -116,7 +116,7 @@ function syncTimeOffs() {
     for (const employee of personio.getPersonioJson('/company/employees')) {
 
         const email = employee.attributes.email.value;
-        if (email !== 'jonas@giantswarm.io') {
+        if (email !== 'jonas@giantswarm.io' && email !== 'marcel@giantswarm.io') {
             continue;
         }
 
