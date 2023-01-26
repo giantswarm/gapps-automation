@@ -613,7 +613,7 @@ function createPersonioTimeOff_(personio, timeOff) {
 function createEventFromTimeOff(timeOffTypes, timeOff) {
     const newEvent = {
         kind: 'calendar#event',
-        iCalUID: '' + Util.generateUUIDv4() + '-p-' - timeOff.id + '-sync-timeoffs@giantswarm.io',
+        iCalUID: '' + Util.generateUUIDv4() + '-p-' + timeOff.id + '-sync-timeoffs@giantswarm.io',
         start: {
             dateTime: timeOff.startAt.toISOString(timeOff.timeZoneOffset)
         },
