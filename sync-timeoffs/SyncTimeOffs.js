@@ -17,6 +17,14 @@ const SERVICE_ACCOUNT_CREDENTIALS_KEY = PROPERTY_PREFIX + 'serviceAccountCredent
 /** Filter for allowed domains (to avoid working and failing on users present on foreign domains). */
 const ALLOWED_DOMAINS_KEY = PROPERTY_PREFIX + 'allowedDomains';
 
+/** White-list to restrict synchronization to a few tester email accounts.
+ *
+ * Must be one email or a comma separated list.
+ *
+ * Default: null or empty
+ */
+const EMAIL_WHITELIST_KEY = PROPERTY_PREFIX + 'emailWhiteList';
+
 /** Lookahead days for event/time-off synchronization.
  *
  * Default: 6 * 30 days, should scale up to ~18 months
@@ -86,8 +94,12 @@ function syncTimeOffs() {
     const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
         .split(',')
         .map(d => d.trim());
-    const isEmailDomainAllowed = email => allowedDomains.includes(email.substring(email.lastIndexOf('@') + 1));
-    Logger.log('Configured to handle users on domains: %s', allowedDomains);
+
+    const emailWhiteList = getEmailWhiteList_();
+    const isEmailAllowed = email => (!emailWhiteList.length || emailWhiteList.includes(email))
+        && allowedDomains.includes(email.substring(email.lastIndexOf('@') + 1));
+
+    Logger.log('Configured to handle accounts %s on domains %s', emailWhiteList.length ? emailWhiteList : '', allowedDomains);
 
     // all timing related activities are relative to this EPOCH
     const epoch = new Date();
@@ -113,11 +125,9 @@ function syncTimeOffs() {
     const timeOffTypes = personio.getPersonioJson('/company/time-off-types');
 
     // load and prepare list of employees to process
-    const employees = personio.getPersonioJson('/company/employees').filter(employee => {
-        const email = employee.attributes.email.value;
-        return (email === 'jonas@giantswarm.io' || email === 'marcel@giantswarm.io')
-            && isEmailDomainAllowed(email)
-    });
+    const employees = personio.getPersonioJson('/company/employees').filter(employee =>
+        employee.attributes.status.value !== 'inactive' && isEmailAllowed(employee.attributes.email.value)
+    );
     Util.shuffleArray(employees);
 
     Logger.log('Syncing events between %s and %s for %s accounts', fetchTimeMin.toISOString(), fetchTimeMax.toISOString(), '' + employees.length);
@@ -186,6 +196,13 @@ function getServiceAccountCredentials_() {
     }
 
     return JSON.parse(creds);
+}
+
+
+/** Get the email account white-list (optional, leave empty to sync all suitable accounts). */
+function getEmailWhiteList_() {
+    return (getScriptProperties_().getProperty(EMAIL_WHITELIST_KEY) || '').trim()
+        .split(',').map(email => email.trim()).filter(email => !!email);
 }
 
 
