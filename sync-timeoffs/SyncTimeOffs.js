@@ -91,6 +91,11 @@ const MINIMUM_OUT_OF_OFFICE_DURATION_WHOLE_DAY_MILLIES = 6 * 60 * 60 * 1000; // 
  */
 function syncTimeOffs() {
 
+    const scriptLock = LockService.getScriptLock();
+    if (!scriptLock.tryLock(5000)) {
+        Logger.log('Failed to acquire lock. Only one instance of this script can run at any given time!');
+    }
+
     const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
         .split(',')
         .map(d => d.trim());
@@ -152,6 +157,9 @@ function syncTimeOffs() {
     }
 
     Logger.log('Completed synchronization for %s of %s accounts', '' + processedCount, '' + employees.length);
+
+    // for completeness, also automatically released at exit
+    scriptLock.releaseLock();
 
     if (firstError) {
         throw firstError;
