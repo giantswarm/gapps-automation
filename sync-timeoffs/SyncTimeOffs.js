@@ -494,7 +494,7 @@ function guessTimeOffType_(timeOffTypes, event) {
 
     let matchedTimeOfType = undefined;
     for (const timeOffType of timeOffTypes) {
-        const typeNameFirstWord = timeOffType.attributes.name.split(' ')[0].toLowerCase();
+        const typeNameFirstWord = timeOffType.attributes.name.split(' ')[0].split('-')[0].toLowerCase();
         if (text.toLowerCase().includes(typeNameFirstWord)) {
             matchedTimeOfType = timeOffType;
         }
