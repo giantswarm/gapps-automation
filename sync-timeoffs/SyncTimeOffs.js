@@ -400,10 +400,11 @@ function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeO
         // updating by ID is not possible (according to docs AND trial and error)
         // since overlapping time-offs are not allowed (HTTP 400) no "more-safe" update operation is possible
         deletePersonioTimeOff_(personio, timeOff);
-        const createdTimeOff = createPersonioTimeOff_(personio, updatedTimeOff)?.data;
-        setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.attributes.id);
+        const createdTimeOff = createPersonioTimeOff_(personio, updatedTimeOff);
+        setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
+        updateEventPersonioDeepLink_(event, createdTimeOff);
         calendar.update('primary', event.id, event);
-        Logger.log('Updated TimeOff "%s" at %s for user %s', updatedTimeOff.typeName, updatedTimeOff.startAt, primaryEmail);
+        Logger.log('Updated TimeOff "%s" at %s for user %s', createdTimeOff.typeName, createdTimeOff.startAt, primaryEmail);
         return true;
     } catch (e) {
         Logger.log('Failed to update TimeOff "%s" at %s for user %s: %s', timeOff.comment, String(timeOff.startAt), primaryEmail, e);
@@ -443,10 +444,11 @@ function syncActionDeleteEvent_(calendar, primaryEmail, event) {
 /** Google Calendar -> New Personio TimeOff */
 function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff) {
     try {
-        const createdTimeOff = createPersonioTimeOff_(personio, newTimeOff)?.data;
-        setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.attributes.id);
+        const createdTimeOff = createPersonioTimeOff_(personio, newTimeOff);
+        setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
+        updateEventPersonioDeepLink_(event, createdTimeOff);
         calendar.update('primary', event.id, event);
-        Logger.log('Inserted TimeOff "%s" at %s for user %s', newTimeOff.typeName, String(newTimeOff.startAt), primaryEmail);
+        Logger.log('Inserted TimeOff "%s" at %s for user %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail);
         return true;
     } catch (e) {
         Logger.log('Failed to insert new TimeOff "%s" at %s for user %s: %s', event.summary, event.start.dateTime, primaryEmail, e);
@@ -506,6 +508,7 @@ function guessTimeOffType_(timeOffTypes, event) {
 
 /** Convert time-offs in Personio API format to intermediate format. */
 function normalizePersonioTimeOffPeriod_(timeOffPeriod) {
+
     const attributes = timeOffPeriod.attributes || {};
 
     // parse start/end dates assuming whole-days
@@ -647,7 +650,7 @@ function createPersonioTimeOff_(personio, timeOff) {
     const halfDayStart = isMultiDay ? timeOff.startAt.isHalfDay() : timeOff.endAt.isHalfDay();
     const halfDayEnd = isMultiDay ? timeOff.endAt.isHalfDay() : timeOff.startAt.isHalfDay();
 
-    return personio.fetchJson('/company/time-offs', {
+    const result = personio.fetchJson('/company/time-offs', {
         method: 'post',
         payload: {
             employee_id: timeOff.employeeId.toFixed(0),
@@ -661,6 +664,12 @@ function createPersonioTimeOff_(personio, timeOff) {
             skip_approval: timeOff.status === 'approved' ? "1" : "0"
         }
     });
+
+    if (!result?.data) {
+        throw new Error(`Failed to create TimeOffPeriod: ${JSON.stringify(result)}`);
+    }
+
+    return normalizePersonioTimeOffPeriod_(result.data);
 }
 
 
@@ -668,7 +677,7 @@ function createPersonioTimeOff_(personio, timeOff) {
 function createEventFromTimeOff(timeOffTypes, timeOff) {
     const newEvent = {
         kind: 'calendar#event',
-        iCalUID: '' + Util.generateUUIDv4() + '-p-' + timeOff.id + '-sync-timeoffs@giantswarm.io',
+        iCalUID: `${Util.generateUUIDv4()}-p-${timeOff.id}-sync-timeoffs@giantswarm.io`,
         start: {
             dateTime: timeOff.startAt.toISOString(timeOff.timeZoneOffset)
         },
@@ -681,7 +690,7 @@ function createEventFromTimeOff(timeOffTypes, timeOff) {
                 timeOffId: timeOff.id
             }
         },
-        summary: '' + timeOff.comment + ' [synced]'
+        summary: `${timeOff.comment} [synced]`
     };
 
     // if we can't guess the corresponding time-off-type, prefix the event summary with its name
@@ -690,8 +699,33 @@ function createEventFromTimeOff(timeOffTypes, timeOff) {
         newEvent.summary = timeOff.typeName.split('(')[0].trim() + ': ' + newEvent.summary
     }
 
+    // add a link to the correct Personio absence calendar page
+    updateEventPersonioDeepLink_(newEvent, timeOff);
+
     return newEvent;
 }
+
+
+/** Generate and add a link to the Personio Absence Calendar page for the specified TimeOffPeriod to this event. */
+function updateEventPersonioDeepLink_(event, timeOff) {
+    const employeeIdSafe = (+timeOff.employeeId).toFixed(0);
+    const timeOffTypeId = (+timeOff.typeId).toFixed(0);
+    const year = (+timeOff.startAt.year).toFixed(0);
+    const month = (+timeOff.startAt.month).toFixed(0);
+    const deepLink = `https://giant-swarm.personio.de/time-off/employee/${employeeIdSafe}/monthly?absenceTypeId=${timeOffTypeId}&month=${month}&year=${year}`;
+    const deepLinkHtml = `<a href="${deepLink}">Show in Personio</a>`;
+    if (!event.description) {
+        event.description = deepLinkHtml;
+    } else if (event.description) {
+        const deepLinkHtmlPattern = /<a.*href="https:\/\/giant-swarm.personio.de\/time-off\/employee\/.*".?>.+<\/a>/g;
+        if (deepLinkHtmlPattern.test(event.description)) {
+            event.description.replace(deepLinkHtmlPattern, deepLinkHtml);
+        } else {
+            event.description = `${event.description}<br/>${deepLinkHtml}`;
+        }
+    }
+}
+
 
 /** Set a private property on an event. */
 function setEventPrivateProperty_(event, key, value) {
