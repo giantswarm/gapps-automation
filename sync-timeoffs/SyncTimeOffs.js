@@ -93,7 +93,7 @@ function syncTimeOffs() {
 
     const scriptLock = LockService.getScriptLock();
     if (!scriptLock.tryLock(5000)) {
-        Logger.log('Failed to acquire lock. Only one instance of this script can run at any given time!');
+        throw new Error('Failed to acquire lock. Only one instance of this script can run at any given time!');
     }
 
     const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
