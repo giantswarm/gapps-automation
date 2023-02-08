@@ -382,12 +382,16 @@ function syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff) {
     try {
         // Update event timestamps
         event.start.dateTime = timeOff.startAt.toISOString(timeOff.timeZoneOffset);
+        event.start.date = null;
+        event.start.timeZone = null;
         event.end.dateTime = timeOff.endAt.switchHour24ToHour0().toISOString(timeOff.timeZoneOffset);
+        event.end.date = null;
+        event.end.timeZone = null;
         calendar.update('primary', event.id, event);
-        Logger.log('Updated event "%s" at %s for user %s', event.summary, event.start.dateTime, primaryEmail);
+        Logger.log('Updated event "%s" at %s for user %s', event.summary, event.start.dateTime || event.start.date, primaryEmail);
         return true;
     } catch (e) {
-        Logger.log('Failed to update event "%s" at %s for user %s: %s', event.summary, event.start.dateTime, primaryEmail, e);
+        Logger.log('Failed to update event "%s" at %s for user %s: %s', event.summary, event.start.dateTime || event.start.date, primaryEmail, e);
         return false;
     }
 }
@@ -432,10 +436,10 @@ function syncActionDeleteEvent_(calendar, primaryEmail, event) {
     try {
         event.status = 'cancelled';
         calendar.update('primary', event.id, event);
-        Logger.log('Cancelled out-of-office "%s" at %s for user %s', event.summary, event.start.dateTime, primaryEmail);
+        Logger.log('Cancelled out-of-office "%s" at %s for user %s', event.summary, event.start.dateTime || event.start.date, primaryEmail);
         return true;
     } catch (e) {
-        Logger.log('Failed to cancel Out-Of-Office "%s" at %s for user %s: %s', event.summary, event.start.dateTime, primaryEmail, e);
+        Logger.log('Failed to cancel Out-Of-Office "%s" at %s for user %s: %s', event.summary, event.start.dateTime || event.start.date, primaryEmail, e);
         return false;
     }
 }
@@ -451,7 +455,7 @@ function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTi
         Logger.log('Inserted TimeOff "%s" at %s for user %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail);
         return true;
     } catch (e) {
-        Logger.log('Failed to insert new TimeOff "%s" at %s for user %s: %s', event.summary, event.start.dateTime, primaryEmail, e);
+        Logger.log('Failed to insert new TimeOff "%s" at %s for user %s: %s', event.summary, event.start.dateTime || event.start.date, primaryEmail, e);
         return false;
     }
 }
@@ -464,7 +468,7 @@ function syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCoun
         calendar.update('primary', event.id, event);
         return true;
     } catch (e) {
-        Logger.log('Failed to set syncFailCount to %s for event at %s for user %s: %s', failCount, event.start.dateTime, primaryEmail, e);
+        Logger.log('Failed to set syncFailCount to %s for event at %s for user %s: %s', failCount, event.start.dateTime || event.start.date, primaryEmail, e);
         return false;
     }
 }
@@ -483,9 +487,12 @@ function queryCalendarEvents_(calendar, calendarId, timeMin, timeMax) {
     const eventListParams = {
         singleEvents: true,
         showDeleted: true,
+        // we use the local timezone to allow the simple Date constructor to correctly parse dates like "2016-05-16"
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         timeMin: timeMin.toISOString(),
         timeMax: timeMax.toISOString()
     };
+
     return calendar.list(calendarId, eventListParams);
 }
 
@@ -611,14 +618,16 @@ function convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, existingTim
         const minimumDurationMillies = halfDaysAllowed
             ? MINIMUM_OUT_OF_OFFICE_DURATION_HALF_DAY_MILLIES
             : MINIMUM_OUT_OF_OFFICE_DURATION_WHOLE_DAY_MILLIES;
-        if (+(new Date(event.end.dateTime)) - +(new Date(event.start.dateTime)) < minimumDurationMillies) {
+        if (+(new Date(event.end.dateTime || event.end.date)) - +(new Date(event.start.dateTime || event.start.date)) < minimumDurationMillies) {
             return undefined;
         }
     }
 
-    const startAt = PeopleTime.fromISO8601(event.start.dateTime).normalizeHalfDay(false, halfDaysAllowed);
-    const endAt = PeopleTime.fromISO8601(event.end.dateTime).normalizeHalfDay(true, halfDaysAllowed);
-    const timeZoneOffset = Util.getTimeZoneOffset(event.start.dateTime);
+    const startAt = PeopleTime.fromISO8601(event.start.dateTime || event.start.date).normalizeHalfDay(false, halfDaysAllowed);
+    const endAt = PeopleTime.fromISO8601(event.end.dateTime || event.end.date).normalizeHalfDay(true, halfDaysAllowed);
+    const timeZoneOffset = (event.start.dateTime || event.end.dateTime)
+        ? Util.getTimeZoneOffset(event.start.dateTime || event.end.dateTime)
+        : (((new Date()).getTimezoneOffset() * -1) * 60 * 1000);
 
     return {
         startAt: startAt,
