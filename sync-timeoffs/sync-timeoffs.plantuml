@@ -6,7 +6,7 @@ start
 
 while (more Employees?) is (yes)
 
-    if (Total runtime exceeded?) then (yes)
+    if (Total runtime exceeded?) then (no)
 
         if (Employee status active \nand email white-listed?) then (yes)
 
@@ -57,7 +57,7 @@ while (more Employees?) is (yes)
             endwhile (no)
         endif
 
-    else (no)
+    else (yes)
         stop
     endif
 
