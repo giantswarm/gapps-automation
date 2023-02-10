@@ -26,7 +26,7 @@ The script performs bidirectional synchronization based on the following algorit
 
 Configuring the synchronization is possible using ScriptProperties.
 
-The following configuration properties are known:
+The following configuration properties are available:
 
 | Mandatory | Property Key                             | Value Example or Default                       |
 |-----------|------------------------------------------|------------------------------------------------|
