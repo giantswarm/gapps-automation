@@ -1,0 +1,67 @@
+@startuml
+!pragma useVerticalIf on
+start
+:Get list of Personio Employees;
+:Randomize list of Employees;
+
+while (more Employees?) is (yes)
+
+    if (Total runtime exceeded?) then (no)
+
+        if (Employee status active \nand email white-listed?) then (yes)
+
+            :Authenticate as Service Account for Employee;
+            :Get list of Calendar Events;
+            :Get list of Personio TimeOffPeriods;
+
+            while (have another Event?) is (yes)
+
+                if (Event has TimeOff ID Property) then (yes)
+
+                    if (a matching TimeOff exists?) then (yes)
+                        :Mark TimeOffPeriod as processed;
+
+                        if (Event status?) then (cancelled)
+                            :Delete Personio TimeOffPeriod;
+
+                        else (not cancelled)
+
+                            if (Event and TimeOffPeriod differ?) then (yes)
+
+                                if (TimeOffPeriod was more recently updated than Event?) then (yes)
+                                    :Update Calendar Event;
+                                else (no)
+                                    :Re-create updated Personio TimeOffPeriod;
+                                endif
+
+                            else (no)
+
+                            endif
+
+                        endif
+
+                    (no) elseif (Event status?) then (not cancelled)
+                        :Cancel Calendar Event;
+                    else (cancelled)
+                    endif
+
+                (no) elseif (Event status and title?) then (not cancelled and known keyword in title)
+                    :Insert Personio TimeOffPeriod;
+                else (cancelled or no keyword)
+                endif
+
+            endwhile (no)
+
+            while (have another unprocessed TimeOffPeriod?) is (yes)
+                :Insert new Calendar Event;
+            endwhile (no)
+        endif
+
+    else (yes)
+        stop
+    endif
+
+endwhile (no)
+
+stop
+@enduml
