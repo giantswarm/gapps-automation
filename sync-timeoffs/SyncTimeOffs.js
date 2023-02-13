@@ -126,8 +126,8 @@ function syncTimeOffs() {
     const personioCreds = getPersonioCreds_();
     const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
 
-    // load timeOffTypes
-    const timeOffTypes = personio.getPersonioJson('/company/time-off-types');
+    // load timeOffTypeDb
+    const timeOffTypeDb = new TimeOffTypeDb(personio.getPersonioJson('/company/time-off-types'));
 
     // load and prepare list of employees to process
     const employees = personio.getPersonioJson('/company/employees').filter(employee =>
@@ -146,7 +146,7 @@ function syncTimeOffs() {
         // we keep operating if handling calendar of a single user fails
         try {
             const calendar = CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), email);
-            if (!syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies)) {
+            if (!syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeDb, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies)) {
                 break;
             }
         } catch (e) {
@@ -263,11 +263,55 @@ function getPersonioCreds_() {
 }
 
 
+/** Small wrapper over a list of TimeOffType objects (for caching patterns). */
+class TimeOffTypeDb {
+    constructor(timeOffTypes) {
+
+        this.timeOffTypes = timeOffTypes;
+
+        // prepare patterns to guess time-off type from text
+        // we dynamically create one RegExp per time-off, which we cache here (V8 can't)
+        const pattern = [];
+        for (let timeOffType of timeOffTypes) {
+            const keyword = TimeOffTypeDb.extractKeyword(timeOffType.attributes?.name);
+            pattern.push(new RegExp(`/(^|[\\s:-])(${keyword})([\\s:-]|$)/`, "sim"));
+        }
+        this.pattern = pattern;
+    }
+
+    /** Returns the keyword for the specified TimeOffType name (field timeOffType.attributes.name). */
+    static extractKeyword(typeName) {
+        return (typeName || '').attributes.name.split(' ')[0].trim() || undefined;
+    }
+
+    /** Guess timeOffType from a text (e.g. event summary) by keyword. */
+    findByKeywordMatch(text) {
+        const searchText = text || '';
+
+        for (let i = 0; i < this.timeOffTypes; ++i) {
+            if (this.pattern[i].test(searchText)) {
+                return this.timeOffTypes[i];
+            }
+        }
+
+        return undefined;
+    }
+
+    /** Find a timeOffType by its ID.
+     *
+     * @param {number} id The ID for looking up the TimeOffType.
+     */
+    findById(id) {
+        return this.timeOffTypes.find(t => t.attributes.id === id);
+    }
+}
+
+
 /** Subscribe a single account to all the specified calendars.
  *
  * @returns true if the specified employees account was fully processed, false if processing was aborted early.
  */
-function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies) {
+function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeDb, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies) {
 
     // test against dead-line first
     const deadlineTs = +epoch + maxRuntimeMillies;
@@ -313,7 +357,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
                     nextFailCount += !syncActionDeleteTimeOff_(personio, primaryEmail, timeOff);
                 } else {
                     // need to convert to be able to compare start/end timestamps (Personio is whole-day/half-day only)
-                    const updatedTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, timeOff);
+                    const updatedTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeDb, employee, event, timeOff);
                     if (updatedTimeOff && (!updatedTimeOff.startAt.equals(timeOff.startAt) || !updatedTimeOff.endAt.equals(timeOff.endAt))) {
                         // start/end timestamps differ, now check which (Personio/Google Calendar) has more recent changes
                         if (+timeOff.updatedAt >= +eventUpdatedAt) {
@@ -333,7 +377,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
         } else if (!isEventCancelled) {
             // check for dead zone, ignore events created by Cronofy
             if (eventUpdatedAt <= updateMax && failCount <= maxFailCount && !event.iCalUID.includes('cronofy.com')) {
-                const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, undefined);
+                const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeDb, employee, event, undefined);
                 if (newTimeOff) {
                     nextFailCount += !syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff);
                 }
@@ -355,7 +399,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypes, fetchT
 
         // check for dead zone
         if (timeOff.updatedAt <= updateMax) {
-            syncActionInsertEvent_(calendar, primaryEmail, timeOffTypes, timeOff);
+            syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeDb, timeOff);
         }
     }
 
@@ -418,9 +462,9 @@ function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeO
 
 
 /** Personio TimeOff -> New Google Calendar event */
-function syncActionInsertEvent_(calendar, primaryEmail, timeOffTypes, timeOff) {
+function syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeDb, timeOff) {
     try {
-        const newEvent = createEventFromTimeOff(timeOffTypes, timeOff);
+        const newEvent = createEventFromTimeOff(timeOffTypeDb, timeOff);
         calendar.insert('primary', newEvent);
         Logger.log('Inserted Out-of-Office "%s" at %s for user %s', timeOff.typeName, String(timeOff.startAt), primaryEmail);
         return true;
@@ -494,22 +538,6 @@ function queryCalendarEvents_(calendar, calendarId, timeMin, timeMax) {
     };
 
     return calendar.list(calendarId, eventListParams);
-}
-
-/** Guess timeOffType from a text (description of out-of-office events usually). */
-function guessTimeOffType_(timeOffTypes, event) {
-
-    const text = (event.summary || '').toLowerCase();
-
-    let matchedTimeOfType = undefined;
-    for (const timeOffType of timeOffTypes) {
-        const typeNameFirstWord = timeOffType.attributes.name.split(' ')[0].split('-')[0].toLowerCase();
-        if (text.toLowerCase().includes(typeNameFirstWord)) {
-            matchedTimeOfType = timeOffType;
-        }
-    }
-
-    return matchedTimeOfType;
 }
 
 
@@ -595,15 +623,15 @@ function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
 
 
 /** Construct a matching TimeOff structure for a Google Calendar event. */
-function convertOutOfOfficeToTimeOff_(timeOffTypes, employee, event, existingTimeOff) {
+function convertOutOfOfficeToTimeOff_(timeOffTypeDb, employee, event, existingTimeOff) {
 
-    let timeOffType = guessTimeOffType_(timeOffTypes, event);
+    let timeOffType = timeOffTypeDb.findByKeywordMatch(event.summary || '');
     if (!timeOffType) {
         if (!existingTimeOff) {
             return undefined;
         }
 
-        const previousType = timeOffTypes.find(t => timeOffType.attributes.id === existingTimeOff.typeId);
+        const previousType = timeOffTypeDb.findById(existingTimeOff.typeId);
         if (!previousType) {
             return undefined;
         }
@@ -683,7 +711,7 @@ function createPersonioTimeOff_(personio, timeOff) {
 
 
 /** Create a new Gcal event to mirror the specified TimeOff. */
-function createEventFromTimeOff(timeOffTypes, timeOff) {
+function createEventFromTimeOff(timeOffTypeDb, timeOff) {
     const newEvent = {
         kind: 'calendar#event',
         iCalUID: `${Util.generateUUIDv4()}-p-${timeOff.id}-sync-timeoffs@giantswarm.io`,
@@ -703,9 +731,10 @@ function createEventFromTimeOff(timeOffTypes, timeOff) {
     };
 
     // if we can't guess the corresponding time-off-type, prefix the event summary with its name
-    const guessedType = guessTimeOffType_(timeOffTypes, newEvent);
+    const guessedType = timeOffTypeDb.findByKeywordMatch(newEvent.summary);
     if (!guessedType || guessedType.attributes.id !== timeOff.typeId) {
-        newEvent.summary = timeOff.typeName.split('(')[0].trim() + ': ' + newEvent.summary
+        const keyword = TimeOffTypeDb.extractKeyword(timeOff.typeName);
+        newEvent.summary = `${keyword}: ${newEvent.summary}`;
     }
 
     // add a link to the correct Personio absence calendar page
