@@ -281,7 +281,7 @@ class TimeOffTypeDb {
 
     /** Returns the keyword for the specified TimeOffType name (field timeOffType.attributes.name). */
     static extractKeyword(typeName) {
-        return (typeName || '').attributes.name.split(' ')[0].trim() || undefined;
+        return (typeName || '').split(' ')[0].trim() || undefined;
     }
 
     /** Guess timeOffType from a text (e.g. event summary) by keyword. */
