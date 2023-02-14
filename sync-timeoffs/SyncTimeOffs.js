@@ -274,7 +274,7 @@ class TimeOffTypeDb {
         const pattern = [];
         for (let timeOffType of timeOffTypes) {
             const keyword = TimeOffTypeDb.extractKeyword(timeOffType.attributes?.name);
-            pattern.push(new RegExp(`/(^|[\\s:-])(${keyword})([\\s:-]|$)/`, "sim"));
+            pattern.push(new RegExp(`(^|[\\s:-])(${keyword})([\\s:-]|$)`, "sim"));
         }
         this.pattern = pattern;
     }
@@ -288,7 +288,7 @@ class TimeOffTypeDb {
     findByKeywordMatch(text) {
         const searchText = text || '';
 
-        for (let i = 0; i < this.timeOffTypes; ++i) {
+        for (let i = 0; i < this.timeOffTypes.length; ++i) {
             if (this.pattern[i].test(searchText)) {
                 return this.timeOffTypes[i];
             }
