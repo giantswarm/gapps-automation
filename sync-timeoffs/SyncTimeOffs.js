@@ -25,6 +25,14 @@ const ALLOWED_DOMAINS_KEY = PROPERTY_PREFIX + 'allowedDomains';
  */
 const EMAIL_WHITELIST_KEY = PROPERTY_PREFIX + 'emailWhiteList';
 
+/** Black-List of keywords for skipping approval on insert (those may then require approval).
+ *
+ * Must be one word or a comma separated list.
+ *
+ * Default: null or empty
+ */
+const SKIP_APPROVAL_BLACKLIST_KEY = PROPERTY_PREFIX + 'skipApprovalBlackList';
+
 /** Lookahead days for event/time-off synchronization.
  *
  * Default: 6 * 30 days, should scale up to ~18 months
@@ -126,8 +134,8 @@ function syncTimeOffs() {
     const personioCreds = getPersonioCreds_();
     const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
 
-    // load timeOffTypeDb
-    const timeOffTypeDb = new TimeOffTypeDb(personio.getPersonioJson('/company/time-off-types'));
+    // load timeOffTypeConfig
+    const timeOffTypeConfig = new TimeOffTypeConfig(personio.getPersonioJson('/company/time-off-types'), getSkipApprovalBlackList_());
 
     // load and prepare list of employees to process
     const employees = personio.getPersonioJson('/company/employees').filter(employee =>
@@ -146,7 +154,7 @@ function syncTimeOffs() {
         // we keep operating if handling calendar of a single user fails
         try {
             const calendar = CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), email);
-            if (!syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeDb, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies)) {
+            if (!syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies)) {
                 break;
             }
         } catch (e) {
@@ -214,6 +222,13 @@ function getEmailWhiteList_() {
 }
 
 
+/** Get the TimeOffType keyword skip approval black-list (optional, leave empty to skip approval for all types). */
+function getSkipApprovalBlackList_() {
+    return (getScriptProperties_().getProperty(SKIP_APPROVAL_BLACKLIST_KEY) || '').trim()
+        .split(',').map(keyword => keyword.trim().toLowerCase()).filter(keyword => !!keyword);
+}
+
+
 /** Get the number of lookahead days (positive integer) or the default (6 * 30 days). */
 function getLookaheadDays_() {
     const creds = (getScriptProperties_().getProperty(LOOKAHEAD_DAYS_KEY) || '').trim();
@@ -264,8 +279,8 @@ function getPersonioCreds_() {
 
 
 /** Small wrapper over a list of TimeOffType objects (for caching patterns). */
-class TimeOffTypeDb {
-    constructor(timeOffTypes) {
+class TimeOffTypeConfig {
+    constructor(timeOffTypes, skipApprovalBlackList) {
 
         this.timeOffTypes = timeOffTypes;
 
@@ -273,10 +288,11 @@ class TimeOffTypeDb {
         // we dynamically create one RegExp per time-off, which we cache here (V8 can't)
         const pattern = [];
         for (let timeOffType of timeOffTypes) {
-            const keyword = TimeOffTypeDb.extractKeyword(timeOffType.attributes?.name);
+            const keyword = TimeOffTypeConfig.extractKeyword(timeOffType.attributes.name);
             pattern.push(new RegExp(`(^|[\\s:-])(${keyword})([\\s:-]|$)`, "sim"));
         }
         this.pattern = pattern;
+        this.skipApprovalBlackList = skipApprovalBlackList || [];
     }
 
     /** Returns the keyword for the specified TimeOffType name (field timeOffType.attributes.name). */
@@ -304,6 +320,20 @@ class TimeOffTypeDb {
     findById(id) {
         return this.timeOffTypes.find(t => t.attributes.id === id);
     }
+
+    /** If approval may be skipped for a certain TimeOffType.
+     *
+     * We default to skipping approvals.
+     */
+    isSkippingApprovalAllowed(id) {
+        const timeOffType = this.findById(id);
+        if (timeOffType) {
+            const keyword = TimeOffTypeConfig.extractKeyword(timeOffType.attributes.name).toLowerCase();
+            return !this.skipApprovalBlackList.includes(keyword);
+        }
+
+        return true;
+    }
 }
 
 
@@ -311,7 +341,7 @@ class TimeOffTypeDb {
  *
  * @returns true if the specified employees account was fully processed, false if processing was aborted early.
  */
-function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeDb, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies) {
+function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies) {
 
     // test against dead-line first
     const deadlineTs = +epoch + maxRuntimeMillies;
@@ -357,7 +387,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeDb, fetch
                     nextFailCount += !syncActionDeleteTimeOff_(personio, primaryEmail, timeOff);
                 } else {
                     // need to convert to be able to compare start/end timestamps (Personio is whole-day/half-day only)
-                    const updatedTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeDb, employee, event, timeOff);
+                    const updatedTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, timeOff);
                     if (updatedTimeOff && (!updatedTimeOff.startAt.equals(timeOff.startAt) || !updatedTimeOff.endAt.equals(timeOff.endAt))) {
                         // start/end timestamps differ, now check which (Personio/Google Calendar) has more recent changes
                         if (+timeOff.updatedAt >= +eventUpdatedAt) {
@@ -377,7 +407,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeDb, fetch
         } else if (!isEventCancelled) {
             // check for dead zone, ignore events created by Cronofy
             if (eventUpdatedAt <= updateMax && failCount <= maxFailCount && !event.iCalUID.includes('cronofy.com')) {
-                const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeDb, employee, event, undefined);
+                const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, undefined);
                 if (newTimeOff) {
                     nextFailCount += !syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff);
                 }
@@ -399,7 +429,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeDb, fetch
 
         // check for dead zone
         if (timeOff.updatedAt <= updateMax) {
-            syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeDb, timeOff);
+            syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeOff);
         }
     }
 
@@ -462,9 +492,9 @@ function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeO
 
 
 /** Personio TimeOff -> New Google Calendar event */
-function syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeDb, timeOff) {
+function syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeOff) {
     try {
-        const newEvent = createEventFromTimeOff(timeOffTypeDb, timeOff);
+        const newEvent = createEventFromTimeOff(timeOffTypeConfig, timeOff);
         calendar.insert('primary', newEvent);
         Logger.log('Inserted Out-of-Office "%s" at %s for user %s', timeOff.typeName, String(timeOff.startAt), primaryEmail);
         return true;
@@ -623,15 +653,15 @@ function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
 
 
 /** Construct a matching TimeOff structure for a Google Calendar event. */
-function convertOutOfOfficeToTimeOff_(timeOffTypeDb, employee, event, existingTimeOff) {
+function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existingTimeOff) {
 
-    let timeOffType = timeOffTypeDb.findByKeywordMatch(event.summary || '');
+    let timeOffType = timeOffTypeConfig.findByKeywordMatch(event.summary || '');
     if (!timeOffType) {
         if (!existingTimeOff) {
             return undefined;
         }
 
-        const previousType = timeOffTypeDb.findById(existingTimeOff.typeId);
+        const previousType = timeOffTypeConfig.findById(existingTimeOff.typeId);
         if (!previousType) {
             return undefined;
         }
@@ -657,6 +687,8 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeDb, employee, event, existingTi
         ? Util.getTimeZoneOffset(event.start.dateTime || event.end.dateTime)
         : (((new Date()).getTimezoneOffset() * -1) * 60 * 1000);
 
+    const skipApproval = timeOffTypeConfig.isSkippingApprovalAllowed(timeOffType.attributes.id);
+
     return {
         startAt: startAt,
         endAt: endAt,
@@ -667,7 +699,7 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeDb, employee, event, existingTi
         updatedAt: new Date(event.updated),
         employeeId: employee.attributes.id.value,
         email: employee.attributes.email.value,
-        status: existingTimeOff ? existingTimeOff.status : 'pending'
+        status: existingTimeOff ? existingTimeOff.status : (skipApproval ? 'approved' : 'pending')
     };
 }
 
@@ -687,19 +719,24 @@ function createPersonioTimeOff_(personio, timeOff) {
     const halfDayStart = isMultiDay ? timeOff.startAt.isHalfDay() : timeOff.endAt.isHalfDay();
     const halfDayEnd = isMultiDay ? timeOff.endAt.isHalfDay() : timeOff.startAt.isHalfDay();
 
+    const payload = {
+        employee_id: timeOff.employeeId.toFixed(0),
+        time_off_type_id: timeOff.typeId.toFixed(0),
+        // Reminder: there may be adjustments needed to handle timezones better to avoid switching days, here
+        start_date: timeOff.startAt.toISODate(),
+        end_date: timeOff.endAt.toISODate(),
+        half_day_start: halfDayStart ? "1" : "0",
+        half_day_end: halfDayEnd ? "1" : "0",
+        comment: timeOff.comment
+    };
+
+    if (timeOff.status === 'approved') {
+        payload.skip_approval = "1";
+    }
+
     const result = personio.fetchJson('/company/time-offs', {
         method: 'post',
-        payload: {
-            employee_id: timeOff.employeeId.toFixed(0),
-            time_off_type_id: timeOff.typeId.toFixed(0),
-            // Reminder: there may be adjustments needed to handle timezones better to avoid switching days, here
-            start_date: timeOff.startAt.toISODate(),
-            end_date: timeOff.endAt.toISODate(),
-            half_day_start: halfDayStart ? "1" : "0",
-            half_day_end: halfDayEnd ? "1" : "0",
-            comment: timeOff.comment,
-            skip_approval: timeOff.status === 'approved' ? "1" : "0"
-        }
+        payload: payload
     });
 
     if (!result?.data) {
@@ -711,7 +748,7 @@ function createPersonioTimeOff_(personio, timeOff) {
 
 
 /** Create a new Gcal event to mirror the specified TimeOff. */
-function createEventFromTimeOff(timeOffTypeDb, timeOff) {
+function createEventFromTimeOff(timeOffTypeConfig, timeOff) {
     const newEvent = {
         kind: 'calendar#event',
         iCalUID: `${Util.generateUUIDv4()}-p-${timeOff.id}-sync-timeoffs@giantswarm.io`,
@@ -731,9 +768,9 @@ function createEventFromTimeOff(timeOffTypeDb, timeOff) {
     };
 
     // if we can't guess the corresponding time-off-type, prefix the event summary with its name
-    const guessedType = timeOffTypeDb.findByKeywordMatch(newEvent.summary);
+    const guessedType = timeOffTypeConfig.findByKeywordMatch(newEvent.summary);
     if (!guessedType || guessedType.attributes.id !== timeOff.typeId) {
-        const keyword = TimeOffTypeDb.extractKeyword(timeOff.typeName);
+        const keyword = TimeOffTypeConfig.extractKeyword(timeOff.typeName);
         newEvent.summary = `${keyword}: ${newEvent.summary}`;
     }
 

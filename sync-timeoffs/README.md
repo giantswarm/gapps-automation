@@ -28,13 +28,14 @@ Configuring the synchronization is possible using ScriptProperties.
 
 The following configuration properties are available:
 
-| Mandatory | Property Key                             | Value Example or Default                       |
-|-----------|------------------------------------------|------------------------------------------------|
-| **yes**   | SyncTimeOffs.personioToken               | `CLIENT_ID&#124;CLIENT_SECRET`                      |
-| **yes**   | SyncTimeOffs.serviceAccountCredentials   | `{SERVICE_ACCOUNT_CREDENTIALS_FILE_CONTENT...}`|
-| no        | SyncTimeOffs.allowedDomains              | `giantswarm.io,giantswarm.com`                 |
-| no        | SyncTimeOffs.emailWhiteList              | `jonas@giantswarm.io,marcel@giantswarm.io`     |
-| no        | SyncTimeOffs.lookaheadDays               | `180`                                          |
-| no        | SyncTimeOffs.lookbackDays                | `30`                                           |
-| no        | SyncTimeOffs.maxSyncFailCount            | `10`                                           |
+| Mandatory | Property Key                             | Value Example or Default                        |
+|-----------|------------------------------------------|-------------------------------------------------|
+| **yes**   | SyncTimeOffs.personioToken               | `CLIENT_ID&#124;CLIENT_SECRET`                  |
+| **yes**   | SyncTimeOffs.serviceAccountCredentials   | `{SERVICE_ACCOUNT_CREDENTIALS_FILE_CONTENT...}` |
+| no        | SyncTimeOffs.allowedDomains              | `giantswarm.io,giantswarm.com`                  |
+| no        | SyncTimeOffs.emailWhiteList              | `jonas@giantswarm.io,marcel@giantswarm.io`      |
+| no        | SyncTimeOffs.skipApprovalBlackList       | `parental`                                      |
+| no        | SyncTimeOffs.lookaheadDays               | `180`                                           |
+| no        | SyncTimeOffs.lookbackDays                | `30`                                            |
+| no        | SyncTimeOffs.maxSyncFailCount            | `10`                                            |
 
