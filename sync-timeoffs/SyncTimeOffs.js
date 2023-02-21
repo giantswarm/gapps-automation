@@ -482,7 +482,7 @@ function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeO
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
         calendar.update('primary', event.id, event);
-        Logger.log('Updated TimeOff "%s" at %s for user %s', createdTimeOff.typeName, createdTimeOff.startAt, primaryEmail);
+        Logger.log('Updated TimeOff "%s" at %s for user %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail);
         return true;
     } catch (e) {
         Logger.log('Failed to update TimeOff "%s" at %s for user %s: %s', timeOff.comment, String(timeOff.startAt), primaryEmail, e);
