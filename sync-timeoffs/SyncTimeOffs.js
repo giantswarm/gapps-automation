@@ -366,9 +366,9 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
         }
 
         const failCount = event.extendedProperties?.private?.syncFailCount || 0;
+        const eventUpdatedAt = getOriginalEventUpdated_(event, !!failCount);
         let nextFailCount = failCount;
         const isEventCancelled = event.status === 'cancelled';
-        const eventUpdatedAt = new Date(event.updated);
         const timeOffId = event.extendedProperties?.private?.timeOffId;
         if (timeOffId) {
 
@@ -416,7 +416,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
 
         // register failure for Personio client circuit breaker
         if (failCount !== nextFailCount) {
-            syncActionUpdateEventFailCount_(calendar, primaryEmail, event, nextFailCount);
+            syncActionUpdateEventFailCount_(calendar, primaryEmail, event, nextFailCount, eventUpdatedAt);
         }
     }
 
@@ -434,6 +434,28 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
     }
 
     return true;
+}
+
+
+/** Get the correct updated timestamp, honoring the original timestamp stored in syncFailUpdated. */
+function getOriginalEventUpdated_(event, useSyncFailUpdated) {
+    const updatedAt = new Date(event.updated);
+    if (useSyncFailUpdated) {
+        try {
+            const syncFailUpdated = (event.extendedProperties?.private?.syncFailUpdated || '').split('|');
+            if (syncFailUpdated.length >= 2) {
+                const syntheticUpdateMax = new Date(+syncFailUpdated[0]);
+                if (updatedAt.valueOf() < syntheticUpdateMax) {
+                    // use the stored "event.updated" timestamp
+                    return new Date(+syncFailUpdated[1]);
+                }
+            }
+        } catch (e) {
+            // no need for double-faults (syncFailCount is already part of an error control measure)
+        }
+    }
+
+    return updatedAt;
 }
 
 
@@ -536,9 +558,14 @@ function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTi
 
 
 /** Update the event's syncFailCount property. */
-function syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCount) {
+function syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCount, updatedAt) {
     try {
         setEventPrivateProperty_(event, 'syncFailCount', failCount);
+
+        // set syncFailUpdated to allow restoring the original "updated" timestamp, via getOriginalEventUpdated_()
+        const deadZoneEndMillies = Date.now() + (30 * 1000);  // now + 30s (calendar.update() won't need more than 30s)
+        setEventPrivateProperty_(event, 'syncFailUpdated', `${deadZoneEndMillies}|${updatedAt.valueOf()}`);
+
         calendar.update('primary', event.id, event);
         return true;
     } catch (e) {
