@@ -563,7 +563,7 @@ function syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCoun
         setEventPrivateProperty_(event, 'syncFailCount', failCount);
 
         // set syncFailUpdated to allow restoring the original "updated" timestamp, via getOriginalEventUpdated_()
-        const deadZoneEndMillies = Date.now() + (30 * 1000);  // now + 30s (calendar.update() won't need more than 30s)
+        const deadZoneEndMillies = Date.now() + (30 * 1000);  // assuming calendar.update() won't need more than 30s
         setEventPrivateProperty_(event, 'syncFailUpdated', `${deadZoneEndMillies}|${updatedAt.valueOf()}`);
 
         calendar.update('primary', event.id, event);
