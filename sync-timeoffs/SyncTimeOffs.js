@@ -289,7 +289,7 @@ class TimeOffTypeConfig {
         const pattern = [];
         for (let timeOffType of timeOffTypes) {
             const keyword = TimeOffTypeConfig.extractKeyword(timeOffType.attributes.name);
-            pattern.push(new RegExp(`(^|[\\s:-])(${keyword})([\\s:-]|$)`, "sim"));
+            pattern.push(new RegExp(`(^|[\\s:-[(])(${keyword})([\\s:-\\])]|$)`, "sim"));
         }
         this.pattern = pattern;
         this.skipApprovalBlackList = skipApprovalBlackList || [];
