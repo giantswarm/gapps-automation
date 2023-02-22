@@ -445,7 +445,7 @@ function getOriginalEventUpdated_(event, useSyncFailUpdated) {
             const syncFailUpdated = (event.extendedProperties?.private?.syncFailUpdated || '').split('|');
             if (syncFailUpdated.length >= 2) {
                 const syntheticUpdateMax = new Date(+syncFailUpdated[0]);
-                if (updatedAt.valueOf() < syntheticUpdateMax) {
+                if (updatedAt.valueOf() < syntheticUpdateMax.valueOf()) {
                     // use the stored "event.updated" timestamp
                     return new Date(+syncFailUpdated[1]);
                 }
