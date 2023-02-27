@@ -193,6 +193,41 @@ function setProperties(properties, deleteAllOthers) {
 }
 
 
+/** White-list (active/onboarding) employees by Team.
+ *
+ * Will only do something if the white-list is not empty (already enabled).
+ *
+ * @param {string|Array<string>} Team name or array of team names that should be white-listed
+ */
+function whiteListTeam(teams) {
+    if (!teams) {
+        throw new Error('No team name(s) specified');
+    }
+
+    const teamNames = Array.isArray(teams) ? teams : [teams];
+    const whiteList = getEmailWhiteList_();
+    if (!Array.isArray(whiteList) || !whiteList.length) {
+        throw new Error('White-list is empty (disabled), cannot add members by team');
+    }
+
+    // load and prepare list of employees to process
+    const personioCreds = getPersonioCreds_();
+    const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
+    const employees = personio.getPersonioJson('/company/employees')
+        .filter(employee => employee.attributes.status.value !== 'inactive');
+
+    for (const employee of employees) {
+        const email = (employee.attributes?.email?.value || '').trim();
+        const team = employee.attributes?.team?.value?.attributes?.name;
+        if (email && team && teamNames.includes(team) && !whiteList.includes(email)) {
+            whiteList.push(email);
+        }
+    }
+
+    TriggerUtil.setProperties({[EMAIL_WHITELIST_KEY]: whiteList.join(',')}, false);
+}
+
+
 /** Get script properties. */
 function getScriptProperties_() {
     const scriptProperties = PropertiesService.getScriptProperties();
