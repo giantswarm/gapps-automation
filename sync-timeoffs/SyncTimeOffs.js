@@ -198,6 +198,8 @@ function setProperties(properties, deleteAllOthers) {
  * Will only do something if the white-list is not empty (already enabled).
  *
  * @param {string|Array<string>} Team name or array of team names that should be white-listed
+ *
+ * @return {string} Returns the updated white-list.
  */
 function whiteListTeam(teams) {
     if (!teams) {
@@ -224,7 +226,10 @@ function whiteListTeam(teams) {
         }
     }
 
-    TriggerUtil.setProperties({[EMAIL_WHITELIST_KEY]: whiteList.join(',')}, false);
+    const whiteListStr = whiteList.join(',');
+    TriggerUtil.setProperties({[EMAIL_WHITELIST_KEY]: whiteListStr}, false);
+
+    return whiteListStr;
 }
 
 
