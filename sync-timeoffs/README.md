@@ -38,4 +38,5 @@ The following configuration properties are available:
 | no        | SyncTimeOffs.lookaheadDays               | `180`                                           |
 | no        | SyncTimeOffs.lookbackDays                | `30`                                            |
 | no        | SyncTimeOffs.maxSyncFailCount            | `10`                                            |
+| no        | SyncTimeOffs.preferBulkRequests          | `true`                                          |
 

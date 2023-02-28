@@ -11,7 +11,7 @@ const PROPERTY_PREFIX = 'SyncTimeOffs.';
 /** Personio clientId and clientSecret, separated by '|'. */
 const PERSONIO_TOKEN_KEY = PROPERTY_PREFIX + 'personioToken';
 
-/** Service account credentials (in JSON format, as downloaded from Google Management Console. */
+/** Service account credentials (in JSON format, as downloaded from Google Management Console). */
 const SERVICE_ACCOUNT_CREDENTIALS_KEY = PROPERTY_PREFIX + 'serviceAccountCredentials';
 
 /** Filter for allowed domains (to avoid working and failing on users present on foreign domains). */
@@ -59,6 +59,19 @@ const LOOKBACK_DAYS_KEY = PROPERTY_PREFIX + 'lookbackDays';
  *    - ignore the situation (it's just a few events)
  */
 const MAX_SYNC_FAIL_COUNT_KEY = PROPERTY_PREFIX + 'maxSyncFailCount';
+
+/** A setting configuring if larger bulk requests are to be preferred.
+ *
+ * This can help with Personio's long per-request processing time and UrlFetchApp quota limits.
+ *
+ * The behavior should be configurable because:
+ *  - Personio's backend is expected to change in the near future.
+ *  - If the TimeOff dataset is becoming too large (or the range is configured to be greater),
+ *    smaller requests may be required.
+ *
+ * The value can be true (default) or false.
+ */
+const PREFER_BULK_REQUESTS = PROPERTY_PREFIX + 'preferBulkRequests';
 
 /** The trigger handler function to call in time based triggers. */
 const TRIGGER_HANDLER_FUNCTION = 'syncTimeOffs';
@@ -143,6 +156,11 @@ function syncTimeOffs() {
     );
     Util.shuffleArray(employees);
 
+    // if bulk requests are preferred, prefetch all Personio time-offs
+    const allTimeOffs = isPreferBulkRequestsEnabled_()
+        ? queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, undefined)
+        : undefined;
+
     Logger.log('Syncing events between %s and %s for %s accounts', fetchTimeMin.toISOString(), fetchTimeMax.toISOString(), '' + employees.length);
 
     let firstError = null;
@@ -154,7 +172,7 @@ function syncTimeOffs() {
         // we keep operating if handling calendar of a single user fails
         try {
             const calendar = CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), email);
-            if (!syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies)) {
+            if (!syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies, allTimeOffs)) {
                 break;
             }
         } catch (e) {
@@ -197,7 +215,7 @@ function setProperties(properties, deleteAllOthers) {
  *
  * Will only do something if the white-list is not empty (already enabled).
  *
- * @param {string|Array<string>} Team name or array of team names that should be white-listed
+ * @param {string|Array<string>} teams Team name or array of team names that should be white-listed
  *
  * @return {string} Returns the updated white-list.
  */
@@ -308,6 +326,13 @@ function getMaxSyncFailCount_() {
 }
 
 
+/** Get the "preferBulkRequests" flag. */
+function isPreferBulkRequestsEnabled_() {
+    const value = (getScriptProperties_().getProperty(PREFER_BULK_REQUESTS) || '').trim().toLowerCase();
+    return value !== 'false' && value !== '0' && value !== 'off' && value !== 'no';
+}
+
+
 /** Get the Personio token. */
 function getPersonioCreds_() {
     const credentialFields = (getScriptProperties_().getProperty(PERSONIO_TOKEN_KEY) || '|')
@@ -381,7 +406,7 @@ class TimeOffTypeConfig {
  *
  * @returns true if the specified employees account was fully processed, false if processing was aborted early.
  */
-function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies) {
+function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies, allTimeOffs) {
 
     // test against dead-line first
     const deadlineTs = +epoch + maxRuntimeMillies;
@@ -395,10 +420,12 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
     const updateDeadZoneMillies = 120 * 1000; // 120 seconds, to avoid races and workaround lack of transactions
     const updateMax = Util.addDateMillies(new Date(epoch), -updateDeadZoneMillies);
 
-    // load timeOffs indexed by ID
-    const timeOffs = queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, employee.attributes.id.value);
+    // load or filter timeOffs indexed by ID
+    const employeeId = employee.attributes.id.value;
+    const timeOffs = Util.isObject(allTimeOffs) ? allTimeOffs : queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, employeeId);
 
     const allEvents = queryCalendarEvents_(calendar, 'primary', fetchTimeMin, fetchTimeMax);
+    const processedTimeOffIds = {};
     for (const event of allEvents) {
 
         if (Date.now() >= deadlineTs) {
@@ -414,9 +441,10 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
 
             // we handle this time-off
             const timeOff = timeOffs[timeOffId];
-            if (timeOff) {
+            if (timeOff && timeOff.employeeId === employeeId) {
 
-                delete timeOffs[timeOffId];
+                // mark as handled
+                processedTimeOffIds[timeOffId] = true;
 
                 if (timeOff.updatedAt > updateMax || eventUpdatedAt > updateMax || failCount > maxFailCount) {
                     // dead zone
@@ -462,13 +490,13 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
 
     // Handle each remaining time-off, not handled above
     for (const timeOff of Object.values(timeOffs)) {
-
-        if (Date.now() >= deadlineTs) {
-            return false;
-        }
-
         // check for dead zone
-        if (timeOff.updatedAt <= updateMax) {
+        if (timeOff.employeeId === employeeId && timeOff.updatedAt <= updateMax && !processedTimeOffIds[timeOff.id]) {
+
+            if (Date.now() >= deadlineTs) {
+                return false;
+            }
+
             syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeOff);
         }
     }
@@ -600,11 +628,12 @@ function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTi
 /** Update the event's syncFailCount property. */
 function syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCount, updatedAt) {
     try {
-        setEventPrivateProperty_(event, 'syncFailCount', failCount);
+        setEventPrivateProperty_(event, 'syncFailCount', failCount.toFixed(0));
 
         // set syncFailUpdated to allow restoring the original "updated" timestamp, via getOriginalEventUpdated_()
-        const deadZoneEndMillies = Date.now() + (30 * 1000);  // assuming calendar.update() won't need more than 30s
-        setEventPrivateProperty_(event, 'syncFailUpdated', `${deadZoneEndMillies}|${updatedAt.valueOf()}`);
+        const deadZoneEndMillies = (Date.now() + (30 * 1000)).toFixed(0);  // assuming calendar.update() won't need more than 30s
+        const updatedAtValue = updatedAt.valueOf().toFixed(0)
+        setEventPrivateProperty_(event, 'syncFailUpdated', `${deadZoneEndMillies}|${updatedAtValue}`);
 
         calendar.update('primary', event.id, event);
         return true;
@@ -708,6 +737,11 @@ function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
         end_date: timeMax.toISOString().split("T")[0],
         ['employees[]']: employeeId
     };
+
+    if (employeeId != null) {
+        params['employees[]'] = employeeId;
+    }
+
     const timeOffPeriods = personio.getPersonioJson('/company/time-offs' + UrlFetchJsonClient.buildQuery(params));
     const timeOffs = {};
     for (const timeOffPeriod of timeOffPeriods) {
