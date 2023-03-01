@@ -86,7 +86,7 @@ const MINIMUM_OUT_OF_OFFICE_DURATION_WHOLE_DAY_MILLIES = 6 * 60 * 60 * 1000; // 
 const SYNC_FAIL_UPDATED_DEAD_ZONE = 30 * 1000; // 30s
 
 /** Do not touch failed events too often, otherwise we may exceed our quotas. */
-const SYNC_FAIL_DELAY = 60 * 60 * 1000; // 1h
+const MAX_SYNC_FAIL_DELAY = 60 * 60 * 1000; // 1h
 
 
 /** Main entry point.
@@ -441,7 +441,9 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
 
         const lastFailMillies = getEventSyncFailedMillies_(event);
         const failCount = getEventSyncFailCount_(event);
-        const skipDueToFail = failCount > maxFailCount || (lastFailMillies && (now - lastFailMillies) < SYNC_FAIL_DELAY);
+        // introduce randomness to avoid an onrush of re-tries triggering Google's quota function after a cold-start
+        const skipDueToFail = failCount > maxFailCount ||
+            (lastFailMillies && now - lastFailMillies < ((MAX_SYNC_FAIL_DELAY / 2) + (MAX_SYNC_FAIL_DELAY * Math.random())));
         const eventUpdatedAt = getOriginalEventUpdated_(event, !!failCount);
 
         let nextFailCount = failCount;
