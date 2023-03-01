@@ -82,6 +82,12 @@ const MINIMUM_OUT_OF_OFFICE_DURATION_HALF_DAY_MILLIES = 3 * 60 * 60 * 1000;  // 
 /** The minimum duration of a whole day or longe out-of-office event. */
 const MINIMUM_OUT_OF_OFFICE_DURATION_WHOLE_DAY_MILLIES = 6 * 60 * 60 * 1000; // whole-day >= 6h
 
+/** The dead-zone after a sync failure where the saved original event.updated timestamp is being preferred. */
+const SYNC_FAIL_UPDATED_DEAD_ZONE = 30 * 1000; // 30s
+
+/** Do not touch failed events too often, otherwise we may exceed our quotas. */
+const SYNC_FAIL_DELAY = 60 * 60 * 1000; // 1h
+
 
 /** Main entry point.
  *
@@ -428,12 +434,16 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
     const processedTimeOffIds = {};
     for (const event of allEvents) {
 
-        if (Date.now() >= deadlineTs) {
+        const now = Date.now();
+        if (now >= deadlineTs) {
             return false;
         }
 
-        const failCount = event.extendedProperties?.private?.syncFailCount || 0;
+        const lastFailMillies = getEventSyncFailedMillies_(event);
+        const failCount = getEventSyncFailCount_(event);
+        const skipDueToFail = failCount > maxFailCount || (lastFailMillies && (now - lastFailMillies) < SYNC_FAIL_DELAY);
         const eventUpdatedAt = getOriginalEventUpdated_(event, !!failCount);
+
         let nextFailCount = failCount;
         const isEventCancelled = event.status === 'cancelled';
         const timeOffId = event.extendedProperties?.private?.timeOffId;
@@ -446,7 +456,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
                 // mark as handled
                 processedTimeOffIds[timeOffId] = true;
 
-                if (timeOff.updatedAt > updateMax || eventUpdatedAt > updateMax || failCount > maxFailCount) {
+                if (timeOff.updatedAt > updateMax || eventUpdatedAt > updateMax || skipDueToFail) {
                     // dead zone
                     continue;
                 }
@@ -474,7 +484,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
             }
         } else if (!isEventCancelled) {
             // check for dead zone, ignore events created by Cronofy
-            if (eventUpdatedAt <= updateMax && failCount <= maxFailCount && !event.iCalUID.includes('cronofy.com')) {
+            if (eventUpdatedAt <= updateMax && !skipDueToFail && !event.iCalUID.includes('cronofy.com')) {
                 const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, undefined);
                 if (newTimeOff) {
                     nextFailCount += !syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff);
@@ -502,6 +512,26 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
     }
 
     return true;
+}
+
+
+/** Get the specified event's syncFailCount property as number. */
+function getEventSyncFailCount_(event) {
+    return (+event.extendedProperties?.private?.syncFailCount) || 0;
+}
+
+
+/** Get last sync fail timestamp (millis since epoch) or 0 if there was no failed sync. */
+function getEventSyncFailedMillies_(event) {
+    const syncFailUpdated = (event.extendedProperties?.private?.syncFailUpdated || '').split('|');
+    if (syncFailUpdated.length >= 2) {
+        const syntheticUpdateMax = +syncFailUpdated[0];
+        if (syntheticUpdateMax) {
+            return syntheticUpdateMax - SYNC_FAIL_UPDATED_DEAD_ZONE;
+        }
+    }
+
+    return 0;
 }
 
 
@@ -545,12 +575,13 @@ function syncActionDeleteTimeOff_(personio, primaryEmail, timeOff) {
 function syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff) {
     try {
         // Update event timestamps
-        event.start.dateTime = timeOff.startAt.toISOString(timeOff.timeZoneOffset);
+        event.start.dateTime = timeOff.startAt.toISOString();
         event.start.date = null;
         event.start.timeZone = null;
-        event.end.dateTime = timeOff.endAt.switchHour24ToHour0().toISOString(timeOff.timeZoneOffset);
+        event.end.dateTime = timeOff.endAt.switchHour24ToHour0().toISOString();
         event.end.date = null;
         event.end.timeZone = null;
+
         calendar.update('primary', event.id, event);
         Logger.log('Updated event "%s" at %s for user %s', event.summary, event.start.dateTime || event.start.date, primaryEmail);
         return true;
@@ -631,7 +662,7 @@ function syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCoun
         setEventPrivateProperty_(event, 'syncFailCount', failCount.toFixed(0));
 
         // set syncFailUpdated to allow restoring the original "updated" timestamp, via getOriginalEventUpdated_()
-        const deadZoneEndMillies = (Date.now() + (30 * 1000)).toFixed(0);  // assuming calendar.update() won't need more than 30s
+        const deadZoneEndMillies = (Date.now() + SYNC_FAIL_UPDATED_DEAD_ZONE).toFixed(0);  // assuming calendar.update() won't need more than 30s
         const updatedAtValue = updatedAt.valueOf().toFixed(0)
         setEventPrivateProperty_(event, 'syncFailUpdated', `${deadZoneEndMillies}|${updatedAtValue}`);
 
@@ -715,7 +746,6 @@ function normalizePersonioTimeOffPeriod_(timeOffPeriod) {
         typeName: attributes.time_off_type?.attributes.name,
         comment: attributes.comment,
         status: attributes.status,
-        timeZoneOffset: Util.getTimeZoneOffset(attributes.start_date),
         updatedAt: updatedAt,
         employeeId: attributes.employee?.attributes.id?.value,
         email: (attributes.employee?.attributes.email?.value || '').trim()
@@ -753,6 +783,12 @@ function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
 }
 
 
+/** Gets the local (script environment) timezone offset in milliseconds (with minute precision) for the specified Date. */
+function getLocalTimeZoneOffsetMillies_(date) {
+    return (date.getTimezoneOffset() * -1) * 60 * 1000;
+}
+
+
 /** Construct a matching TimeOff structure for a Google Calendar event. */
 function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existingTimeOff) {
 
@@ -782,11 +818,12 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
         }
     }
 
-    const startAt = PeopleTime.fromISO8601(event.start.dateTime || event.start.date).normalizeHalfDay(false, halfDaysAllowed);
-    const endAt = PeopleTime.fromISO8601(event.end.dateTime || event.end.date).normalizeHalfDay(true, halfDaysAllowed);
-    const timeZoneOffset = (event.start.dateTime || event.end.dateTime)
-        ? Util.getTimeZoneOffset(event.start.dateTime || event.end.dateTime)
-        : (((new Date()).getTimezoneOffset() * -1) * 60 * 1000);
+    const localTzOffsetStart = event.start.date ? getLocalTimeZoneOffsetMillies_(new Date(event.start.date)) : undefined;
+    const localTzOffsetEnd = event.end.date ? getLocalTimeZoneOffsetMillies_(new Date(event.end.date)) : undefined;
+    const startAt = PeopleTime.fromISO8601(event.start.dateTime || event.start.date, undefined, localTzOffsetStart)
+        .normalizeHalfDay(false, halfDaysAllowed);
+    const endAt = PeopleTime.fromISO8601(event.end.dateTime || event.end.date, undefined, localTzOffsetEnd)
+        .normalizeHalfDay(true, halfDaysAllowed);
 
     const skipApproval = timeOffTypeConfig.isSkippingApprovalAllowed(timeOffType.attributes.id);
 
@@ -795,7 +832,6 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
         endAt: endAt,
         typeId: timeOffType.attributes.id,
         typeName: timeOffType.attributes.name,
-        timeZoneOffset: timeZoneOffset,
         comment: event.summary.replace(' [synced]', ''),
         updatedAt: new Date(event.updated),
         employeeId: employee.attributes.id.value,
@@ -854,10 +890,10 @@ function createEventFromTimeOff(timeOffTypeConfig, timeOff) {
         kind: 'calendar#event',
         iCalUID: `${Util.generateUUIDv4()}-p-${timeOff.id}-sync-timeoffs@giantswarm.io`,
         start: {
-            dateTime: timeOff.startAt.toISOString(timeOff.timeZoneOffset)
+            dateTime: timeOff.startAt.toISOString()
         },
         end: {
-            dateTime: timeOff.endAt.switchHour24ToHour0().toISOString(timeOff.timeZoneOffset)
+            dateTime: timeOff.endAt.switchHour24ToHour0().toISOString()
         },
         eventType: 'outOfOffice',  // left here for completeness, still not fully supported by Google Calendar
         extendedProperties: {

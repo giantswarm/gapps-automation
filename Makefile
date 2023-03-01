@@ -6,7 +6,7 @@ gas_projects_clean = $(subst /.clasp.json,-clean,$(clasp_files))
 # see: https://stackoverflow.com/questions/68379711/google-apps-script-hoisting-and-referenceerror
 # (in Apps Script Editor one could set file position manually)
 lib_files = lib/OAuth2.gs lib/UrlFetchJsonClient.js lib/CalendarListClient.js lib/CalendarClient.js lib/PersonioAuthV1.js \
-	lib/PersonioClientV1.js lib/GmailClientV1.js lib/PeopleTime.js lib/SheetUtil.js lib/TriggerUtil.js lib/Util.js
+	lib/PersonioClientV1.js lib/GmailClientV1.js lib/SheetUtil.js lib/TriggerUtil.js lib/Util.js lib/PeopleTime.js
 
 .PHONY: all
 all: $(gas_projects)
