@@ -142,8 +142,11 @@ function syncTimeOffs() {
     const lookaheadMillies = Math.round(getLookaheadDays_() * 24 * 60 * 60 * 1000);
     // how many Personio action retries per event?
     const maxFailCount = getMaxSyncFailCount_();
+
     // after how many milliseconds should this script stop by itself (to avoid forced termination/unclean state)?
-    const maxRuntimeMillies = Math.round(320 * 1000); // 5:20 minutes (hard AppsScript kill comes at 6:00 minutes)
+    // 4:50 minutes (hard AppsScript kill comes at 6:00 minutes)
+    // stay under 5 min. to ensure termination before the next instances starts if operating at 5 min. job delay
+    const maxRuntimeMillies = Math.round(290 * 1000);
 
     const fetchTimeMin = Util.addDateMillies(new Date(epoch), lookbackMillies);
     fetchTimeMin.setUTCHours(0, 0, 0, 0); // round down to start of day
