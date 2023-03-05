@@ -617,7 +617,7 @@ function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeO
 /** Personio TimeOff -> New Google Calendar event */
 function syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeOff) {
     try {
-        const newEvent = createEventFromTimeOff(timeOffTypeConfig, timeOff);
+        const newEvent = createEventFromTimeOff_(timeOffTypeConfig, timeOff);
         calendar.insert('primary', newEvent);
         Logger.log('Inserted Out-of-Office "%s" at %s for user %s', timeOff.typeName, String(timeOff.startAt), primaryEmail);
         return true;
@@ -887,7 +887,7 @@ function createPersonioTimeOff_(personio, timeOff) {
 
 
 /** Create a new Gcal event to mirror the specified TimeOff. */
-function createEventFromTimeOff(timeOffTypeConfig, timeOff) {
+function createEventFromTimeOff_(timeOffTypeConfig, timeOff) {
     const newEvent = {
         kind: 'calendar#event',
         iCalUID: `${Util.generateUUIDv4()}-p-${timeOff.id}-sync-timeoffs@giantswarm.io`,
