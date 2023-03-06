@@ -471,7 +471,8 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
                 } else {
                     // need to convert to be able to compare start/end timestamps (Personio is whole-day/half-day only)
                     const updatedTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, timeOff);
-                    if (updatedTimeOff && (!updatedTimeOff.startAt.equals(timeOff.startAt) || !updatedTimeOff.endAt.equals(timeOff.endAt))) {
+                    if (updatedTimeOff
+                        && (!updatedTimeOff.startAt.equals(timeOff.startAt) || !updatedTimeOff.endAt.equals(timeOff.endAt) || updatedTimeOff.typeId !== timeOff.typeId)) {
                         // start/end timestamps differ, now check which (Personio/Google Calendar) has more recent changes
                         if (+timeOff.updatedAt >= +eventUpdatedAt) {
                             syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff);
