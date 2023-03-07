@@ -694,8 +694,6 @@ function queryCalendarEvents_(calendar, calendarId, timeMin, timeMax) {
     const eventListParams = {
         singleEvents: true,
         showDeleted: true,
-        // we use the local timezone to allow the simple Date constructor to correctly parse dates like "2016-05-16"
-        //timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         timeMin: timeMin.toISOString(),
         timeMax: timeMax.toISOString()
     };
