@@ -695,7 +695,7 @@ function queryCalendarEvents_(calendar, calendarId, timeMin, timeMax) {
         singleEvents: true,
         showDeleted: true,
         // we use the local timezone to allow the simple Date constructor to correctly parse dates like "2016-05-16"
-        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        //timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         timeMin: timeMin.toISOString(),
         timeMax: timeMax.toISOString()
     };
@@ -789,12 +789,6 @@ function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
 }
 
 
-/** Gets the local (script environment) timezone offset in milliseconds (with minute precision) for the specified Date. */
-function getLocalTimeZoneOffsetMillies_(date) {
-    return (date.getTimezoneOffset() * -1) * 60 * 1000;
-}
-
-
 /** Construct a matching TimeOff structure for a Google Calendar event. */
 function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existingTimeOff) {
 
@@ -824,8 +818,8 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
         }
     }
 
-    const localTzOffsetStart = event.start.date ? getLocalTimeZoneOffsetMillies_(new Date(event.start.date)) : undefined;
-    const localTzOffsetEnd = event.end.date ? getLocalTimeZoneOffsetMillies_(new Date(event.end.date)) : undefined;
+    const localTzOffsetStart = event.start.date ? Util.getNamedTimeZoneOffset(event.start.timeZone, new Date(event.start.date)) : undefined;
+    const localTzOffsetEnd = event.end.date ? Util.getNamedTimeZoneOffset(event.end.timeZone, new Date(event.end.date)) : undefined;
     const startAt = PeopleTime.fromISO8601(event.start.dateTime || event.start.date, undefined, localTzOffsetStart)
         .normalizeHalfDay(false, halfDaysAllowed);
     const endAt = PeopleTime.fromISO8601(event.end.dateTime || event.end.date, undefined, localTzOffsetEnd)
