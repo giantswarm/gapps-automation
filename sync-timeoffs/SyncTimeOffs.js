@@ -454,7 +454,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
 
         const syncFailUpdatedAt = failedSyncs['e' + event.id];
         const eventUpdatedAt = new Date(event.updated);
-        const skipDueToFail = syncFailUpdatedAt != null && new Date(syncFailUpdatedAt) === eventUpdatedAt;
+        const skipDueToFail = syncFailUpdatedAt != null && syncFailUpdatedAt === +eventUpdatedAt;
         const isEventCancelled = event.status === 'cancelled';
         const timeOffId = event.extendedProperties?.private?.timeOffId;
         let isOk = true;
@@ -522,7 +522,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
         }
 
         const syncFailUpdatedAt = failedSyncs['t' + timeOff.id];
-        const skipDueToFail = syncFailUpdatedAt != null && new Date(syncFailUpdatedAt) === timeOff.updatedAt;
+        const skipDueToFail = syncFailUpdatedAt != null && syncFailUpdatedAt === +timeOff.updatedAt;
 
         // check for dead zone
         if (!skipDueToFail && timeOff.employeeId === employeeId && timeOff.updatedAt <= updateMax && !processedTimeOffIds[timeOff.id]) {
