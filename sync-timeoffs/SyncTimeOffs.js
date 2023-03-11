@@ -419,7 +419,8 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
 
     // test against dead-line first
     const deadlineTs = +epoch + maxRuntimeMillies;
-    if (Date.now() >= deadlineTs) {
+    let now = Date.now();
+    if (now >= deadlineTs) {
         return false;
     }
 
@@ -433,25 +434,30 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
     const employeeId = employee.attributes.id.value;
     const timeOffs = Util.isObject(allTimeOffs) ? allTimeOffs : queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, employeeId);
 
+    const failedSyncs = getFailedSyncs_(primaryEmail);
+
     const allEvents = queryCalendarEvents_(calendar, 'primary', fetchTimeMin, fetchTimeMax);
+    Util.shuffleArray(allEvents);
+
+    let failCount = 0;
     const processedTimeOffIds = {};
     for (const event of allEvents) {
 
-        const now = Date.now();
         if (now >= deadlineTs) {
+            putFailedSyncs_(primaryEmail, failedSyncs);
             return false;
         }
 
-        const lastFailMillies = getEventSyncFailedMillies_(event);
-        const failCount = getEventSyncFailCount_(event);
-        // introduce randomness to avoid an onrush of re-tries triggering Google's quota function after a cold-start
-        const skipDueToFail = failCount > maxFailCount ||
-            (lastFailMillies && now - lastFailMillies < ((MAX_SYNC_FAIL_DELAY / 2) + (MAX_SYNC_FAIL_DELAY * Math.random())));
-        const eventUpdatedAt = getOriginalEventUpdated_(event, !!failCount);
+        if (failCount >= maxFailCount) {
+            break;
+        }
 
-        let nextFailCount = failCount;
+        const syncFailUpdatedAt = failedSyncs['e' + event.id];
+        const eventUpdatedAt = new Date(event.updated);
+        const skipDueToFail = syncFailUpdatedAt != null && new Date(syncFailUpdatedAt) === eventUpdatedAt;
         const isEventCancelled = event.status === 'cancelled';
         const timeOffId = event.extendedProperties?.private?.timeOffId;
+        let isOk = true;
         if (timeOffId) {
 
             // we handle this time-off
@@ -467,25 +473,28 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
                 }
 
                 if (isEventCancelled) {
-                    nextFailCount += !syncActionDeleteTimeOff_(personio, primaryEmail, timeOff);
+                    isOk = syncActionDeleteTimeOff_(personio, primaryEmail, timeOff);
+                    now = Date.now();
                 } else {
                     // need to convert to be able to compare start/end timestamps (Personio is whole-day/half-day only)
                     const updatedTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, timeOff);
                     if (updatedTimeOff
                         && (!updatedTimeOff.startAt.equals(timeOff.startAt) || !updatedTimeOff.endAt.equals(timeOff.endAt) || updatedTimeOff.typeId !== timeOff.typeId)) {
                         // start/end timestamps differ, now check which (Personio/Google Calendar) has more recent changes
-                        if (+timeOff.updatedAt >= +eventUpdatedAt) {
-                            syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff);
+                        if (timeOff.updatedAt >= eventUpdatedAt) {
+                            isOk = syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff);
                         } else {
-                            nextFailCount += !syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff);
+                            isOk = syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff);
                         }
+                        now = Date.now();
                     }
                 }
             } else if (!isEventCancelled) {
                 // check for dead zone
                 // we allow event cancellation even in case maxFailCount was reached
                 if (eventUpdatedAt <= updateMax) {
-                    syncActionDeleteEvent_(calendar, primaryEmail, event);
+                    isOk = syncActionDeleteEvent_(calendar, primaryEmail, event);
+                    now = Date.now();
                 }
             }
         } else if (!isEventCancelled) {
@@ -493,73 +502,61 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
             if (eventUpdatedAt <= updateMax && !skipDueToFail && !event.iCalUID.includes('cronofy.com')) {
                 const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, undefined);
                 if (newTimeOff) {
-                    nextFailCount += !syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff);
+                    isOk = syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff);
+                    now = Date.now();
                 }
             }
         }
 
-        // register failure for Personio client circuit breaker
-        if (failCount !== nextFailCount) {
-            syncActionUpdateEventFailCount_(calendar, primaryEmail, event, nextFailCount, eventUpdatedAt);
+        if (!isOk) {
+            failedSyncs['e' + event.id] = +eventUpdatedAt;
+            ++failCount;
         }
     }
 
     // Handle each remaining time-off, not handled above
     for (const timeOff of Object.values(timeOffs)) {
+
+        if (failCount >= maxFailCount) {
+            break;
+        }
+
+        const syncFailUpdatedAt = failedSyncs['t' + event.id];
+        const skipDueToFail = syncFailUpdatedAt != null && new Date(syncFailUpdatedAt) === timeOff.updatedAt;
+
         // check for dead zone
-        if (timeOff.employeeId === employeeId && timeOff.updatedAt <= updateMax && !processedTimeOffIds[timeOff.id]) {
+        if (!skipDueToFail && timeOff.employeeId === employeeId && timeOff.updatedAt <= updateMax && !processedTimeOffIds[timeOff.id]) {
 
             if (Date.now() >= deadlineTs) {
+                putFailedSyncs_(primaryEmail, failedSyncs);
                 return false;
             }
 
-            syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeOff);
+            if (!syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeOff)) {
+                failedSyncs['t' + timeOff.id] = +timeOff.updatedAt;
+                ++failCount;
+            }
         }
     }
 
+    putFailedSyncs_(primaryEmail, failedSyncs);
     return true;
 }
 
 
-/** Get the specified event's syncFailCount property as number. */
-function getEventSyncFailCount_(event) {
-    return (+event.extendedProperties?.private?.syncFailCount) || 0;
+/** Get the cached map of event id to updatedAt mapping for failed synchronizations by email. */
+function getFailedSyncs_(primaryEmail) {
+    const cache = CacheService.getScriptCache();
+    const item = cache.get("syncFailed_" + primaryEmail);
+    return item != null ? JSON.parse(item) : {};
 }
 
 
-/** Get last sync fail timestamp (millis since epoch) or 0 if there was no failed sync. */
-function getEventSyncFailedMillies_(event) {
-    const syncFailUpdated = (event.extendedProperties?.private?.syncFailUpdated || '').split('|');
-    if (syncFailUpdated.length >= 2) {
-        const syntheticUpdateMax = +syncFailUpdated[0];
-        if (syntheticUpdateMax) {
-            return syntheticUpdateMax - SYNC_FAIL_UPDATED_DEAD_ZONE;
-        }
-    }
-
-    return 0;
-}
-
-
-/** Get the correct updated timestamp, honoring the original timestamp stored in syncFailUpdated. */
-function getOriginalEventUpdated_(event, useSyncFailUpdated) {
-    const updatedAt = new Date(event.updated);
-    if (useSyncFailUpdated) {
-        try {
-            const syncFailUpdated = (event.extendedProperties?.private?.syncFailUpdated || '').split('|');
-            if (syncFailUpdated.length >= 2) {
-                const syntheticUpdateMax = new Date(+syncFailUpdated[0]);
-                if (updatedAt.valueOf() < syntheticUpdateMax.valueOf()) {
-                    // use the stored "event.updated" timestamp
-                    return new Date(+syncFailUpdated[1]);
-                }
-            }
-        } catch (e) {
-            // no need for double-faults (syncFailCount is already part of an error control measure)
-        }
-    }
-
-    return updatedAt;
+/** Cache the map of event id to updatedAt millies for failed synchronizations by email. */
+function putFailedSyncs_(primaryEmail, failedSyncs) {
+    const cache = CacheService.getScriptCache();
+    const expiration = (MAX_SYNC_FAIL_DELAY / 2) + (MAX_SYNC_FAIL_DELAY * Math.random());
+    cache.put("syncFailed_" + primaryEmail, JSON.stringify(failedSyncs), Math.round(expiration / 1000));
 }
 
 
@@ -777,6 +774,8 @@ function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
     }
 
     const timeOffPeriods = personio.getPersonioJson('/company/time-offs' + UrlFetchJsonClient.buildQuery(params));
+    Util.shuffleArray(timeOffPeriods);
+
     const timeOffs = {};
     for (const timeOffPeriod of timeOffPeriods) {
         const timeOff = normalizePersonioTimeOffPeriod_(timeOffPeriod);
