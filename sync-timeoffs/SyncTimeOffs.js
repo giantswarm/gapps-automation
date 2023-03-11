@@ -521,7 +521,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
             break;
         }
 
-        const syncFailUpdatedAt = failedSyncs['t' + event.id];
+        const syncFailUpdatedAt = failedSyncs['t' + timeOff.id];
         const skipDueToFail = syncFailUpdatedAt != null && new Date(syncFailUpdatedAt) === timeOff.updatedAt;
 
         // check for dead zone
