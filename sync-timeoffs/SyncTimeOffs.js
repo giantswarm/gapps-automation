@@ -444,7 +444,9 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
     for (const event of allEvents) {
 
         if (now >= deadlineTs) {
-            putFailedSyncs_(primaryEmail, failedSyncs);
+            if (failCount > 0) {
+                putFailedSyncs_(primaryEmail, failedSyncs);
+            }
             return false;
         }
 
@@ -528,7 +530,9 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
         if (!skipDueToFail && timeOff.employeeId === employeeId && timeOff.updatedAt <= updateMax && !processedTimeOffIds[timeOff.id]) {
 
             if (Date.now() >= deadlineTs) {
-                putFailedSyncs_(primaryEmail, failedSyncs);
+                if (failCount > 0) {
+                    putFailedSyncs_(primaryEmail, failedSyncs);
+                }
                 return false;
             }
 
@@ -539,7 +543,9 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
         }
     }
 
-    putFailedSyncs_(primaryEmail, failedSyncs);
+    if (failCount > 0) {
+        putFailedSyncs_(primaryEmail, failedSyncs);
+    }
     return true;
 }
 
