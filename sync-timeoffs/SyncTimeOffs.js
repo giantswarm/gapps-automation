@@ -76,12 +76,6 @@ const PREFER_BULK_REQUESTS = PROPERTY_PREFIX + 'preferBulkRequests';
 /** The trigger handler function to call in time based triggers. */
 const TRIGGER_HANDLER_FUNCTION = 'syncTimeOffs';
 
-/** The minimum duration of a half-day out-of-office event. */
-const MINIMUM_OUT_OF_OFFICE_DURATION_HALF_DAY_MILLIES = 3 * 60 * 60 * 1000;  // half-day >= 3h
-
-/** The minimum duration of a whole day or longe out-of-office event. */
-const MINIMUM_OUT_OF_OFFICE_DURATION_WHOLE_DAY_MILLIES = 6 * 60 * 60 * 1000; // whole-day >= 6h
-
 /** The dead-zone after a sync failure where the saved original event.updated timestamp is being preferred. */
 const SYNC_FAIL_UPDATED_DEAD_ZONE = 30 * 1000; // 30s
 
@@ -810,17 +804,6 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
     }
 
     const halfDaysAllowed = !!timeOffType.attributes?.half_day_requests_enabled;
-    if (!existingTimeOff) {
-        // if we consider creating a new time-off (previously untracked),
-        // we ignore events which do not cover a certain minimum of hours
-        const minimumDurationMillies = halfDaysAllowed
-            ? MINIMUM_OUT_OF_OFFICE_DURATION_HALF_DAY_MILLIES
-            : MINIMUM_OUT_OF_OFFICE_DURATION_WHOLE_DAY_MILLIES;
-        if (+(new Date(event.end.dateTime || event.end.date)) - +(new Date(event.start.dateTime || event.start.date)) < minimumDurationMillies) {
-            return undefined;
-        }
-    }
-
     const localTzOffsetStart = event.start.date ? Util.getNamedTimeZoneOffset(event.start.timeZone, new Date(event.start.date)) : undefined;
     const localTzOffsetEnd = event.end.date ? Util.getNamedTimeZoneOffset(event.end.timeZone, new Date(event.end.date)) : undefined;
     const startAt = PeopleTime.fromISO8601(event.start.dateTime || event.start.date, undefined, localTzOffsetStart)
