@@ -6,7 +6,15 @@
  * Managed via: https://github.com/giantswarm/gapps-automation
  */
 
-/** Register this function with a "On form submit" trigger in Sheet context. */
+/** Register this function with a "On form submit" trigger in Sheet context.
+ *
+ * USAGE:
+ *
+ *  1. Deploy this script into a spreadsheet with the right columns (conference form)
+ *  2. Ensure the calendar is shared with and subscribed by the account running the script
+ *  3. Set the property ConferenceSync.calendarId to the calendar ID.
+ *  4. Setup "On form submit" trigger to call onFormSubmit()
+ */
 function onFormSubmit() {
 
     const scriptProperties = PropertiesService.getScriptProperties();
