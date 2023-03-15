@@ -34,6 +34,9 @@ function syncToCalendar_(spreadsheetId, sheetName, calendarId) {
     const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
     const sheet = sheetName ? spreadsheet.getSheetByName(sheetName) : spreadsheet.getSheets()[0];
     const calendar = CalendarApp.getCalendarById(calendarId);
+    if (!calendar) {
+        throw new Error(`Failed to access calendar ${calendarId}, please check permissions`);
+    }
 
     const data = sheet.getDataRange().getValues();
     const columnIndexes = getColumnIndexes_(data[0]);
