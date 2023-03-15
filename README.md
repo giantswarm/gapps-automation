@@ -115,3 +115,10 @@ We maintain a shared directory based library, called `lib`, which includes all o
 work.
 
 This directory is copied into each dependent project via `Makefile`.
+
+### Hints
+
+The Google Sheets/Forms UI makes it hard to attach a script project when using multiple Google accounts.
+
+To attach a project, get the document ID and use the following clasp command line in the project subdirectory:  
+`clasp create --parentId {SHEET_ID} --rootDir .`
