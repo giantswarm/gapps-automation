@@ -28,7 +28,7 @@ const PERSONIO_TOKEN_KEY = PROPERTY_PREFIX + 'personioToken'
  *
  * Execution stops at the first error, and error message containing the failed employee is returned.
  */
-function patchEmployee(...employees) {
+function patchEmployees(...employees) {
 
     const creds = getPersonioCreds_();
     const personio = PersonioClientV1.withApiCredentials(creds.clientId, creds.clientSecret);
