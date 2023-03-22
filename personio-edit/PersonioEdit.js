@@ -27,6 +27,13 @@ const PERSONIO_TOKEN_KEY = PROPERTY_PREFIX + 'personioToken'
  *   https://developer.personio.de/reference/patch_company-employees-employee-id
  *
  * Execution stops at the first error, and error message containing the failed employee is returned.
+ *
+ * USAGE:
+ *
+ *   Only via script API or debugger, clasp example:
+ *
+ *   $ clasp run 'patchEmployee' --params '[{"id": 1540283, "last_name": "Ajmera"}, {"id": 8919186, "last_name": "Wu"}]'
+ *
  */
 function patchEmployees(...employees) {
 
@@ -40,10 +47,7 @@ function patchEmployees(...employees) {
             throw new Error('Invalid argument specified (not a partial employee with "id"): ' + JSON.stringify(employee));
         }
 
-        const id = +employee['id'];
-        const employeeData = {...employee};
-        delete employeeData['id'];
-
+        const {id, ...employeeData} = employee;
         try {
             personio.fetchJson(`/company/employees/${id}`,
                 {
