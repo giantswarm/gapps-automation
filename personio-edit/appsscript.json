@@ -1,13 +1,6 @@
 {
   "timeZone": "Europe/Berlin",
   "dependencies": {
-    "enabledAdvancedServices": [
-      {
-        "userSymbol": "Sheets",
-        "serviceId": "sheets",
-        "version": "v4"
-      }
-    ]
   },
   "oauthScopes": [
     "https://www.googleapis.com/auth/drive",
