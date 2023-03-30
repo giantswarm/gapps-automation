@@ -32,7 +32,7 @@ const PERSONIO_TOKEN_KEY = PROPERTY_PREFIX + 'personioToken'
  *
  *   Only via script API or debugger, clasp example:
  *
- *   $ clasp run 'patchEmployee' --params '[{"id": 1540283, "last_name": "Ajmera"}, {"id": 8919186, "last_name": "Wu"}]'
+ *   $ clasp run 'patchEmployees' --params '[{"id": 1540283, "last_name": "Ajmera"}, {"id": 8919186, "last_name": "Wu"}]'
  *
  */
 function patchEmployees(...employees) {
