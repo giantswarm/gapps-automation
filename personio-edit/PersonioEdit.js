@@ -86,7 +86,7 @@ function getPersonioCreds_() {
             clientSecret: apiParts[1].trim()
         };
 
-        if (sourceSpec.url && sourceSpec.clientId && sourceSpec.clientSecret) {
+        if (sourceSpec.clientId && sourceSpec.clientSecret) {
             return sourceSpec;
         } else {
             throw new Error('Empty fields in property value for key ' + key + ': ' + rawProperty);
