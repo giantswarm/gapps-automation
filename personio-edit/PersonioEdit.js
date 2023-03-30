@@ -49,15 +49,15 @@ function patchEmployees(...employees) {
 
         const {id, ...employeeData} = employee;
         try {
-            personio.fetchJson(`/company/employees/${id}`,
+            personio.fetchJson(`/company/employees/${(+id).toFixed(0)}`,
                 {
                     "method": "patch",
                     "contentType": "application/json",
-                    "payload": JSON.stringify(employeeData)
+                    "payload": JSON.stringify({employee: employeeData})
                 });
-            Logger.log('Patched employee %s: %s', id, JSON.stringify(employeeData));
+            Logger.log('Patched employee %s: %s', (+id).toFixed(0), JSON.stringify(employeeData));
         } catch (e) {
-            throw new Error(`Failed to patch employee ${id}: ${e.message}`);
+            throw new Error(`Failed to patch employee ${(+id).toFixed(0)}: ${e.message}`);
         }
     }
 }
