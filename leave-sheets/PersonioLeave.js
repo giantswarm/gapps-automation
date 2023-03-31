@@ -12,7 +12,8 @@
  *
  * Use =IMPORTRANGE(PERSONIO_SPREADSHEET_ID, TimeOffPeriod!A:ZZZ) and similar to import the needed sheet's data.
  *
- * @param {array<string>|string} typeFilter  Words that the TimeOffType name must match to be displayed.
+ * @param {array<string>|string} typeFilter  Words that the TimeOffType name must match to be displayed,
+ *                                           maybe a pipe-separated list (eg. "vacation|sick|out").
  * @param {boolean} includeAbsent  Also list currently entires for currently absent employees.
  * @return Rows listing the upcoming leave.
  * @customfunction
@@ -26,7 +27,7 @@ function UPCOMING_LEAVE(typeFilter, includeAbsent) {
 
     // sanitize args
     if (typeFilter && !Array.isArray(typeFilter)) {
-        typeFilter = [typeFilter];
+        typeFilter = ('' + typeFilter).split('|');
     }
 
     const now = new Date();
