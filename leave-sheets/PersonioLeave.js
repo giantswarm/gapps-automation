@@ -28,12 +28,11 @@ function UPCOMING_LEAVE(typeFilter, includeAbsent) {
     if (typeFilter && !Array.isArray(typeFilter)) {
         typeFilter = [typeFilter];
     }
-    includeAbsent = !!includeAbsent;
 
     const now = new Date();
 
     const matchingTypes = SheetUtil.getSheetData(spreadsheet, 'TimeOffType', [])
-        .filter(timeOffType => !Array.isArray(typeFilter)
+        .filter(timeOffType => (!Array.isArray(typeFilter) || !typeFilter.length)
             || typeFilter.some(t => timeOffType.name.toLowerCase().includes(t) || timeOffType.category.toLowerCase().includes(t)))
         .reduce((map, timeOffType) => ({...map, [timeOffType.id]: timeOffType.name}), {});
 
@@ -42,9 +41,7 @@ function UPCOMING_LEAVE(typeFilter, includeAbsent) {
         .filter(timeOff => matchingTypes[timeOff.time_off_type_timeofftype_id] != null)
         .map(timeOff => ({...timeOff, start_date: new Date(timeOff.start_date), end_date: new Date(timeOff.end_date)}))
         .filter(timeOff => timeOff.end_date >= now && (includeAbsent || timeOff.start_date >= now))
-        .sort((t1, t2) => {
-            return t1 - t2;
-        });
+        .sort((t1, t2) => t1 - t2);
 
     const employees = SheetUtil.getSheetData(spreadsheet, 'Employee', ['id', 'first_name', 'last_name', 'email'])
         .reduce((map, employee) => {
@@ -52,7 +49,6 @@ function UPCOMING_LEAVE(typeFilter, includeAbsent) {
             return map;
         }, {});
 
-    // id name	start_date	end_date	First name	Last name	Email
     const result = [['Id', 'Name', 'Start Date', 'End Date', 'First Name', 'Last Name', 'Email', 'Comment']];
     for (const timeOff of timeOffPeriods) {
         const employee = employees[timeOff.employee_employee_id];
