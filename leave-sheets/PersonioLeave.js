@@ -41,7 +41,7 @@ function UPCOMING_LEAVE(typeFilter, includeAbsent) {
         .filter(timeOff => matchingTypes[timeOff.time_off_type_timeofftype_id] != null)
         .map(timeOff => ({...timeOff, start_date: new Date(timeOff.start_date), end_date: new Date(timeOff.end_date)}))
         .filter(timeOff => timeOff.end_date >= now && (includeAbsent || timeOff.start_date >= now))
-        .sort((t1, t2) => t1 - t2);
+        .sort((t1, t2) => t1.start_date - t2.start_date);
 
     const employees = SheetUtil.getSheetData(spreadsheet, 'Employee', ['id', 'first_name', 'last_name', 'email'])
         .reduce((map, employee) => {
