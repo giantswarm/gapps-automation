@@ -47,30 +47,31 @@ Uses Google's `clasp` tool for deployment.
    ```sh
    clasp login --creds <OAUTH2_GOOGLE_CLOUD_PROJECT_CLIENT_SECRET_FILE>
    ```
-5. Prepare for pushing from working copy to an Apps Script project  
-   * Link to existing Apps Script project:
-     ```
-     SCRIPT_ID=1XFv9QvLUjFqqPMpqNqDoq2C9aZAsBTGR2s63hSCrqwFcyPMTUrV99Q4x make personio-to-sheets/
-     ```
-   * Link to new project (with or without parent sheets/docs document):
-     ```
-     clasp create --help  # see documentation for parameter '--type'
-     clasp create --title "$(basename "$(pwd)")" --type standalone --parentId OPTIONAL_PARENT_DOCUMENT_ID
-     ```
-6. Upload local files to drive:
-   ```sh
-   clasp push
-   ```
-8. Configure properties for the scripts using the builtin helper function:
+5. Upload from working copy to a new or existing Apps Script project  
+   The `personio-to-sheets` sub project is used as an example.
+   * Link and push to existing Apps Script project:
+      ```
+      clasp list | sed 's/https\:\/\/script\.google\.com\/d\///g'
+      SCRIPT_ID={SCRIPT_ID_COPIED_FROM_ABOVE} make personio-to-sheets/
+      ```
+   * Link and push to new project (with or without parent sheets/docs document):
+      ```
+      cd personio-to-sheets/
+      clasp create --help  # see documentation for parameter '--type'
+      clasp create --title "$(basename "$(pwd)")" --type standalone --parentId OPTIONAL_PARENT_DOCUMENT_ID
+      cd ..
+      SCRIPT_ID={SCRIPT_ID_COPIED_FROM_ABOVE} make personio-to-sheets/
+      ```
+6. Configure properties for the scripts using the builtin helper function:
    ```sh
    clasp run 'setProperties' --params '[{"KEY": "VALUE"}, false]'
    ```
-9. Install automated script functions:
+7. Install automated script functions:
    ```sh
    # install a script (argument "5" could be the delay in minutes)
    clasp run 'install' --params '[5]'  
    ```
-10. Uninstall automated script function:
+8. Uninstall automated script function:
     ```sh
     clasp run 'uninstall' # remove trigger(s) for the relevant project
     ```
