@@ -14,6 +14,12 @@ all: $(gas_projects)
 
 %/: %/lib.js FORCE
 	@echo Pushing project $@
+	@ if test -n "$(SCRIPT_ID)"; then \
+   		 echo '{}' > $@.clasp.json ; \
+ 		 clasp-env --folder $@. --scriptId $(SCRIPT_ID); \
+ 	  else \
+ 	     echo WARNING: SCRIPT_ID not set, trying to use existing $@.clasp.json; \
+ 	  fi
 	cd $@ && clasp push -f
 
 #.PRECIOUS: %/lib.js
