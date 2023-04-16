@@ -34,7 +34,7 @@ const TRIGGER_HANDLER_FUNCTION = 'dumpPersonio';
  *
  * Take configuration from ScriptProperties and perform synchronization.
  */
-function dumpPersonio() {
+async function dumpPersonio() {
 
     let firstError = null;
 
@@ -45,7 +45,7 @@ function dumpPersonio() {
 
         let data = null;
         try {
-            data = personio.getPersonioJson(task.source.url);
+            data = await personio.getPersonioJson(task.source.url);
         } catch (e) {
             Logger.log('Failed to fetch Personio data for sheet %s: %s', task.spreadsheetId, e.message);
             firstError = firstError || e;

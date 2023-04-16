@@ -49,7 +49,7 @@ const TRIGGER_HANDLER_FUNCTION = 'truncateMailboxes';
  * Ensure that this methods ExecutionApi scope is limited to MYSELF in the manifest,
  * to prevent other unauthorized domain users from using its features.
  */
-function truncateMailboxes() {
+async function truncateMailboxes() {
 
     let firstError = null;
 
@@ -57,7 +57,7 @@ function truncateMailboxes() {
     for (const task of getTasks_()) {
 
         try {
-            cleanUserMailbox_(getServiceAccountCredentials_(), task.primaryEmail, task.cleanFilter);
+            await cleanUserMailbox_(getServiceAccountCredentials_(), task.primaryEmail, task.cleanFilter);
         } catch (e) {
             Logger.log('Failed to clean mailbox %s: %s', task.primaryEmail, e.message);
             firstError = firstError || e;
@@ -75,20 +75,20 @@ function truncateMailboxes() {
  * WARNING: This is intended to be used for emergencies, adhering to regulatory requirements or to
  *          keep automated account's inboxes clean. Use with utmost care!
  */
-function cleanUserMailbox_(serviceAccountCredentials, primaryEmail, searchExpression) {
+async function cleanUserMailbox_(serviceAccountCredentials, primaryEmail, searchExpression) {
 
-    const gmail = GmailClientV1.withImpersonatingService(serviceAccountCredentials, primaryEmail);
+    const gmail = await GmailClientV1.withImpersonatingService(serviceAccountCredentials, primaryEmail);
 
-    const cleanMessages = (messages) => {
+    const cleanMessages = async (messages) => {
         if (Array.isArray(messages) && messages.length > 0)
         {
-            gmail.deleteUserMessages(primaryEmail, messages.map(message => message.id));
+            await gmail.deleteUserMessages(primaryEmail, messages.map(message => message.id));
             return [messages.length]; // accumulate only stats
         }
         return [0]
     };
 
-    const batches = gmail.listUserMessages(primaryEmail, searchExpression, cleanMessages);
+    const batches = await gmail.listUserMessages(primaryEmail, searchExpression, cleanMessages);
 
     const removalCount = batches.reduce((s1, s2) => s1 + s2);
     Logger.log("mailbox %s: deleted %s messages searching: %s", primaryEmail, ""+removalCount, searchExpression);

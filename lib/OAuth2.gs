@@ -535,7 +535,7 @@ Service_.prototype.getAuthorizationUrl = function(optAdditionalParameters) {
  *     function.
  * @return {boolean} True if authorization was granted, false if it was denied.
  */
-Service_.prototype.handleCallback = function(callbackRequest) {
+Service_.prototype.handleCallback = async function(callbackRequest) {
   var code = callbackRequest.parameter.code;
   var error = callbackRequest.parameter.error;
   if (error) {
@@ -560,7 +560,7 @@ Service_.prototype.handleCallback = function(callbackRequest) {
   if (callbackRequest.parameter.codeVerifier_) {
     payload['code_verifier'] = callbackRequest.parameter.codeVerifier_;
   }
-  var token = this.fetchToken_(payload);
+  var token = await this.fetchToken_(payload);
   this.saveToken_(token);
   return true;
 };
@@ -572,14 +572,14 @@ Service_.prototype.handleCallback = function(callbackRequest) {
  * @return {boolean} true if the user has access to the service, false
  *     otherwise.
  */
-Service_.prototype.hasAccess = function() {
+Service_.prototype.hasAccess = async function() {
   var token = this.getToken();
   if (token && !this.isExpired_(token)) return true; // Token still has access.
   var canGetToken = (token && this.canRefresh_(token)) ||
       this.privateKey_ || this.grantType_;
   if (!canGetToken) return false;
 
-  return this.lockable_(function() {
+  return await this.lockable_(async function() {
     // Get the token again, bypassing the local memory cache.
     token = this.getToken(true);
     // Check to see if the token is no longer missing or expired, as another
@@ -587,13 +587,13 @@ Service_.prototype.hasAccess = function() {
     if (token && !this.isExpired_(token)) return true; // Token now has access.
     try {
       if (token && this.canRefresh_(token)) {
-        this.refresh();
+        await this.refresh();
         return true;
       } else if (this.privateKey_) {
-        this.exchangeJwt_();
+        await this.exchangeJwt_();
         return true;
       } else if (this.grantType_) {
-        this.exchangeGrant_();
+        await this.exchangeGrant_();
         return true;
       } else {
         // This should never happen, since canGetToken should have been false
@@ -659,7 +659,7 @@ Service_.prototype.getLastError = function() {
  * @param {string} [optUrl] The URL of the token endpoint.
  * @return {Object} The parsed token.
  */
-Service_.prototype.fetchToken_ = function(payload, optUrl) {
+Service_.prototype.fetchToken_ = async function(payload, optUrl) {
   // Use the configured token URL unless one is specified.
   var url = optUrl || this.tokenUrl_;
   var headers = {
@@ -671,7 +671,7 @@ Service_.prototype.fetchToken_ = function(payload, optUrl) {
   if (this.tokenPayloadHandler_) {
     payload = this.tokenPayloadHandler_(payload);
   }
-  var response = UrlFetchApp.fetch(url, {
+  var response = await UrlFetchApp.fetch(url, {
     method: this.tokenMethod_,
     headers: headers,
     payload: payload,
@@ -763,14 +763,14 @@ Service_.prototype.ensureExpiresAtSet_ = function(token) {
  * Refreshes a token that has expired. This is only possible if offline access
  * was requested when the token was authorized.
  */
-Service_.prototype.refresh = function() {
+Service_.prototype.refresh = async function() {
   validate_({
     'Client ID': this.clientId_,
     'Client Secret': this.clientSecret_,
     'Token URL': this.tokenUrl_
   });
 
-  this.lockable_(function() {
+  await this.lockable_(async function() {
     var token = this.getToken();
     if (!token.refresh_token) {
       throw new Error('Offline access is required.');
@@ -781,7 +781,7 @@ Service_.prototype.refresh = function() {
       client_secret: this.clientSecret_,
       grant_type: 'refresh_token',
     };
-    var newToken = this.fetchToken_(payload, this.refreshUrl_);
+    var newToken = await this.fetchToken_(payload, this.refreshUrl_);
     if (!newToken.refresh_token) {
       newToken.refresh_token = token.refresh_token;
     }
@@ -892,7 +892,7 @@ Service_.prototype.canRefresh_ = function(token) {
  * an access token.
  * @private
  */
-Service_.prototype.exchangeJwt_ = function() {
+Service_.prototype.exchangeJwt_ = async function() {
   validate_({
     'Token URL': this.tokenUrl_
   });
@@ -901,7 +901,7 @@ Service_.prototype.exchangeJwt_ = function() {
     assertion: jwt,
     grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer'
   };
-  var token = this.fetchToken_(payload);
+  var token = await this.fetchToken_(payload);
   this.saveToken_(token);
 };
 
@@ -947,13 +947,13 @@ Service_.prototype.createJwt_ = function() {
  * @return {*} The result of the code block.
  * @private
  */
-Service_.prototype.lockable_ = function(func) {
+Service_.prototype.lockable_ = async function(func) {
   var releaseLock = false;
   if (this.lock_ && !this.lock_.hasLock()) {
     this.lock_.waitLock(Service_.LOCK_EXPIRATION_MILLISECONDS_);
     releaseLock = true;
   }
-  var result = func.apply(this);
+  var result = await func.apply(this);
   if (this.lock_ && releaseLock) {
     this.lock_.releaseLock();
   }
@@ -965,7 +965,7 @@ Service_.prototype.lockable_ = function(func) {
  * this will be "client_credentials", and a client ID and secret are set an
  * "Authorization: Basic ..." header will be added using those values.
  */
-Service_.prototype.exchangeGrant_ = function() {
+Service_.prototype.exchangeGrant_ = async function() {
   validate_({
     'Grant Type': this.grantType_,
     'Token URL': this.tokenUrl_
@@ -988,7 +988,7 @@ Service_.prototype.exchangeGrant_ = function() {
         Utilities.base64Encode(this.clientId_ + ':' + this.clientSecret_);
   }
 
-  var token = this.fetchToken_(payload);
+  var token = await this.fetchToken_(payload);
   this.saveToken_(token);
 };
 

@@ -5,3 +5,4 @@ gapps-automation.iml
 venv
 credentials.json
 */lib.js
+lib-output
