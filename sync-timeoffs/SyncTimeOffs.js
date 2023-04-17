@@ -110,7 +110,7 @@ const MAX_SYNC_FAIL_DELAY = 60 * 60 * 1000; // 1h
  * The service account must be configured correctly and have at least permission for these scopes:
  *   https://www.googleapis.com/auth/calendar
  */
-function syncTimeOffs() {
+async function syncTimeOffs() {
 
     const scriptLock = LockService.getScriptLock();
     if (!scriptLock.tryLock(5000)) {
@@ -151,17 +151,17 @@ function syncTimeOffs() {
     const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
 
     // load timeOffTypeConfig
-    const timeOffTypeConfig = new TimeOffTypeConfig(personio.getPersonioJson('/company/time-off-types'), getSkipApprovalBlackList_());
+    const timeOffTypeConfig = new TimeOffTypeConfig(await personio.getPersonioJson('/company/time-off-types'), getSkipApprovalBlackList_());
 
     // load and prepare list of employees to process
-    const employees = personio.getPersonioJson('/company/employees').filter(employee =>
+    const employees = await personio.getPersonioJson('/company/employees').filter(employee =>
         employee.attributes.status.value !== 'inactive' && isEmailAllowed(employee.attributes.email.value)
     );
     Util.shuffleArray(employees);
 
     // if bulk requests are preferred, prefetch all Personio time-offs
     const allTimeOffs = isPreferBulkRequestsEnabled_()
-        ? queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, undefined)
+        ? await queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, undefined)
         : undefined;
 
     Logger.log('Syncing events between %s and %s for %s accounts', fetchTimeMin.toISOString(), fetchTimeMax.toISOString(), '' + employees.length);
@@ -174,7 +174,7 @@ function syncTimeOffs() {
 
         // we keep operating if handling calendar of a single user fails
         try {
-            const calendar = CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), email);
+            const calendar = await CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), email);
             if (!syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies, allTimeOffs)) {
                 break;
             }
@@ -409,7 +409,7 @@ class TimeOffTypeConfig {
  *
  * @returns true if the specified employees account was fully processed, false if processing was aborted early.
  */
-function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies, allTimeOffs) {
+async function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies, allTimeOffs) {
 
     // test against dead-line first
     const deadlineTs = +epoch + maxRuntimeMillies;
@@ -426,11 +426,11 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
 
     // load or filter timeOffs indexed by ID
     const employeeId = employee.attributes.id.value;
-    const timeOffs = Util.isObject(allTimeOffs) ? allTimeOffs : queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, employeeId);
+    const timeOffs = Util.isObject(allTimeOffs) ? allTimeOffs : await queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, employeeId);
 
     const failedSyncs = getFailedSyncs_(primaryEmail);
 
-    const allEvents = queryCalendarEvents_(calendar, 'primary', fetchTimeMin, fetchTimeMax);
+    const allEvents = await queryCalendarEvents_(calendar, 'primary', fetchTimeMin, fetchTimeMax);
     Util.shuffleArray(allEvents);
 
     let failCount = 0;
@@ -469,7 +469,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
                 }
 
                 if (isEventCancelled) {
-                    isOk = syncActionDeleteTimeOff_(personio, primaryEmail, timeOff);
+                    isOk = await syncActionDeleteTimeOff_(personio, primaryEmail, timeOff);
                     now = Date.now();
                 } else {
                     // need to convert to be able to compare start/end timestamps (Personio is whole-day/half-day only)
@@ -478,9 +478,9 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
                         && (!updatedTimeOff.startAt.equals(timeOff.startAt) || !updatedTimeOff.endAt.equals(timeOff.endAt) || updatedTimeOff.typeId !== timeOff.typeId)) {
                         // start/end timestamps differ, now check which (Personio/Google Calendar) has more recent changes
                         if (timeOff.updatedAt >= eventUpdatedAt) {
-                            isOk = syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff);
+                            isOk = await syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff);
                         } else {
-                            isOk = syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff);
+                            isOk = await syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff);
                         }
                         now = Date.now();
                     }
@@ -489,7 +489,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
                 // check for dead zone
                 // we allow event cancellation even in case maxFailCount was reached
                 if (eventUpdatedAt <= updateMax) {
-                    isOk = syncActionDeleteEvent_(calendar, primaryEmail, event);
+                    isOk = await syncActionDeleteEvent_(calendar, primaryEmail, event);
                     now = Date.now();
                 }
             }
@@ -498,7 +498,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
             if (eventUpdatedAt <= updateMax && !skipDueToFail && !event.iCalUID.includes('cronofy.com')) {
                 const newTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, undefined);
                 if (newTimeOff) {
-                    isOk = syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff);
+                    isOk = await syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff);
                     now = Date.now();
                 }
             }
@@ -530,7 +530,7 @@ function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, f
                 return false;
             }
 
-            if (!syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeOff)) {
+            if (!await syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeOff)) {
                 failedSyncs['t' + timeOff.id] = +timeOff.updatedAt;
                 ++failCount;
             }
@@ -561,10 +561,10 @@ function putFailedSyncs_(primaryEmail, failedSyncs) {
 
 
 /** Delete Personio TimeOffs for cancelled Google Calendar events */
-function syncActionDeleteTimeOff_(personio, primaryEmail, timeOff) {
+async function syncActionDeleteTimeOff_(personio, primaryEmail, timeOff) {
     try {
         // event deleted in google calendar, delete in Personio
-        deletePersonioTimeOff_(personio, timeOff);
+        await deletePersonioTimeOff_(personio, timeOff);
         Logger.log('Deleted TimeOff "%s" at %s for user %s', timeOff.typeName, String(timeOff.startAt), primaryEmail);
         return true;
     } catch (e) {
@@ -575,7 +575,7 @@ function syncActionDeleteTimeOff_(personio, primaryEmail, timeOff) {
 
 
 /** Update Personio TimeOff -> Google Calendar event */
-function syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff) {
+async function syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff) {
     try {
         // Update event timestamps
         event.start.dateTime = timeOff.startAt.toISOString();
@@ -585,7 +585,7 @@ function syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff) {
         event.end.date = null;
         event.end.timeZone = null;
 
-        calendar.update('primary', event.id, event);
+        await calendar.update('primary', event.id, event);
         Logger.log('Updated event "%s" at %s for user %s', event.summary, event.start.dateTime || event.start.date, primaryEmail);
         return true;
     } catch (e) {
@@ -596,16 +596,16 @@ function syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff) {
 
 
 /** Update Google Calendar event -> Personio TimeOff */
-function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff) {
+async function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff) {
     try {
         // Create new Google Calendar Out-of-Office
         // updating by ID is not possible (according to docs AND trial and error)
         // since overlapping time-offs are not allowed (HTTP 400) no "more-safe" update operation is possible
-        deletePersonioTimeOff_(personio, timeOff);
-        const createdTimeOff = createPersonioTimeOff_(personio, updatedTimeOff);
+        await deletePersonioTimeOff_(personio, timeOff);
+        const createdTimeOff = await createPersonioTimeOff_(personio, updatedTimeOff);
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
-        calendar.update('primary', event.id, event);
+        await calendar.update('primary', event.id, event);
         Logger.log('Updated TimeOff "%s" at %s for user %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail);
         return true;
     } catch (e) {
@@ -616,10 +616,10 @@ function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeO
 
 
 /** Personio TimeOff -> New Google Calendar event */
-function syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeOff) {
+async function syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeOff) {
     try {
         const newEvent = createEventFromTimeOff_(timeOffTypeConfig, timeOff);
-        calendar.insert('primary', newEvent);
+        await calendar.insert('primary', newEvent);
         Logger.log('Inserted Out-of-Office "%s" at %s for user %s', timeOff.typeName, String(timeOff.startAt), primaryEmail);
         return true;
     } catch (e) {
@@ -630,10 +630,10 @@ function syncActionInsertEvent_(calendar, primaryEmail, timeOffTypeConfig, timeO
 
 
 /** Delete from Google Calendar */
-function syncActionDeleteEvent_(calendar, primaryEmail, event) {
+async function syncActionDeleteEvent_(calendar, primaryEmail, event) {
     try {
         event.status = 'cancelled';
-        calendar.update('primary', event.id, event);
+        await calendar.update('primary', event.id, event);
         Logger.log('Cancelled out-of-office "%s" at %s for user %s', event.summary, event.start.dateTime || event.start.date, primaryEmail);
         return true;
     } catch (e) {
@@ -644,35 +644,16 @@ function syncActionDeleteEvent_(calendar, primaryEmail, event) {
 
 
 /** Google Calendar -> New Personio TimeOff */
-function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff) {
+async function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event, newTimeOff) {
     try {
-        const createdTimeOff = createPersonioTimeOff_(personio, newTimeOff);
+        const createdTimeOff = await createPersonioTimeOff_(personio, newTimeOff);
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
-        calendar.update('primary', event.id, event);
+        await calendar.update('primary', event.id, event);
         Logger.log('Inserted TimeOff "%s" at %s for user %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail);
         return true;
     } catch (e) {
         Logger.log('Failed to insert new TimeOff "%s" at %s for user %s: %s', event.summary, event.start.dateTime || event.start.date, primaryEmail, e);
-        return false;
-    }
-}
-
-
-/** Update the event's syncFailCount property. */
-function syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCount, updatedAt) {
-    try {
-        setEventPrivateProperty_(event, 'syncFailCount', failCount.toFixed(0));
-
-        // set syncFailUpdated to allow restoring the original "updated" timestamp, via getOriginalEventUpdated_()
-        const deadZoneEndMillies = (Date.now() + SYNC_FAIL_UPDATED_DEAD_ZONE).toFixed(0);  // assuming calendar.update() won't need more than 30s
-        const updatedAtValue = updatedAt.valueOf().toFixed(0)
-        setEventPrivateProperty_(event, 'syncFailUpdated', `${deadZoneEndMillies}|${updatedAtValue}`);
-
-        calendar.update('primary', event.id, event);
-        return true;
-    } catch (e) {
-        Logger.log('Failed to set syncFailCount to %s for event at %s for user %s: %s', failCount, event.start.dateTime || event.start.date, primaryEmail, e);
         return false;
     }
 }
@@ -687,7 +668,7 @@ function syncActionUpdateEventFailCount_(calendar, primaryEmail, event, failCoun
  *
  * @return {Array<Object>} Array of Google Calendar event resources.
  */
-function queryCalendarEvents_(calendar, calendarId, timeMin, timeMax) {
+async function queryCalendarEvents_(calendar, calendarId, timeMin, timeMax) {
     const eventListParams = {
         singleEvents: true,
         showDeleted: true,
@@ -695,7 +676,7 @@ function queryCalendarEvents_(calendar, calendarId, timeMin, timeMax) {
         timeMax: timeMax.toISOString()
     };
 
-    return calendar.list(calendarId, eventListParams);
+    return await calendar.list(calendarId, eventListParams);
 }
 
 
@@ -762,7 +743,7 @@ function normalizePersonioTimeOffPeriod_(timeOffPeriod) {
  *
  * @return {Object} Normalized TimeOff structures indexed by TimeOffPeriod ID.
  */
-function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
+async function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
     const params = {
         start_date: timeMin.toISOString().split("T")[0],
         end_date: timeMax.toISOString().split("T")[0],
@@ -773,7 +754,7 @@ function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
         params['employees[]'] = employeeId;
     }
 
-    const timeOffPeriods = personio.getPersonioJson('/company/time-offs' + UrlFetchJsonClient.buildQuery(params));
+    const timeOffPeriods = await personio.getPersonioJson('/company/time-offs' + UrlFetchJsonClient.buildQuery(params));
     Util.shuffleArray(timeOffPeriods);
 
     const timeOffs = {};
@@ -828,15 +809,15 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
 
 
 /** Delete the specified TimeOff from Personio. */
-function deletePersonioTimeOff_(personio, timeOff) {
-    return personio.fetchJson(`/company/time-offs/${timeOff.id.toFixed(0)}`, {
+async function deletePersonioTimeOff_(personio, timeOff) {
+    return await personio.fetchJson(`/company/time-offs/${timeOff.id.toFixed(0)}`, {
         method: 'delete'
     });
 }
 
 
 /** Insert a new Personio TimeOff. */
-function createPersonioTimeOff_(personio, timeOff) {
+async function createPersonioTimeOff_(personio, timeOff) {
 
     const isMultiDay = !timeOff.startAt.isAtSameDay(timeOff.endAt);
     const halfDayStart = isMultiDay ? timeOff.startAt.isHalfDay() : timeOff.endAt.isHalfDay();
@@ -857,7 +838,7 @@ function createPersonioTimeOff_(personio, timeOff) {
         payload.skip_approval = "1";
     }
 
-    const result = personio.fetchJson('/company/time-offs', {
+    const result = await personio.fetchJson('/company/time-offs', {
         method: 'post',
         payload: payload
     });

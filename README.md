@@ -9,15 +9,21 @@ Uses Google's `clasp` tool for deployment.
 
 ### Local Dependencies
 
+* `node`  
+    The `node` binary allows running JavaScript locally (used to run `clasp` and for tests).  
+    **Install:** `sudo apt install nodejs`.  
+    **Documentation:** https://nodejs.org/en
+
 * `clasp`  
     Automates Apps Script deployment tasks.  
     **Install:** `sudo npm install -g clasp`.  
     **Documentation:** https://developers.google.com/apps-script/guides/clasp  
 
 * `clasp-env`  
-    Links sub-directories to clasp projects.  
+    Links subdirectories to clasp projects.  
     **Install:** `sudo npm install -g clasp-env`.  
     **Documentation:** https://medium.com/geekculture/if-you-use-clasp-with-google-apps-script-you-need-this-utility-right-now-de61fd4e67c8  
+
 
 ### Cloud Services for Deployment
 
@@ -82,6 +88,12 @@ A Makefile is provided to ease development and deployment on CI.
 
 #### Examples
 
+* Build node library in `lib-output` and run local tests:
+
+  Running the tests requires the `node` binary to be installed. The installed node must implement `fetch()` (>= v16).
+
+  ```make clean && make test```
+
 * Assemble and push all projects (must be locally logged in, see above):
 
   ```make```
@@ -90,7 +102,7 @@ A Makefile is provided to ease development and deployment on CI.
 
   ```make options-sheets/```
 
-* Clean all generated files (for example `$project/lib`):
+* Clean all generated files (for example `$project/lib` or `lib-output`):
 
   ```make clean```
 
@@ -119,7 +131,20 @@ This directory is copied into each dependent project via `Makefile`.
 
 ### Hints
 
+
+#### Attaching to a Sheets/Docs/Forms Container
+
 The Google Sheets/Forms UI makes it hard to attach a script project when using multiple Google accounts.
 
 To attach a project, get the document ID and use the following clasp command line in the project subdirectory:  
 `clasp create --parentId {SHEET_ID} --rootDir .`
+
+#### Building just the Lib
+
+For testing or use in other projects (possibly targetting another runtime) building just the library part of this project may be required.
+
+To build just `lib-output/lib.js` run the following:
+```
+# the directory lib-output will be automatically created if it doesn't exist
+make lib
+```

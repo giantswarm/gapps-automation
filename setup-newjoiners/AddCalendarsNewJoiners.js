@@ -48,7 +48,7 @@ const TRIGGER_HANDLER_FUNCTION = 'addCalendarsToNewJoiners';
  * The service account must be configured correctly and have at least permission for these scopes:
  *   https://www.googleapis.com/auth/calendar
  */
-function addCalendarsToNewJoiners() {
+async function addCalendarsToNewJoiners() {
 
     const calendarIds = getRequiredCalendars_();
     if (!calendarIds || calendarIds.length === 0) {
@@ -64,14 +64,14 @@ function addCalendarsToNewJoiners() {
 
     Logger.log('Configured to handle users on domains: %s', allowedDomains);
 
-    const newJoinerEmails = getPersonioEmployeeEmailsByStatus_('onboarding').filter(email => isEmailDomainAllowed(email));
+    const newJoinerEmails = await getPersonioEmployeeEmailsByStatus_('onboarding').filter(email => isEmailDomainAllowed(email));
 
     let firstError = null;
 
     for (const primaryEmail of newJoinerEmails) {
         // we keep operating if handling calendars of a single user fails
         try {
-            subscribeUserCalendars_(getServiceAccountCredentials_(), primaryEmail, calendarIds);
+            await subscribeUserCalendars_(getServiceAccountCredentials_(), primaryEmail, calendarIds);
         } catch (e) {
             Logger.log('Failed to ensure calendars of user %s: %s', primaryEmail, e.message);
             firstError = firstError || e;
@@ -85,16 +85,16 @@ function addCalendarsToNewJoiners() {
 
 
 /** Subscribe a single account to all the specified calendars. */
-function subscribeUserCalendars_(serviceAccountCredentials, primaryEmail, calendarIds) {
+async function subscribeUserCalendars_(serviceAccountCredentials, primaryEmail, calendarIds) {
 
-    const calendarList = CalendarListClient.withImpersonatingService(serviceAccountCredentials, primaryEmail);
+    const calendarList = await CalendarListClient.withImpersonatingService(serviceAccountCredentials, primaryEmail);
 
-    const existingCalendars = calendarList.list();
+    const existingCalendars = await calendarList.list();
     for (const calendarId of calendarIds) {
         if (!existingCalendars.some(calendar => calendar.id === calendarId)) {
             // continue operating if adding a single calendar fails
             try {
-                const newItem = calendarList.insert({id: calendarId});
+                const newItem = await calendarList.insert({id: calendarId});
                 existingCalendars.push(newItem); // to handle duplicates in calendarIds
                 Logger.log('Added calendar %s to user %s', calendarId, primaryEmail);
             } catch (e) {
@@ -169,12 +169,12 @@ function getPersonioCreds_() {
  *
  * @param status One of: onboarding, active, offboarding, inactive
  */
-function getPersonioEmployeeEmailsByStatus_(status) {
+async function getPersonioEmployeeEmailsByStatus_(status) {
 
     const personioCreds = getPersonioCreds_();
     const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
 
-    const data = personio.getPersonioJson('/company/employees');
+    const data = await personio.getPersonioJson('/company/employees');
     const emails = [];
     for (const item of data) {
         const attributes = item?.attributes;
