@@ -84,6 +84,8 @@ A Makefile is provided to ease development and deployment on CI.
 
 * Build node library in `lib-output` and run local tests:
 
+  Running the tests requires the `node` binary to be installed. The installed node must implement `fetch()` (>= v16).
+
   ```make clean && make test```
 
 * Assemble and push all projects (must be locally logged in, see above):
