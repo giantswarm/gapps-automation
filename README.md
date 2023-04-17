@@ -9,15 +9,21 @@ Uses Google's `clasp` tool for deployment.
 
 ### Local Dependencies
 
+* `node`  
+    The `node` binary allows running JavaScript locally (used to run `clasp` and for tests).  
+    **Install:** `sudo apt install nodejs`.  
+    **Documentation:** https://nodejs.org/en
+
 * `clasp`  
     Automates Apps Script deployment tasks.  
     **Install:** `sudo npm install -g clasp`.  
     **Documentation:** https://developers.google.com/apps-script/guides/clasp  
 
 * `clasp-env`  
-    Links sub-directories to clasp projects.  
+    Links subdirectories to clasp projects.  
     **Install:** `sudo npm install -g clasp-env`.  
     **Documentation:** https://medium.com/geekculture/if-you-use-clasp-with-google-apps-script-you-need-this-utility-right-now-de61fd4e67c8  
+
 
 ### Cloud Services for Deployment
 
