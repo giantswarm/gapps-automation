@@ -8,8 +8,8 @@ jobs:
     env:
       VERSION: ${{ github.event.release.name }}
       COMMITISH: ${{ github.event.release.target_commitish }}
-      SENDER: ${{ github.event.sender }}
-      REPOSITORY: ${{ github.event.repository }}
+      SENDER: ${{ github.event.release.sender }}
+      REPOSITORY: ${{ github.event.release.repository }}
     steps:
       - name: Checkout Sources
         uses: actions/checkout@v3
