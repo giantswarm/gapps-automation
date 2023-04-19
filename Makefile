@@ -46,12 +46,11 @@ lib: lib-output/lib.js
 # running tests requires nodejs to be installed
 .PHONY: test
 test: lib
-	set -e ; cd tests && for t in *-test-*.js; do node --input-type=module < $$t ; done
+	set -e ; cd tests && for t in *.*js; do node --input-type=module < $$t ; done
 
 .PHONY: clean
 clean:
 	rm -rf ./lib-output
-	@echo Cleaned projects $(gas_projects)
 
 # this target only exists to allow us to force pattern targets (.PHONY doesn't work there)
 FORCE:

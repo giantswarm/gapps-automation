@@ -4,7 +4,7 @@ const {createServer} = await import('http');
 const {PersonioClientV1, PersonioAuthV1} = (await import('../lib-output/lib.js')).default;
 
 const mockServer = createServer((request, response) => {
-    console.log("request: ", (request.method || '').toUpperCase(), request.url, request.headers);
+    console.log("request: ", (request.method || '').toUpperCase(), request.url);
     let status = 200;
     let content = '';
     if (request.url.includes('/auth')) {

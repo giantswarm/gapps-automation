@@ -1,3 +1,5 @@
+![Library Test](https://github.com/giantswarm/gapps-automation/actions/workflows/build/badge.svg)
+
 # Apps Script Automation Projects
 
 Apps Script based automation for a company that uses GApps with Personio.
