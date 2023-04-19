@@ -21,8 +21,7 @@ jobs:
           go-version: '=1.18.1'
       - name: Upload Files to Release
         env:
-          #GITHUB_TOKEN: "${{ secrets.TAYLORBOT_GITHUB_ACTION }}"
-          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GITHUB_TOKEN: "${{ secrets.TAYLORBOT_GITHUB_ACTION }}"
         run: |
           go install github.com/tcnksm/ghr@v0.16.0
           ghr -t ${GITHUB_TOKEN} -u ${SENDER} -r ${REPOSITORY} -c ${COMMITISH} -delete ${VERSION} ./lib-output/
