@@ -1,0 +1,11 @@
+name: run-js-test
+description: |
+  Runs a JavaScript test script under the GitHub node runtime.
+inputs:
+  test_name:
+    required: true
+    description: The name (name of file under directory "tests")
+
+runs:
+  using: node16
+  main: index.js

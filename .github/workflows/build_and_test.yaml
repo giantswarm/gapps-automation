@@ -1,0 +1,60 @@
+name: Build and Test
+on:
+  push:
+jobs:
+  build_lib:
+    name: Build Library
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@v3
+      - name: Build Library
+        run: make lib
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@master
+        with:
+          name: lib-output
+          path: lib-output
+  list_tests:
+    needs:
+      - build_lib
+    name: Discover Tests
+    runs-on: ubuntu-20.04
+    outputs:
+        test_matrix: ${{ steps.set_test_matrix.outputs.test_matrix }}
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@v3
+      - name: Debug List
+        run: find ./tests
+      - name: Set Test Matrix
+        id: set_test_matrix
+        run: |
+          echo "test_matrix={\"include\":["$(ls -1 ./tests | grep -E '.*\.m?js' | jq -jcnR '{"test":[inputs | select(length>0)][]}' | sed 's/}{/},{/g')"]}" >> $GITHUB_OUTPUT
+  test_lib:
+    name: Test Library
+    needs:
+      - build_lib
+      - list_tests
+    runs-on: ubuntu-20.04
+    strategy:
+      matrix: ${{fromJSON(needs.list_tests.outputs.test_matrix)}}
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@v3
+      - name: Setup NodeJS
+        uses: actions/setup-node@v3
+        with:
+          node-version: 16
+          cache: npm
+      - name: Install Dependencies
+        run: npm ci
+      - name: Download Artifacts
+        uses: actions/download-artifact@master
+        with:
+          name: lib-output
+          path: lib-output
+      - name: Run Test ${{ matrix.test }}
+        uses: ./.github/actions/run-js-tests
+        with:
+          test_name: ${{ matrix.test }}
