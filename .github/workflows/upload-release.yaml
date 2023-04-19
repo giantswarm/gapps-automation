@@ -1,6 +1,7 @@
 name: Upload Release Artifacts
 on:
   release:
+    types: [created]
 jobs:
   upload_release_files:
     name: Upload Release Files
