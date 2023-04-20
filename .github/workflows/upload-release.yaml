@@ -24,4 +24,4 @@ jobs:
           REPOSITORY: "${{ github.repository }}"
         run: |
           go install github.com/tcnksm/ghr@v0.16.0
-          ghr -t ${GITHUB_TOKEN} -u ${OWNER} -r ${REPOSITORY} -c ${COMMITISH} -delete ${VERSION} ./lib-output/
+          ghr -t ${GITHUB_TOKEN} -u ${OWNER} -r ${REPOSITORY} -c ${COMMITISH} -replace ${VERSION} ./lib-output/
