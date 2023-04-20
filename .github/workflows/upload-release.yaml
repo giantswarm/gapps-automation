@@ -1,7 +1,7 @@
 name: Upload Release Artifacts
 on:
   release:
-    types: [created]
+    types: [published]
 jobs:
   upload_release_files:
     name: Upload Release Files
@@ -11,17 +11,11 @@ jobs:
         uses: actions/checkout@v3
       - name: Build Library
         run: make lib
-      - name: Setup Go
-        uses: actions/setup-go@v3
-        with:
-          go-version: '=1.18.1'
       - name: Upload Files to Release
         env:
           GITHUB_TOKEN: "${{ secrets.TAYLORBOT_GITHUB_ACTION }}"
           VERSION: "${{ github.event.release.name }}"
-          COMMITISH: "${{ github.event.release.target_commitish }}"
-          OWNER: "${{ github.repository_owner }}"
-          REPOSITORY: "${{ github.repository }}"
         run: |
-          go install github.com/tcnksm/ghr@v0.16.0
-          ghr -t ${GITHUB_TOKEN} -u ${OWNER} -r ${REPOSITORY} -c ${COMMITISH} -replace ${VERSION} ./lib-output/
+          RELEASE="$(gh release list | grep "$VERSION")"
+          gh release view --json assets "$VERSION" | jq '.assets[].name' | xargs gh release delete-asset -y "$VERSION"
+          gh release upload --clobber "$VERSION" lib-output/*
