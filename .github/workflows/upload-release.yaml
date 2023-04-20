@@ -1,15 +1,11 @@
 name: Upload Release Artifacts
 on:
   release:
+    types: [created]
 jobs:
   upload_release_files:
     name: Upload Release Files
     runs-on: ubuntu-20.04
-    env:
-      VERSION: ${{ github.event.release.name }}
-      COMMITISH: ${{ github.event.release.target_commitish }}
-      SENDER: ${{ github.event.sender }}
-      REPOSITORY: ${{ github.event.repository }}
     steps:
       - name: Checkout Sources
         uses: actions/checkout@v3
@@ -22,6 +18,10 @@ jobs:
       - name: Upload Files to Release
         env:
           GITHUB_TOKEN: "${{ secrets.TAYLORBOT_GITHUB_ACTION }}"
+          VERSION: "${{ github.event.release.name }}"
+          COMMITISH: "${{ github.event.release.target_commitish }}"
+          SENDER: "${{ github.event.sender }}"
+          REPOSITORY: "${{ github.event.repository }}"
         run: |
           go install github.com/tcnksm/ghr@v0.16.0
           ghr -t ${GITHUB_TOKEN} -u ${SENDER} -r ${REPOSITORY} -c ${COMMITISH} -delete ${VERSION} ./lib-output/
