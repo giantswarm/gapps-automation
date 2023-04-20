@@ -17,5 +17,5 @@ jobs:
           VERSION: "${{ github.event.release.name }}"
         run: |
           RELEASE="$(gh release list | grep "$VERSION")"
-          gh release view --json assets "$VERSION" | jq '.assets[].name' | xargs gh release delete-asset -y "$VERSION"
+          gh release view --json assets "$VERSION" | jq '.assets[].name' | xargs -r gh release delete-asset -y "$VERSION"
           gh release upload --clobber "$VERSION" lib-output/*
