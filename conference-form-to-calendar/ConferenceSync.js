@@ -99,8 +99,8 @@ function syncToCalendar_(spreadsheetId, sheetName, calendarId) {
 
         event.setDescription(description);
 
-        // Reminder 7 days before
-        event.addEmailReminder(10080)
+        // Reminder 7 days before (this only works for the current users reminders array and stacks)
+        // event.addEmailReminder(10080)
 
         const eventId = Utilities.base64Encode(event.getId().split('@')[0] + calendarId).replace('=', '');
         const url = `https://calendar.google.com/calendar/event?eid=${eventId}`;
