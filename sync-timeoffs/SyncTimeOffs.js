@@ -198,6 +198,8 @@ async function syncTimeOffs() {
 
 /** Utility function to unsynchronize certain events and delete the associated absence from Personio.
  *
+ * @note This is a destructive operation, USE WITH UTMOST CARE!
+ *
  * @param title The event title (only events whose title includes this string are de-synced).
  */
 async function unsyncTimeOffs_(title) {
