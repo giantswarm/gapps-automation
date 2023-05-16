@@ -246,11 +246,6 @@ async function unsyncTimeOffs_(title) {
     );
     Util.shuffleArray(employees);
 
-    // if bulk requests are preferred, prefetch all Personio time-offs
-    const allTimeOffs = isPreferBulkRequestsEnabled_()
-        ? await queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, undefined)
-        : undefined;
-
     Logger.log('Unsyncing events with title containing "%s" between %s and %s for %s accounts', title, fetchTimeMin.toISOString(), fetchTimeMax.toISOString(), '' + employees.length);
 
     let firstError = null;
