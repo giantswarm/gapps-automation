@@ -278,12 +278,12 @@ async function unsyncTimeOffs_(title) {
                 const timeOffId = +event.extendedProperties?.private?.timeOffId;
                 if (timeOffId && (event.summary || '').includes(title)) {
                     try {
-                        await deletePersonioTimeOff_({id: timeOffId});
+                        await deletePersonioTimeOff_(personio, {id: timeOffId});
                     } catch (e) {
                         Logger.log('Failed to remove time-off for de-synced event of user %s: %s', email, e);
                     }
 
-                    setEventPrivateProperty_(event, 'timeOffId', null);
+                    setEventPrivateProperty_(event, 'timeOffId', undefined);
 
                     await calendar.update('primary', event.id, event);
                     Logger.log('De-synced event "%s" at %s for user %s', event.summary, event.start.dateTime || event.start.date, email);
