@@ -271,12 +271,13 @@ async function unsyncTimeOffs_(title) {
             let failCount = 0;
             const processedTimeOffIds = {};
             for (const event of allEvents) {
-                if (now >= deadlineTs) {
-                    break;
-                }
-
                 const timeOffId = +event.extendedProperties?.private?.timeOffId;
                 if (timeOffId && (event.summary || '').includes(title)) {
+                    let now = Date.now();
+                    if (now >= deadlineTs) {
+                        break;
+                    }
+
                     try {
                         await deletePersonioTimeOff_(personio, {id: timeOffId});
                     } catch (e) {
