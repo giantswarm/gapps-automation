@@ -881,21 +881,19 @@ async function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
 function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existingTimeOff) {
 
     let timeOffType = timeOffTypeConfig.findByKeywordMatch(event.summary || '');
+    if (!timeOffType && existingTimeOff) {
+        const previousType = timeOffTypeConfig.findById(existingTimeOff.typeId);
+        if (previousType) {
+            timeOffType = previousType;
+        }
+    }
+
+    if (!timeOffType && event.eventType === 'outOfOffice') {
+        timeOffType = timeOffTypeConfig.findByKeywordMatch('out');
+    }
+
     if (!timeOffType) {
-        if (existingTimeOff) {
-            const previousType = timeOffTypeConfig.findById(existingTimeOff.typeId);
-            if (previousType) {
-                timeOffType = previousType;
-            }
-        }
-
-        if (!timeOffType && event.eventType === 'outOfOffice') {
-            timeOffType = timeOffTypeConfig.findByKeywordMatch('out');
-        }
-
-        if (!timeOffType) {
-            return undefined;
-        }
+        return undefined;
     }
 
     const halfDaysAllowed = !!timeOffType.attributes?.half_day_requests_enabled;
