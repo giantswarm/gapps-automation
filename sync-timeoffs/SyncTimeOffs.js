@@ -268,8 +268,6 @@ async function unsyncTimeOffs_(title) {
             const allEvents = await queryCalendarEvents_(calendar, 'primary', fetchTimeMin, fetchTimeMax);
             Util.shuffleArray(allEvents);
 
-            let failCount = 0;
-            const processedTimeOffIds = {};
             for (const event of allEvents) {
                 const timeOffId = +event.extendedProperties?.private?.timeOffId;
                 if (timeOffId && (event.summary || '').includes(title)) {
@@ -883,17 +881,19 @@ async function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
 function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existingTimeOff) {
 
     let timeOffType = timeOffTypeConfig.findByKeywordMatch(event.summary || '');
-    if (!timeOffType) {
-        if (!existingTimeOff) {
-            return undefined;
-        }
-
+    if (!timeOffType && existingTimeOff) {
         const previousType = timeOffTypeConfig.findById(existingTimeOff.typeId);
-        if (!previousType) {
-            return undefined;
+        if (previousType) {
+            timeOffType = previousType;
         }
+    }
 
-        timeOffType = previousType;
+    if (!timeOffType && event.eventType === 'outOfOffice') {
+        timeOffType = timeOffTypeConfig.findByKeywordMatch('out');
+    }
+
+    if (!timeOffType) {
+        return undefined;
     }
 
     const halfDaysAllowed = !!timeOffType.attributes?.half_day_requests_enabled;

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## Added
+
+- Fall back to `out` time-off type if calendar event type is `outOfOffice` https://github.com/giantswarm/giantswarm/issues/26484 
+
 ## [0.1.1] - 2023-04-26
 
 ## [0.1.0] - 2023-04-20
