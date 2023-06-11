@@ -39,7 +39,6 @@ function STICKY_ROWS(dynamic_range, sticky_range) {
     // ensure onChange() trigger
     let haveTrigger = false;
     for (const trigger of ScriptApp.getProjectTriggers()) {
-        console.log('Trigger:', trigger.getEventType().name(), trigger.getHandlerFunction());
         if (trigger.getEventType() === ScriptApp.EventType.ON_CHANGE && trigger.getHandlerFunction() === TRIGGER_FUNCTION_NAME) {
             haveTrigger = true;
         }
@@ -51,17 +50,33 @@ function STICKY_ROWS(dynamic_range, sticky_range) {
 }
 
 
+/** Uninstall triggers. */
+function uninstall() {
+    TriggerUtil.uninstall(TRIGGER_HANDLER_FUNCTION);
+}
+
+
+/** Install spreadsheet onChange trigger. */
+function install() {
+
+    TriggerUtil.uninstall(TRIGGER_HANDLER_FUNCTION);
+
+    Logger.log("Installing onChange trigger for spreadsheet %s", spreadsheet.getId());
+
+    const sheet = SpreadsheetApp.getActive();
+    ScriptApp.newTrigger(TRIGGER_HANDLER_FUNCTION)
+        .forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet().getId())
+        .onChange()
+        .create();
+    Logger.log("Installed onChange trigger for spreadsheet %s", sheet.getSpreadsheet());
+}
+
+
 /** Perform the actual sticky rows logic.
  *
  * Supposed to be called in a SpreadSheet.onChange() trigger.
  */
 function onChangeStickyRows(event) {
-
-    if (event.changeType !== 'EDIT') {
-        // we only react to real user edits
-        console.log(`Won't handle event type: ${event.changeType}`);
-        return;
-    }
 
     const spreadsheet = event.source;
     if (!spreadsheet) {
@@ -88,35 +103,57 @@ function onChangeStickyRows(event) {
         throw new Error("dynamic/sticky data must not overlap");
     }
 
-    const dynamicIds = sheet.getSheetValues(dynamic.getRow(), dynamic.getColumn(), rowCount, 1).flat();
-    const metaIds = sheet.getSheetValues(sticky.getRow(), sticky.getColumn(), rowCount, 1).flat();
+    const dynamicIds = sheet.getSheetValues(dynamic.getRow(), dynamic.getColumn(), rowCount, 1);
+    const stickyRows = readRange_(sticky);
 
+    // index sticky row indices by meta id
+    let metaIdToStickyRowIndex = null;
+    let modified = false;
     for (let i = 0; i < rowCount; ++i) {
-        const id = dynamicIds[i];
-        const metaId = metaIds[i];
+        const id = dynamicIds[i][0];
+        const metaId = stickyRows[i][0];
         if (id != null && id !== '' && id !== metaId) {
-
-            // TODO replace this with map index + lookup?
-            let j;
-            for (j = 0; j < rowCount && metaIds[j] !== id; ++j) {
+            if (!metaIdToStickyRowIndex) {
+                // lazily index sticky rows metaId column
+                metaIdToStickyRowIndex = buildIndex_(stickyRows);
             }
-
-            if (j < rowCount) {
-                const a = sheet.getRange(sticky.getRow() + i, sticky.getColumn(), 1, sticky.getNumColumns());
-                const b = sheet.getRange(sticky.getRow() + j, sticky.getColumn(), 1, sticky.getNumColumns());
-                const dataA = readRange_(a);
-                a.setValues(readRange_(b));
-                b.setValues(dataA);
-                metaIds[i] = metaIds[j];
-                metaIds[j] = metaId;
-            } else if (metaId == null || metaId === '') {
-                console.log(`[${i}]: init`);
-                sheet.getRange(sticky.getRow() + i, sticky.getColumn(), 1, 1).setValue(id);
-                metaIds[i] = id;
+            const j = metaIdToStickyRowIndex.get(id);
+            if (j !== undefined) {
+                const row = stickyRows[j];
+                stickyRows[j] = stickyRows[i];
+                stickyRows[i] = row;
+                if (metaId != null && metaId !== '') {
+                    metaIdToStickyRowIndex.set(metaId, j);
+                }
+                metaIdToStickyRowIndex.delete(id);
+                modified = true;
+            } else {
+                stickyRows[i][0] = id;
+                modified = true;
             }
         }
     }
+
+    if (modified) {
+        sticky.setValues(stickyRows);
+    }
 }
+
+
+/** Build a hash index (ES6 Map key to position) from the first column of the provided rows array.
+ */
+function buildIndex_(rows) {
+    const rowCount = rows.length;
+    const index = new Map();
+    for (let i = 0; i < rowCount; ++i) {
+        index.set(rows[i][0], i);
+    }
+    index.delete(null);
+    index.delete('');
+
+    return index;
+}
+
 
 /** Read one SpreadsheetApp Range object's cell values and formulas into an array usable with Range.setValues().
  *
