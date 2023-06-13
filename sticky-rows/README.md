@@ -56,7 +56,7 @@ The trigger can also be installed manually by following these steps:
 
 The [Developer Metadata](https://developers.google.com/sheets/api/guides/metadata) feature seems convenient to avoid the need for the second hidden *ID* column inside the *sticky data* range.
 
-Unfortunately, as listed in the linked documentation, the character size quotas for developer metadata in spreadsheet sheets ist relatively small. Thus, storing the *IDs* in metadata would limit the size of datasets supported by our function to less than ~1000 (depending on the type of ID values used).
+Unfortunately, as listed in the linked documentation, the character size quotas for developer metadata in spreadsheet sheets is relatively small. Thus, storing the *IDs* in metadata would limit the size of datasets supported by our function to less than ~1000 (depending on the type of ID values used).
 
 2000 rows is far below the [limits of a Google Spreadheet sheet](https://support.google.com/drive/answer/37603):
 - 10 million cells
