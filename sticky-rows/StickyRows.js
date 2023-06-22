@@ -148,7 +148,7 @@ function mergeConfig_(key, configProperties) {
 }
 
 
-/** Logic to re-align rows in the sticky area (defined in config) within sheet. */
+/** Logic to realign rows in the sticky area (defined in config) within sheet. */
 function realignStickyRows_(sheet, config) {
     const dynamic = sheet.getRange(config.dynamic_range);
     const sticky = sheet.getRange(config.sticky_range);
