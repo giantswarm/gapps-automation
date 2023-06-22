@@ -141,6 +141,8 @@ The Google Sheets/Forms UI makes it hard to attach a script project when using m
 To attach a project, get the document ID and use the following clasp command line in the project subdirectory:  
 `clasp create --parentId {SHEET_ID} --rootDir .`
 
+The logged in clasp user account must have `Editor` access to the document.
+
 #### Building just the Lib
 
 For testing or use in other projects (possibly targetting another runtime) building just the library part of this project may be required.
