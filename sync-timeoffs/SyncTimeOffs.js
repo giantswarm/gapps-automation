@@ -715,6 +715,9 @@ async function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event,
         const createdTimeOff = await createPersonioTimeOff_(personio, updatedTimeOff);
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
+        if (!event.summary.includes('⇵')) {
+            event.summary += ' ⇵';
+        }
         await calendar.update('primary', event.id, event);
         Logger.log('Updated TimeOff "%s" at %s for user %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail);
         return true;
@@ -759,6 +762,9 @@ async function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event,
         const createdTimeOff = await createPersonioTimeOff_(personio, newTimeOff);
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
+        if (!event.summary.includes('⇵')) {
+            event.summary += ' ⇵';
+        }
         await calendar.update('primary', event.id, event);
         Logger.log('Inserted TimeOff "%s" at %s for user %s: %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail, createdTimeOff.comment);
         return true;
@@ -911,7 +917,7 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
         endAt: endAt,
         typeId: timeOffType.attributes.id,
         typeName: timeOffType.attributes.name,
-        comment: event.summary.replace(' [synced]', ''),
+        comment: event.summary.replace(' ⇵', ''),
         updatedAt: new Date(event.updated),
         employeeId: employee.attributes.id.value,
         email: employee.attributes.email.value,
@@ -980,7 +986,7 @@ function createEventFromTimeOff_(timeOffTypeConfig, timeOff) {
                 timeOffId: timeOff.id
             }
         },
-        summary: `${timeOff.comment} [synced]`
+        summary: `${timeOff.comment} ⇵`
     };
 
     // if we can't guess the corresponding time-off-type, prefix the event summary with its name
