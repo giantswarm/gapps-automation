@@ -880,6 +880,11 @@ async function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
 /** Construct a matching TimeOff structure for a Google Calendar event. */
 function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existingTimeOff) {
 
+    // skip events created by other users
+    if (event?.creator?.email && event?.creator?.email !== employee.attributes.email.value) {
+        return undefined;
+    }
+
     let timeOffType = timeOffTypeConfig.findByKeywordMatch(event.summary || '');
     if (!timeOffType && existingTimeOff) {
         const previousType = timeOffTypeConfig.findById(existingTimeOff.typeId);
