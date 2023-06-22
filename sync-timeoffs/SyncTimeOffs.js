@@ -760,7 +760,7 @@ async function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event,
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
         await calendar.update('primary', event.id, event);
-        Logger.log('Inserted TimeOff "%s" at %s for user %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail);
+        Logger.log('Inserted TimeOff "%s" at %s for user %s: %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail, createdTimeOff.comment);
         return true;
     } catch (e) {
         Logger.log('Failed to insert new TimeOff "%s" at %s for user %s: %s', event.summary, event.start.dateTime || event.start.date, primaryEmail, e);
