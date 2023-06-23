@@ -716,7 +716,7 @@ async function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event,
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
         if (!/ ?⇵$/.test(event.summary)) {
-            event.summary += ' ⇵';
+            event.summary = event.summary.replace(' [synced]', '') + ' ⇵';
         }
         await calendar.update('primary', event.id, event);
         Logger.log('Updated TimeOff "%s" at %s for user %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail);
@@ -763,7 +763,7 @@ async function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event,
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
         if (!/ ?⇵$/.test(event.summary)) {
-            event.summary += ' ⇵';
+            event.summary = event.summary.replace(' [synced]', '') + ' ⇵';
         }
         await calendar.update('primary', event.id, event);
         Logger.log('Inserted TimeOff "%s" at %s for user %s: %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail, createdTimeOff.comment);
