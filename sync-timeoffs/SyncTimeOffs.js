@@ -716,7 +716,7 @@ async function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event,
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
         if (!/ ?⇵$/.test(event.summary)) {
-            event.summary += ' ⇵';
+            event.summary = event.summary.replace(' [synced]', '') + ' ⇵';
         }
         await calendar.update('primary', event.id, event);
         Logger.log('Updated TimeOff "%s" at %s for user %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail);
@@ -763,7 +763,7 @@ async function syncActionInsertTimeOff_(personio, calendar, primaryEmail, event,
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
         if (!/ ?⇵$/.test(event.summary)) {
-            event.summary += ' ⇵';
+            event.summary = event.summary.replace(' [synced]', '') + ' ⇵';
         }
         await calendar.update('primary', event.id, event);
         Logger.log('Inserted TimeOff "%s" at %s for user %s: %s', createdTimeOff.typeName, String(createdTimeOff.startAt), primaryEmail, createdTimeOff.comment);
@@ -922,7 +922,7 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
         endAt: endAt,
         typeId: timeOffType.attributes.id,
         typeName: timeOffType.attributes.name,
-        comment: event.summary.replace(/ ?⇵$/, ''),
+        comment: event.summary.replace(' [synced]', '').replace(/ ?⇵$/, ''),
         updatedAt: new Date(event.updated),
         employeeId: employee.attributes.id.value,
         email: employee.attributes.email.value,
