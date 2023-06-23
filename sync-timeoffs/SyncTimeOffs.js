@@ -917,7 +917,7 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
         endAt: endAt,
         typeId: timeOffType.attributes.id,
         typeName: timeOffType.attributes.name,
-        comment: event.summary.replace(/ ?⇵$/, ''),
+        comment: event.summary.replace(' [synced]', '').replace(/ ?⇵$/, ''),
         updatedAt: new Date(event.updated),
         employeeId: employee.attributes.id.value,
         email: employee.attributes.email.value,
