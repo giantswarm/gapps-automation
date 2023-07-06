@@ -64,7 +64,7 @@ async function addCalendarsToNewJoiners() {
 
     Logger.log('Configured to handle users on domains: %s', allowedDomains);
 
-    const newJoinerEmails = await getPersonioEmployeeEmailsByStatus_('onboarding').filter(email => isEmailDomainAllowed(email));
+    const newJoinerEmails = (await getPersonioEmployeeEmailsByStatus_('onboarding')).filter(email => isEmailDomainAllowed(email));
 
     let firstError = null;
 
@@ -84,7 +84,11 @@ async function addCalendarsToNewJoiners() {
 }
 
 
-/** Unsubscribe all users from the specified calendars. */
+/** Unsubscribe all users from the specified calendars.
+ *
+ * NOTE: The calendar IDs must be in "email like" format, for example: giantswarm.io_u9j5eaid81sl9b8cd73novr7do@group.calendar.google.com
+ *
+ */
 async function unsubscribeCalendars(calendarIds) {
 
     if (!calendarIds || calendarIds.length === 0) {
@@ -100,7 +104,7 @@ async function unsubscribeCalendars(calendarIds) {
 
     Logger.log('Configured to handle users on domains: %s', allowedDomains);
 
-    const activeEmployeeEmails = await getPersonioEmployeeEmailsByStatus_('active').filter(email => isEmailDomainAllowed(email));
+    const activeEmployeeEmails = (await getPersonioEmployeeEmailsByStatus_('active')).filter(email => isEmailDomainAllowed(email));
 
     let firstError = null;
 
