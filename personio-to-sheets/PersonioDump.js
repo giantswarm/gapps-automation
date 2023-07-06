@@ -421,8 +421,8 @@ function writeRelationsToSheet_(spreadsheetId, relations) {
         if (relType === 'version' || !Util.isObject(relation))
             continue;
 
-        const spreadsheet = SheetUtil.getSpreadsheet(spreadsheetId);
-        const sheetProperties = SheetUtil.ensureSheet(spreadsheet, relType).properties;
+        const spreadsheet = getSpreadsheet_(spreadsheetId);
+        const sheetProperties = ensureSheet_(spreadsheet, relType).properties;
         const sheetId = sheetProperties.sheetId;
         const timeZoneOffsetMillies = SheetUtil.getTimeZoneOffset(spreadsheet.properties.timeZone);
         const rowCount = sheetProperties.gridProperties.rowCount;
@@ -484,4 +484,36 @@ function writeRelationsToSheet_(spreadsheetId, relations) {
     }
 
     Sheets.Spreadsheets.batchUpdate(batch, spreadsheetId);
+}
+
+
+/** Get a spreadsheet by ID. */
+function getSpreadsheet_(id) {
+    const spreadsheet = Sheets.Spreadsheets.get(id);
+    if (!spreadsheet)
+        throw new Error(`Specified spreadsheet ${id} does not exist or is not accessible`);
+
+    return spreadsheet;
+}
+
+
+/** Creates a "custom" sheet with the specified name (if it doesn't exist) and returns the sheet properties. */
+function ensureSheet_(spreadsheet, sheetTitle) {
+
+    const existingSheet = spreadsheet.sheets.find(sheet => sheet.properties.title === sheetTitle);
+    if (existingSheet) {
+        return existingSheet;
+    }
+
+    const batch = {
+        requests: [{
+            addSheet: {
+                properties: {
+                    title: sheetTitle
+                }
+            }
+        }]
+    };
+    const response = Sheets.Spreadsheets.batchUpdate(batch, spreadsheet.spreadsheetId);
+    return response.replies[0].addSheet;
 }

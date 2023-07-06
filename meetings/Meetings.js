@@ -1,4 +1,7 @@
-/** Script to generate various meeting reports. */
+/** Script to generate various meeting reports.
+ *
+ * NOTE: You may install periodic triggers to keep these reports up-to-date in the output sheets.
+ */
 
 /** The prefix for properties specific to this script in the project. */
 const PROPERTY_PREFIX = 'Meetings.';
@@ -139,31 +142,10 @@ async function listMeetingStatistic() {
     }
     rows.unshift(header);
 
-    const padCount = Math.min(1000, 1000 - rows.length);
-    const emptyRow = [];
-    for (let i = 0; i < header.length; ++i) {
-        emptyRow.push("");
-    }
-
-    for (let i = 0; i < padCount; ++i) {
-        rows.push(emptyRow);
-    }
-
     const spreadsheet = SpreadsheetApp.openById(getReportSheetId_());
-    const sheet = ensureSheet_(spreadsheet, "Meeting_Hours");
-    sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
-}
-
-
-/** Get or create a sheet inside the spreadsheet with the specified name. */
-function ensureSheet_(spreadsheet, name) {
-    let sheet = spreadsheet.getSheetByName(name)
-    if (!sheet) {
-        sheet = spreadsheet.insertSheet();
-        sheet.setName(name);
-    }
-
-    return sheet;
+    const sheet = SheetUtil.ensureSheet(spreadsheet, "Meeting_Hours");
+    sheet.getRange(1, 1, sheet.getMaxRows(), header.length).clearContent();
+    sheet.getRange(1, 1, rows.length, header.length).setValues(rows);
 }
 
 
@@ -171,7 +153,7 @@ function ensureSheet_(spreadsheet, name) {
 async function listMeetings() {
 
     const recurring1on1Ids = {};
-    const recurring1on1s = [];
+    const rows = [];
     try {
         await visitEvents_((event, employee, employees, calendar, personio) => {
             const email = employee.attributes.email.value;
@@ -196,7 +178,7 @@ async function listMeetings() {
 
                 if (!recurring1on1Ids[event.iCalUID]) {
                     recurring1on1Ids[event.iCalUID] = event;
-                    recurring1on1s.push([email, otherAttendeeEmail, event.summary, event.start.dateTime, event.recurrence.join('\n')]);
+                    rows.push([email, otherAttendeeEmail, event.summary, event.start.dateTime, event.recurrence.join('\n')]);
                 }
             }
 
@@ -206,16 +188,15 @@ async function listMeetings() {
         Logger.log("First error while visiting calendar events: " + e);
     }
 
-    Logger.log(`Found ${recurring1on1s.length} recurring 1on1s`);
+    Logger.log(`Found ${rows.length} recurring 1on1s`);
 
-    const padCount = Math.min(1000, 1000 - recurring1on1s.length);
-    for (let i = 0; i < padCount; ++i) {
-        recurring1on1s.push(["", "", "", "", ""]);
-    }
+    const header = ["Organizer/Owner", "Other Attendee", "Summary", "First Start DateTime", "Recurring Rules"];
+    rows.unshift(header);
 
     const spreadsheet = SpreadsheetApp.openById(getReportSheetId_());
-    const sheet = ensureSheet_(spreadsheet, "1on1recurring");
-    sheet.getRange(2, 1, recurring1on1s.length, recurring1on1s[0].length).setValues(recurring1on1s);
+    const sheet = SheetUtil.ensureSheet(spreadsheet, "1on1recurring");
+    sheet.getRange(1, 1, sheet.getMaxRows(), header.length).clearContent();
+    sheet.getRange(1, 1, rows.length, header.length).setValues(rows);
 }
 
 
