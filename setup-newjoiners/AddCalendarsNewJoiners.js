@@ -64,7 +64,7 @@ async function addCalendarsToNewJoiners() {
 
     Logger.log('Configured to handle users on domains: %s', allowedDomains);
 
-    const newJoinerEmails = await getPersonioEmployeeEmailsByStatus_('onboarding').filter(email => isEmailDomainAllowed(email));
+    const newJoinerEmails = (await getPersonioEmployeeEmailsByStatus_('onboarding')).filter(email => isEmailDomainAllowed(email));
 
     let firstError = null;
 
@@ -100,7 +100,7 @@ async function unsubscribeCalendars(calendarIds) {
 
     Logger.log('Configured to handle users on domains: %s', allowedDomains);
 
-    const activeEmployeeEmails = await getPersonioEmployeeEmailsByStatus_('active').filter(email => isEmailDomainAllowed(email));
+    const activeEmployeeEmails = (await getPersonioEmployeeEmailsByStatus_('active')).filter(email => isEmailDomainAllowed(email));
 
     let firstError = null;
 
