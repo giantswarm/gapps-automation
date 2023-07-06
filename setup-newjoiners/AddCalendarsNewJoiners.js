@@ -84,7 +84,11 @@ async function addCalendarsToNewJoiners() {
 }
 
 
-/** Unsubscribe all users from the specified calendars. */
+/** Unsubscribe all users from the specified calendars.
+ *
+ * NOTE: The calendar IDs must be in "email like" format, for example: giantswarm.io_u9j5eaid81sl9b8cd73novr7do@group.calendar.google.com
+ *
+ */
 async function unsubscribeCalendars(calendarIds) {
 
     if (!calendarIds || calendarIds.length === 0) {
