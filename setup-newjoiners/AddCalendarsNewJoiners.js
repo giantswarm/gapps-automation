@@ -84,6 +84,42 @@ async function addCalendarsToNewJoiners() {
 }
 
 
+/** Unsubscribe all users from the specified calendars. */
+async function unsubscribeCalendars(calendarIds) {
+
+    if (!calendarIds || calendarIds.length === 0) {
+        Logger.log("No calendars configured, exiting");
+        return;
+    }
+    Logger.log('Configured to unsubscribe every active user from calendars: %s', calendarIds);
+
+    const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
+        .split(',')
+        .map(d => d.trim());
+    const isEmailDomainAllowed = email => allowedDomains.includes(email.substring(email.lastIndexOf('@') + 1));
+
+    Logger.log('Configured to handle users on domains: %s', allowedDomains);
+
+    const activeEmployeeEmails = await getPersonioEmployeeEmailsByStatus_('active').filter(email => isEmailDomainAllowed(email));
+
+    let firstError = null;
+
+    for (const primaryEmail of activeEmployeeEmails) {
+        // we keep operating if handling calendars of a single user fails
+        try {
+            await unsubscribeUserCalendars_(getServiceAccountCredentials_(), primaryEmail, calendarIds);
+        } catch (e) {
+            Logger.log('Failed to unsubscribe calendars from user %s: %s', primaryEmail, e.message);
+            firstError = firstError || e;
+        }
+    }
+
+    if (firstError) {
+        throw firstError;
+    }
+}
+
+
 /** Subscribe a single account to all the specified calendars. */
 async function subscribeUserCalendars_(serviceAccountCredentials, primaryEmail, calendarIds) {
 
@@ -99,6 +135,26 @@ async function subscribeUserCalendars_(serviceAccountCredentials, primaryEmail, 
                 Logger.log('Added calendar %s to user %s', calendarId, primaryEmail);
             } catch (e) {
                 Logger.log('Failed to add calendar %s to user %s: %s', calendarId, primaryEmail, e.message);
+            }
+        }
+    }
+}
+
+
+/** Subscribe a single account to all the specified calendars. */
+async function unsubscribeUserCalendars_(serviceAccountCredentials, primaryEmail, calendarIds) {
+
+    const calendarList = await CalendarListClient.withImpersonatingService(serviceAccountCredentials, primaryEmail);
+
+    const existingCalendars = await calendarList.list();
+    for (const calendarId of calendarIds) {
+        if (existingCalendars.some(calendar => calendar.id === calendarId)) {
+            // continue operating if removing a single calendar fails
+            try {
+                await calendarList.delete(calendarId);
+                Logger.log('Removed calendar %s from user %s', calendarId, primaryEmail);
+            } catch (e) {
+                Logger.log('Failed to remove calendar %s from user %s: %s', calendarId, primaryEmail, e.message);
             }
         }
     }
