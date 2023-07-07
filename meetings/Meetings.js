@@ -115,7 +115,7 @@ async function listMeetingStatistic() {
 
             return true;
         }, {
-            singleEvents: true,
+            singleEvents: true, // return recurring events rolled out into individual event instances
             timeMin: new Date(new Date().setDate(now.getDate() - (weeks * 7))).toISOString(),
             timeMax: now.toISOString()
         });
@@ -251,8 +251,8 @@ async function visitEvents_(visitor, listParams) {
         try {
             const calendar = await CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), email);
             const allEvents = await calendar.list('primary', {
-                singleEvents: false,
-                showDeleted: false,
+                singleEvents: false, // return original recurring events, not the individual, rolled out instances
+                showDeleted: false, // no cancelled/deleted events
                 timeMin: fetchTimeMin.toISOString(),
                 timeMax: fetchTimeMax.toISOString(),
                 ...listParams
