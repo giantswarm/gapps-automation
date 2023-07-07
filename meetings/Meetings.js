@@ -74,6 +74,7 @@ async function listMeetingStatistic() {
     const employeeStats = {};
     try {
         let haveEmployees = false;
+        // visitEvents_() will call our visitor function for each employee and calendar event combination
         await visitEvents_((event, employee, employees, calendar, personio) => {
 
             const getGiantSwarmAttendees = attendees =>
@@ -155,6 +156,7 @@ async function listMeetings() {
     const recurring1on1Ids = {};
     const rows = [];
     try {
+        // visitEvents_() will call our visitor function for each employee and calendar event combination
         await visitEvents_((event, employee, employees, calendar, personio) => {
             const email = employee.attributes.email.value;
 
