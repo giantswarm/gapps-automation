@@ -42,6 +42,10 @@ const REPORT_SHEET_KEY = PROPERTY_PREFIX + 'reportSheet';
 /** Build meetings statistic per employee and summarized. */
 async function listMeetingStatistic() {
 
+    const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
+        .split(',')
+        .map(d => d.trim());
+
     const weeks = 4;   // 4 weeks back from now
 
     const now = new Date();
@@ -67,24 +71,17 @@ async function listMeetingStatistic() {
         return null;
     };
 
-    const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
-        .split(',')
-        .map(d => d.trim());
-
     const employeeStats = {};
     try {
         let haveEmployees = false;
         // visitEvents_() will call our visitor function for each employee and calendar event combination
         await visitEvents_((event, employee, employees, calendar, personio) => {
 
-            const getGiantSwarmAttendees = attendees =>
-                attendees.filter(attendee => allowedDomains.filter(domain => (attendee.email || '').includes(domain)).length);
-
             if (!haveEmployees) {
                 for (const e of employees) {
                     const email = e.attributes.email.value;
 
-                    const stats = {email: email, count: 0, weeks: []};
+                    const stats = {email: email, count: 0, duration1on1: 0, durationSig: 0, weeks: []};
                     for (let i = 0; i < weeks; ++i) {
                         stats.weeks.push(0.0);
                     }
@@ -94,22 +91,34 @@ async function listMeetingStatistic() {
                 haveEmployees = true;
             }
 
-            const stats = employeeStats[employee.attributes.email.value];
+            const email = employee.attributes.email.value;
+            const stats = employeeStats[email];
 
-            if (Array.isArray(event.attendees) && event.attendees.length > 1
-                && !event.extendedProperties?.private?.timeOffId
+            if (!event.extendedProperties?.private?.timeOffId
                 && event.eventType !== 'outOfOffice'
-                && getGiantSwarmAttendees(event.attendees).length === event.attendees.length) {
+                && getGiantSwarmAttendees_(event, allowedDomains).length === (event?.attendees?.length || 0)) {
                 const start = new Date(event.start.dateTime);
                 const end = new Date(event.end.dateTime);
                 const durationHours = (end - start) / (60.0 * 60 * 1000);
                 if (!isNaN(durationHours)) {
                     const week = getWeekIndex(start, end);
                     if (week != null) {
-                        stats.count += 1;
-                        stats.weeks[week] += durationHours;
+
+                        let validMeeting = (event?.attendees?.length) > 1;
+                        if (isSigOrChapther_(event)) {
+                            validMeeting = true;
+                            stats.durationSig += durationHours;
+                        } else if (isOneOnOne_(event, employees, email)) {
+                            validMeeting = true;
+                            stats.duration1on1 += durationHours;
+                        }
+
+                        if (validMeeting) {
+                            stats.count += 1;
+                            stats.weeks[week] += durationHours;
+                        }
                     } else {
-                        console.log(`Event for ${employee.attributes.email.value} doesn't fit any week: ${JSON.stringify(event)}`);
+                        console.log(`Event for ${email} doesn't fit any week: ${JSON.stringify(event)}`);
                     }
                 }
             }
@@ -128,7 +137,7 @@ async function listMeetingStatistic() {
     statistics.sort((a, b) => Util.median(b.weeks) - Util.median(a.weeks));
 
     const rows = statistics.map(stats => {
-        const row = [stats.email, stats.count];
+        const row = [stats.email, stats.count, +stats.duration1on1.toFixed(2), +stats.durationSig.toFixed(2)];
 
         for (const weekHours of stats.weeks) {
             row.push(+weekHours.toFixed(2));
@@ -137,7 +146,7 @@ async function listMeetingStatistic() {
         return row;
     });
 
-    const header = ["Email", "Meeting Count"];
+    const header = ["Email", "Meeting Count", "Total 1on1 (h)", "SIG/Chapter (h)"];
     for (let i = 0; i < weekBounds.length; ++i) {
         header.push('' + weekBounds[i].start.toDateString() + ' +7d (h)');
     }
@@ -153,6 +162,10 @@ async function listMeetingStatistic() {
 /** Extract recurring 1on1s from all personal calendars. */
 async function listMeetings() {
 
+    const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
+        .split(',')
+        .map(d => d.trim());
+
     const recurring1on1Ids = {};
     const rows = [];
     try {
@@ -160,22 +173,8 @@ async function listMeetings() {
         await visitEvents_((event, employee, employees, calendar, personio) => {
             const email = employee.attributes.email.value;
 
-            const hasNonEmployeeAttendees = attendees => {
-                for (const attendee of attendees) {
-                    if (!employees.find(e => e.attributes.email.value === attendee.email)) {
-                        return true;
-                    }
-                }
-
-                return false;
-            };
-
             // recurring event, organized by this employee with 2 attendees means it's a 1on1
-            if (Array.isArray(event.attendees) && event.attendees.length === 2
-                && Array.isArray(event.recurrence) && event.recurrence.length
-                && event.attendees.find(attendee => attendee.email === email)
-                && !hasNonEmployeeAttendees(event.attendees)) {
-
+            if (isOneOnOne_(event, employees, email)) {
                 const otherAttendeeEmail = event.attendees.find(attendee => attendee.email !== email)?.email;
 
                 if (!recurring1on1Ids[event.iCalUID]) {
@@ -199,6 +198,31 @@ async function listMeetings() {
     const sheet = SheetUtil.ensureSheet(spreadsheet, "1on1recurring");
     sheet.getRange(1, 1, sheet.getMaxRows(), header.length).clearContent();
     sheet.getRange(1, 1, rows.length, header.length).setValues(rows);
+}
+
+
+function getGiantSwarmAttendees_(event, allowedDomains) {
+    return (event.attendees || []).filter(attendee => allowedDomains.filter(domain => (attendee.email || '').includes(domain)).length);
+}
+
+
+function isTeamEvent_(event) {
+    return (event.attendees || []).find(attendee => attendee.email.startsWith('team-'));
+}
+
+
+function isSigOrChapther_(event) {
+    return /(^|\s)(SIG|chapter)(\s|$)/i.test(event.summary) || (event.attendees || []).find(attendee => attendee.email.startsWith('sig-'));
+}
+
+
+function isOneOnOne_(event, employees, ownerEmail) {
+    return Array.isArray(event.attendees) && event.attendees.length === 2
+        && ((Array.isArray(event.recurrence) && event.recurrence.length) || event.recurringEventId)
+        && !isSigOrChapther_(event)
+        && !isTeamEvent_(event)
+        && event.attendees.find(attendee => attendee.email === ownerEmail)
+        && event.attendees.filter(attendee => employees.find(employee => employee.attributes.email.value === attendee.email)).length === event.attendees.length;
 }
 
 
