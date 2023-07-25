@@ -175,7 +175,8 @@ async function syncTimeOffs() {
         // we keep operating if handling calendar of a single user fails
         try {
             const calendar = await CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), email);
-            if (!syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies, allTimeOffs)) {
+            const isCompleted = await syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeConfig, fetchTimeMin, fetchTimeMax, maxFailCount, maxRuntimeMillies, allTimeOffs);
+            if (!isCompleted) {
                 break;
             }
         } catch (e) {
