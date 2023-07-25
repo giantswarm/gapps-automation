@@ -8,7 +8,7 @@ function createTestFunctionWrapper(fileName, functionName) {
 }
 
 // test generatePersonioTimeOffPayload_
-const generatePersonioTimeOffPayload_ = createTestFunctionWrapper('../sync-timeoffs/SyncTimeOffs.js', 'generatePersonioTimeOffPayload_');
+const generatePersonioTimeOffPayload_ = createTestFunctionWrapper('sync-timeoffs/SyncTimeOffs.js', 'generatePersonioTimeOffPayload_');
 for (const [timeOffInput, expectedPayload] of [
     [{startAt: PeopleTime.fromISO8601('2016-05-16T00:00:00+05:00'), endAt: PeopleTime.fromISO8601('2016-05-16T24:00:00+05:00')}, {half_day_start: "0", half_day_end: "0"}],
     [{startAt: PeopleTime.fromISO8601('2016-05-16T00:00:00+05:00'), endAt: PeopleTime.fromISO8601('2016-05-17T24:00:00+05:00')}, {half_day_start: "0", half_day_end: "0"}],

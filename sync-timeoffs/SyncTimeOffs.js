@@ -913,8 +913,8 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
     const localTzOffsetEnd = event.end.date ? Util.getNamedTimeZoneOffset(event.end.timeZone, new Date(event.end.date)) : undefined;
     const startAt = PeopleTime.fromISO8601(event.start.dateTime || event.start.date, undefined, localTzOffsetStart)
         .normalizeHalfDay(false, halfDaysAllowed);
-    const endAt = PeopleTime.fromISO8601(event.end.dateTime || event.end.date, undefined, localTzOffsetEnd)
-        .normalizeHalfDay(true, halfDaysAllowed);
+    const endAtRaw = PeopleTime.fromISO8601(event.end.dateTime || event.end.date, undefined, localTzOffsetEnd);
+    const endAt = endAtRaw.normalizeHalfDay(true, halfDaysAllowed && (!startAt.isHalfDay() || !startAt.isAtSameDay(endAtRaw)));
 
     const skipApproval = timeOffTypeConfig.isSkippingApprovalAllowed(timeOffType.attributes.id);
 
