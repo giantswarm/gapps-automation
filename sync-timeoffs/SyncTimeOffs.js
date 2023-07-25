@@ -940,12 +940,11 @@ async function deletePersonioTimeOff_(personio, timeOff) {
 }
 
 
-/** Insert a new Personio TimeOff. */
-async function createPersonioTimeOff_(personio, timeOff) {
-
+/** Generate payload for a personio time-off request. */
+function generatePersonioTimeOffPayload_(timeOff) {
     const isMultiDay = !timeOff.startAt.isAtSameDay(timeOff.endAt);
-    const halfDayStart = isMultiDay ? timeOff.startAt.isHalfDay() : timeOff.endAt.isHalfDay();
-    const halfDayEnd = isMultiDay ? timeOff.endAt.isHalfDay() : timeOff.startAt.isHalfDay();
+    const halfDayStart = isMultiDay ? timeOff.startAt.isHalfDay() : timeOff.endAt.isHalfDay() && timeOff.startAt.isFirstHalfDay();
+    const halfDayEnd = isMultiDay ? timeOff.endAt.isHalfDay() : timeOff.startAt.isHalfDay() && !timeOff.endAt.isFirstHalfDay();
 
     const payload = {
         employee_id: timeOff.employeeId.toFixed(0),
@@ -962,6 +961,14 @@ async function createPersonioTimeOff_(personio, timeOff) {
         payload.skip_approval = "1";
     }
 
+    return payload;
+}
+
+
+/** Insert a new Personio TimeOff. */
+async function createPersonioTimeOff_(personio, timeOff) {
+
+    const payload = generatePersonioTimeOffPayload_(timeOff);
     const result = await personio.fetchJson('/company/time-offs', {
         method: 'post',
         payload: payload
