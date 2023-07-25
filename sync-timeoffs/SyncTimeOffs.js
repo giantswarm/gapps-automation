@@ -943,8 +943,8 @@ async function deletePersonioTimeOff_(personio, timeOff) {
 /** Generate payload for a personio time-off request. */
 function generatePersonioTimeOffPayload_(timeOff) {
     const isMultiDay = !timeOff.startAt.isAtSameDay(timeOff.endAt);
-    const halfDayStart = isMultiDay ? timeOff.startAt.isHalfDay() : timeOff.endAt.isHalfDay() && timeOff.startAt.isFirstHalfDay();
-    const halfDayEnd = isMultiDay ? timeOff.endAt.isHalfDay() : timeOff.startAt.isHalfDay() && !timeOff.endAt.isFirstHalfDay();
+    const halfDayStart = (isMultiDay && timeOff.startAt.isHalfDay() && !timeOff.startAt.isFirstHalfDay()) || (timeOff.endAt.isHalfDay() && timeOff.endAt.isFirstHalfDay());
+    const halfDayEnd = (isMultiDay && timeOff.endAt.isHalfDay() && timeOff.endAt.isFirstHalfDay()) || (timeOff.startAt.isHalfDay() && !timeOff.startAt.isFirstHalfDay());
 
     const payload = {
         employee_id: timeOff.employeeId.toFixed(0),
