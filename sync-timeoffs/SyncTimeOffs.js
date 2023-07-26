@@ -913,8 +913,8 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
     const localTzOffsetEnd = event.end.date ? Util.getNamedTimeZoneOffset(event.end.timeZone, new Date(event.end.date)) : undefined;
     const startAt = PeopleTime.fromISO8601(event.start.dateTime || event.start.date, undefined, localTzOffsetStart)
         .normalizeHalfDay(false, halfDaysAllowed);
-    const endAt = PeopleTime.fromISO8601(event.end.dateTime || event.end.date, undefined, localTzOffsetEnd)
-        .normalizeHalfDay(true, halfDaysAllowed);
+    const endAtRaw = PeopleTime.fromISO8601(event.end.dateTime || event.end.date, undefined, localTzOffsetEnd);
+    const endAt = endAtRaw.normalizeHalfDay(true, halfDaysAllowed && (!startAt.isHalfDay() || !startAt.isAtSameDay(endAtRaw)));
 
     const skipApproval = timeOffTypeConfig.isSkippingApprovalAllowed(timeOffType.attributes.id);
 
@@ -940,12 +940,11 @@ async function deletePersonioTimeOff_(personio, timeOff) {
 }
 
 
-/** Insert a new Personio TimeOff. */
-async function createPersonioTimeOff_(personio, timeOff) {
-
+/** Generate payload for a personio time-off request. */
+function generatePersonioTimeOffPayload_(timeOff) {
     const isMultiDay = !timeOff.startAt.isAtSameDay(timeOff.endAt);
-    const halfDayStart = isMultiDay ? timeOff.startAt.isHalfDay() : timeOff.endAt.isHalfDay();
-    const halfDayEnd = isMultiDay ? timeOff.endAt.isHalfDay() : timeOff.startAt.isHalfDay();
+    const halfDayStart = (isMultiDay && timeOff.startAt.isHalfDay() && !timeOff.startAt.isFirstHalfDay()) || (timeOff.endAt.isHalfDay() && timeOff.endAt.isFirstHalfDay());
+    const halfDayEnd = (isMultiDay && timeOff.endAt.isHalfDay() && timeOff.endAt.isFirstHalfDay()) || (timeOff.startAt.isHalfDay() && !timeOff.startAt.isFirstHalfDay());
 
     const payload = {
         employee_id: timeOff.employeeId.toFixed(0),
@@ -962,6 +961,14 @@ async function createPersonioTimeOff_(personio, timeOff) {
         payload.skip_approval = "1";
     }
 
+    return payload;
+}
+
+
+/** Insert a new Personio TimeOff. */
+async function createPersonioTimeOff_(personio, timeOff) {
+
+    const payload = generatePersonioTimeOffPayload_(timeOff);
     const result = await personio.fetchJson('/company/time-offs', {
         method: 'post',
         payload: payload
