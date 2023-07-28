@@ -17,7 +17,7 @@
     "@octokit/auth-app": "^6.0.0",
     "@octokit/request": "^8.1.1",
     "@octokit/graphql": "^7.0.1",
-    "node-fetch": "^3.3.1"
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {}
 }
