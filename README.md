@@ -1,4 +1,4 @@
-![Library Test](https://github.com/giantswarm/gapps-automation/actions/workflows/build/badge.svg)
+![Library Test](https://github.com/giantswarm/gapps-automation/actions/workflows/build_and_test.yaml/badge.svg)
 
 # Apps Script Automation Projects
 
