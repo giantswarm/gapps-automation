@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - name: Checkout Sources
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Build Library
         run: make lib
       - name: Upload Artifacts
@@ -24,7 +24,7 @@ jobs:
         test_matrix: ${{ steps.set_test_matrix.outputs.test_matrix }}
     steps:
       - name: Checkout Sources
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Debug List
         run: find ./tests
       - name: Set Test Matrix
@@ -41,7 +41,7 @@ jobs:
       matrix: ${{fromJSON(needs.list_tests.outputs.test_matrix)}}
     steps:
       - name: Checkout Sources
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Setup NodeJS
         uses: actions/setup-node@v3
         with:
