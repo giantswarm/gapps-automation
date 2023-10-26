@@ -107,7 +107,7 @@ function onChangeStickyRows(event) {
     const config = mergeConfig_(key, {});
     if (!config.dynamic_range || !config.sticky_range || !config.controlCell) {
         // STICKY_ROWS() also reports this error, we can't forward since we know no control cell here
-        throw new Error("Please call STICK_ROWS() with a valid dynamic_range and sticky_range in a formula on the sheet");
+        return;
     }
 
     try {
