@@ -468,7 +468,12 @@ class TimeOffTypeConfig {
         const pattern = [];
         for (let timeOffType of timeOffTypes) {
             const keyword = TimeOffTypeConfig.extractKeyword(timeOffType.attributes.name);
-            pattern.push(new RegExp(`(^|[\\s:\\-[(])(${keyword})([\\s:\\-\\])]|$)`, "sim"));
+            if (keyword) {
+                const safeKeyword = keyword.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '[\\$& _]');
+                pattern.push(new RegExp(`(^|[\\s:\\-[(])(${safeKeyword})([\\s:\\-\\])]|$)`, "sim"));
+            } else {
+                pattern.push(new RegExp('a^'));
+            }
         }
         this.pattern = pattern;
         this.skipApprovalBlackList = skipApprovalBlackList || [];
