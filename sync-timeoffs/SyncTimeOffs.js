@@ -714,11 +714,25 @@ async function syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff) {
 /** Update Google Calendar event -> Personio TimeOff */
 async function syncActionUpdateTimeOff_(personio, calendar, primaryEmail, event, timeOff, updatedTimeOff) {
     try {
-        // Create new Google Calendar Out-of-Office
         // updating by ID is not possible (according to docs AND trial and error)
-        // since overlapping time-offs are not allowed (HTTP 400) no "more-safe" update operation is possible
         await deletePersonioTimeOff_(personio, timeOff);
-        const createdTimeOff = await createPersonioTimeOff_(personio, updatedTimeOff);
+
+        let createdTimeOff;
+        try
+        {
+            createdTimeOff = await createPersonioTimeOff_(personio, updatedTimeOff);
+        } catch (e) {
+            // re-creation after deletion failed
+            // cut the Gcal event's connection to schedule a new sync
+            setEventPrivateProperty_(event, 'timeOffId', undefined);
+            if (/ ?⇵$/.test(event.summary)) {
+                event.summary = event.summary.replace(' [synced]', '').replace(' ⇵', '');
+            }
+            await calendar.update('primary', event.id, event);
+            Logger.log('Will re-create TimeOff "%s" at %s for user %s due to error: %s', updatedTimeOff.typeName, String(updatedTimeOff.startAt), primaryEmail, e);
+            // handle recovery from 502 as "success" to speed up time-off recreation
+            return (e?.response?.getResponseCode() === 502);
+        }
         setEventPrivateProperty_(event, 'timeOffId', createdTimeOff.id);
         updateEventPersonioDeepLink_(event, createdTimeOff);
         if (!/ ?⇵$/.test(event.summary)) {
