@@ -907,7 +907,10 @@ async function queryPersonioTimeOffs_(personio, timeMin, timeMax, employeeId) {
 function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existingTimeOff) {
 
     // skip events created by other users
-    if (event?.creator?.email && event?.creator?.email !== employee.attributes.email.value) {
+    const email = employee.attributes.email.value;
+    if (event.creator?.email !== email
+        && event.organizer?.email !== email
+        && (!event.attendees || !event.attendees.some(attendee => attendee.email === email && attendee.responseStatus && attendee.responseStatus !== "declined"))) {
         return undefined;
     }
 
