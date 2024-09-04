@@ -197,13 +197,22 @@ async function syncTimeOffs() {
 }
 
 
+/** Example how to utilize the unsyncTimeOffs_() function.
+ *
+ */
+async function unsyncExample() {
+    await unsyncTimeOffs_('P32', 'blub@example.com', 0);
+}
+
 /** Utility function to unsynchronize certain events and delete the associated absence from Personio.
  *
  * @note This is a destructive operation, USE WITH UTMOST CARE!
  *
  * @param title The event title (only events whose title includes this string are de-synced).
+ * @param email (optional) The email of the user whose events are to be deleted.
+ * @param deleteConfig (optional) Specify 2 to also delete matching Personio time-offs which aren't linked to any Google calendar event, or specify 1 to only delete matching non-synced Personio time-offs, or 0 to only de-sync events.
  */
-async function unsyncTimeOffs_(title) {
+async function unsyncTimeOffs_(title, email, deleteConfig) {
 
     const scriptLock = LockService.getScriptLock();
     if (!scriptLock.tryLock(5000)) {
@@ -215,6 +224,9 @@ async function unsyncTimeOffs_(title) {
         .map(d => d.trim());
 
     const emailWhiteList = getEmailWhiteList_();
+    if (email) {
+        emailWhiteList.push(email);
+    }
     const isEmailAllowed = email => (!emailWhiteList.length || emailWhiteList.includes(email))
         && allowedDomains.includes(email.substring(email.lastIndexOf('@') + 1));
 
@@ -254,6 +266,7 @@ async function unsyncTimeOffs_(title) {
     for (const employee of employees) {
 
         const email = employee.attributes.email.value;
+        const employeeId = employee.attributes.id.value;
 
         // we keep operating if handling calendar of a single user fails
         try {
@@ -266,15 +279,24 @@ async function unsyncTimeOffs_(title) {
                 return false;
             }
 
-            const allEvents = await queryCalendarEvents_(calendar, 'primary', fetchTimeMin, fetchTimeMax);
-            Util.shuffleArray(allEvents);
+            const timeOffs = deleteConfig ? (await queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, employeeId)) : {};
+            now = Date.now();
+            if (now >= deadlineTs) {
+                return false;
+            }
 
+            const allEvents = await queryCalendarEvents_(calendar, 'primary', fetchTimeMin, fetchTimeMax);
             for (const event of allEvents) {
                 const timeOffId = +event.extendedProperties?.private?.timeOffId;
                 if (timeOffId && (event.summary || '').includes(title)) {
                     let now = Date.now();
                     if (now >= deadlineTs) {
                         break;
+                    }
+
+                    delete timeOffs[timeOffId];
+                    if (deleteConfig === 1) {
+                        continue;
                     }
 
                     try {
@@ -287,6 +309,22 @@ async function unsyncTimeOffs_(title) {
 
                     await calendar.update('primary', event.id, event);
                     Logger.log('De-synced event "%s" at %s for user %s', event.summary, event.start.dateTime || event.start.date, email);
+                }
+            }
+
+            for (const timeOff of Object.values(timeOffs)) {
+                let now = Date.now();
+                if (now >= deadlineTs) {
+                    break;
+                }
+
+                if ((timeOff.comment || '').includes(title)) {
+                    try {
+                        await deletePersonioTimeOff_(personio, timeOff);
+                        Logger.log('Deleted time-off "%s" at %s for user %s', timeOff.comment, timeOff.startAt, email);
+                    } catch (e) {
+                        Logger.log('Failed to remove time-off of user %s: %s', email, timeOff);
+                    }
                 }
             }
         } catch (e) {
@@ -1040,6 +1078,12 @@ function createEventFromTimeOff_(timeOffTypeConfig, timeOff) {
 
 /** Generate and add a link to the Personio Absence Calendar page for the specified TimeOffPeriod to this event. */
 function updateEventPersonioDeepLink_(event, timeOff) {
+
+    if (event.eventType && event.eventType !== 'default') {
+        // outOfOffice and similar special events don't support the `description` field
+        return;
+    }
+
     const employeeIdSafe = (+timeOff.employeeId).toFixed(0);
     const timeOffTypeId = (+timeOff.typeId).toFixed(0);
     const year = (+timeOff.startAt.year).toFixed(0);
