@@ -968,7 +968,7 @@ function convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, existi
         return undefined;
     }
 
-    const halfDaysAllowed = !!timeOffType.attributes?.half_day_requests_enabled;
+    const halfDaysAllowed = true; // field `half_day_requests_enabled` removed from absence-types from Sep. 16
     const localTzOffsetStart = event.start.date ? Util.getNamedTimeZoneOffset(event.start.timeZone, new Date(event.start.date)) : undefined;
     const localTzOffsetEnd = event.end.date ? Util.getNamedTimeZoneOffset(event.end.timeZone, new Date(event.end.date)) : undefined;
     const startAt = PeopleTime.fromISO8601(event.start.dateTime || event.start.date, undefined, localTzOffsetStart)
