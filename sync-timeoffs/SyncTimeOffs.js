@@ -194,6 +194,153 @@ async function syncTimeOffs() {
     if (firstError) {
         throw firstError;
     }
+
+    return true;
+}
+
+
+/** Example how to utilize the unsyncTimeOffs_() function.
+ *
+ */
+async function recoverEventsExample() {
+    const updateDateMin = new Date('Oct 21, 2024, 6:34:35 PM');
+    const updateDateMax = new Date('Oct 21, 2024, 10:50:50 PM');
+    const specs = [
+        ['example@giantswarm.io', "Example P32  ⇵"],
+        ['foobar@giantswarm.io', "Out - Concert ⇵"],
+        ['baz@giantswarm.io', "Vacation:  ⇵"],
+        // ...
+    ];
+
+    for (const [email, title] of specs) {
+        if (!await recoverEvents_(title, email, updateDateMin, updateDateMax)) {
+            break;
+        }
+    }
+}
+
+/** Utility function to recover accidentally cancelled events.
+ *
+ * @note This is a destructive operation, USE WITH UTMOST CARE!
+ *
+ * @param title The event title (only events whose title includes this string are de-synced).
+ * @param email (optional) The email of the user whose events are to be deleted.
+ * @param updateDateMin (optional) Minimum last update date.
+ * @param updateDateMax (optional) Maximum last update date.
+ */
+async function recoverEvents_(title, email, updateDateMin, updateDateMax) {
+
+    const scriptLock = LockService.getScriptLock();
+    if (!scriptLock.tryLock(5000)) {
+        throw new Error('Failed to acquire lock. Only one instance of this script can run at any given time!');
+    }
+
+    const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
+        .split(',')
+        .map(d => d.trim());
+
+    const emailWhiteList = getEmailWhiteList_();
+    if (email) {
+        emailWhiteList.push(email);
+    }
+    const isEmailAllowed = email => (!emailWhiteList.length || emailWhiteList.includes(email))
+        && allowedDomains.includes(email.substring(email.lastIndexOf('@') + 1));
+
+    Logger.log('Configured to handle accounts %s on domains %s', emailWhiteList.length ? emailWhiteList : '', allowedDomains);
+
+    // all timing related activities are relative to this EPOCH
+    const epoch = new Date();
+
+    // how far back to sync events/time-offs
+    const lookbackMillies = -Math.round(getLookbackDays_() * 24 * 60 * 60 * 1000);
+    // how far into the future to sync events/time-offs
+    const lookaheadMillies = Math.round(getLookaheadDays_() * 24 * 60 * 60 * 1000);
+
+    // after how many milliseconds should this script stop by itself (to avoid forced termination/unclean state)?
+    // 4:50 minutes (hard AppsScript kill comes at 6:00 minutes)
+    // stay under 5 min. to ensure termination before the next instances starts if operating at 5 min. job delay
+    const maxRuntimeMillies = Math.round(290 * 1000);
+
+    const fetchTimeMin = Util.addDateMillies(new Date(epoch), lookbackMillies);
+    fetchTimeMin.setUTCHours(0, 0, 0, 0); // round down to start of day
+    const fetchTimeMax = Util.addDateMillies(new Date(epoch), lookaheadMillies);
+    fetchTimeMax.setUTCHours(24, 0, 0, 0); // round up to end of day
+
+    const personioCreds = getPersonioCreds_();
+    const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
+
+    // load and prepare list of employees to process
+    const employees = await personio.getPersonioJson('/company/employees').filter(employee =>
+        employee.attributes.status.value !== 'inactive' && isEmailAllowed(employee.attributes.email.value)
+    );
+    Util.shuffleArray(employees);
+
+    Logger.log('Recovering events with title containing "%s" between %s and %s for %s accounts', title, fetchTimeMin.toISOString(), fetchTimeMax.toISOString(), '' + employees.length);
+
+    let firstError = null;
+    let processedCount = 0;
+    for (const employee of employees) {
+
+        const email = employee.attributes.email.value;
+        const employeeId = employee.attributes.id.value;
+
+        // we keep operating if handling calendar of a single user fails
+        try {
+            const calendar = await CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), email);
+
+            // test against dead-line first
+            const deadlineTs = +epoch + maxRuntimeMillies;
+            let now = Date.now();
+            if (now >= deadlineTs) {
+                return false;
+            }
+
+            const timeOffs = await queryPersonioTimeOffs_(personio, fetchTimeMin, fetchTimeMax, employeeId);
+            now = Date.now();
+            if (now >= deadlineTs) {
+                return false;
+            }
+
+            const allEvents = await queryCalendarEvents_(calendar, 'primary', fetchTimeMin, fetchTimeMax);
+            for (const event of allEvents) {
+
+                if ((updateDateMin && event.updated < updateDateMin) || (updateDateMax && event.updated > updateDateMax)) {
+                    continue;
+                }
+
+                const timeOffId = +event.extendedProperties?.private?.timeOffId;
+                if (timeOffId && event.status === 'cancelled' && (event.summary || '') === title) {
+                    let now = Date.now();
+                    if (now >= deadlineTs) {
+                        break;
+                    }
+
+                    if (!timeOffs.hasOwnProperty(timeOffId)) {
+                        setEventPrivateProperty_(event, 'timeOffId', undefined);
+                    }
+
+                    event.status = 'confirmed';
+                    await calendar.update('primary', event.id, event);
+                    Logger.log('Recovered event "%s" at %s for user %s', event.summary, event.start.dateTime || event.start.date, email);
+                }
+            }
+        } catch (e) {
+            Logger.log('Failed to recover matching out-of-offices of user %s: %s', email, e);
+            firstError = firstError || e;
+        }
+        ++processedCount;
+    }
+
+    Logger.log('Completed event recovery for %s of %s accounts', '' + processedCount, '' + employees.length);
+
+    // for completeness, also automatically released at exit
+    scriptLock.releaseLock();
+
+    if (firstError) {
+        throw firstError;
+    }
+
+    return true;
 }
 
 
