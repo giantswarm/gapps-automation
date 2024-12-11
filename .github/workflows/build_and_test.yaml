@@ -11,7 +11,7 @@ jobs:
       - name: Build Library
         run: make lib
       - name: Upload Artifacts
-        uses: actions/upload-artifact@master
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: lib-output
           path: lib-output
@@ -50,7 +50,7 @@ jobs:
       - name: Install Dependencies
         run: npm ci
       - name: Download Artifacts
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
         with:
           name: lib-output
           path: lib-output
