@@ -42,7 +42,7 @@ jobs:
     needs: build_user_list
     if: github.event.action == 'assigned'
     steps:
-    - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+    - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806  # v4.1.9
       id: download-users
       with:
         name: users
@@ -68,7 +68,7 @@ jobs:
     needs: build_user_list
     if: github.event.action == 'labeled'
     steps:
-    - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+    - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806  # v4.1.9
       id: download-labels
       with:
         name: labels
