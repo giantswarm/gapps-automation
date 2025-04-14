@@ -15,7 +15,7 @@
     "@actions/github": "^6.0.0",
     "octokit": "^4.1.2",
     "@octokit/auth-app": "^7.2.0",
-    "@octokit/request": "^9.2.2",
+    "@octokit/request": "^9.2.3",
     "@octokit/graphql": "^8.2.1",
     "node-fetch": "^3.3.2"
   },
