@@ -5,7 +5,7 @@ on:
 jobs:
   upload_release_files:
     name: Upload Release Files
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout Sources
         uses: actions/checkout@v4
