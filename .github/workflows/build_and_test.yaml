@@ -4,7 +4,7 @@ on:
 jobs:
   build_lib:
     name: Build Library
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout Sources
         uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
     needs:
       - build_lib
     name: Discover Tests
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     outputs:
         test_matrix: ${{ steps.set_test_matrix.outputs.test_matrix }}
     steps:
@@ -36,7 +36,7 @@ jobs:
     needs:
       - build_lib
       - list_tests
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     strategy:
       matrix: ${{fromJSON(needs.list_tests.outputs.test_matrix)}}
     steps:
