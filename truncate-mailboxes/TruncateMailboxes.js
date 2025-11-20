@@ -70,6 +70,41 @@ async function truncateMailboxes() {
 }
 
 
+/** Helper function for cleaning up after users inboxes got messed up. */
+async function removeMassEmails_() {
+
+    const emails = []; // dear admin, list user primary emails here to clean up their inboxes
+
+    const scriptProperties = PropertiesService.getScriptProperties();
+    if (!scriptProperties) {
+        Logger.log('ScriptProperties not accessible');
+        return [];
+    }
+
+    const svcCreds = getServiceAccountCredentials_();
+    const filter = 'newer_than:3h AND subject:"Delivery Status Notification (Failure)"';
+
+    let firstError = null;
+
+    const lastEmail = scriptProperties.getProperty('removeMess.lastEmailDone');
+
+    // we keep operating if a single sync task fails
+    for (const email of emails.slice(Math.max(0, emails.findIndex(e => e === lastEmail)))) {
+        try {
+            await cleanUserMailbox_(svcCreds, email, filter);
+            scriptProperties.setProperty('removeMess.lastEmailDone', email);
+        } catch (e) {
+            Logger.log('Failed to clean mailbox %s: %s', email, e.message);
+            firstError = firstError || e;
+        }
+    }
+
+    if (firstError) {
+        throw firstError;
+    }
+}
+
+
 /** Clean the specified user's mailbox based on search expression.
  *
  * WARNING: This is intended to be used for emergencies, adhering to regulatory requirements or to
