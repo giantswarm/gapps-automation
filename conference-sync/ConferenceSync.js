@@ -61,7 +61,7 @@ function syncToCalendar_(spreadsheetId, sheetName, calendarId) {
         throw new Error(`Failed to access calendar ${calendarId}, please check permissions`);
     }
     const sheet = spreadsheet.getSheetByName(sheetName);
-    SheetUtil.mapRows(sheet.getSheetValues(1, 1, -1, -1), null).forEach((row, i) => {
+    SheetUtil.mapRows(sheet.getSheetValues(1, 1, -1, -1), undefined).forEach((row, i) => {
 
         const untilDeadlineMs = new Date(row.deadline) - new Date();
         if (!row.notified_deadline_date && untilDeadlineMs) {
