@@ -1,4 +1,4 @@
-/** Script to generate various meeting reports.
+/** Script to generate various meeting reports and share team meeting artifacts.
  *
  * NOTE: You may install periodic triggers to keep these reports up-to-date in the output sheets.
  */
@@ -38,6 +38,20 @@ const LOOKBACK_DAYS_KEY = PROPERTY_PREFIX + 'lookbackDays';
 /** ID of sheet to write reports to. */
 const REPORT_SHEET_KEY = PROPERTY_PREFIX + 'reportSheet';
 
+/** ID of shared team meetings calendar to restrict automatic operations (optional). */
+const TEAM_MEETINGS_CALENDAR = PROPERTY_PREFIX + 'teamMeetingsCalendar';
+
+/** Slack App bot token for sharing artifacts with the whole organization (posts will be to each channel where the app is invited).
+ *  Required scopes: chat:write, channels:read, groups:read, users:read, users:read.email
+ */
+const SLACK_BOT_TOKEN = PROPERTY_PREFIX + 'slackBotToken';
+
+/** Google Gemini API key to summarize meeting content. */
+const GEMINI_API_KEY = PROPERTY_PREFIX + 'geminiApiKey';
+
+/** Share domain (domain to share meeting recordings/summaries with). */
+const SHARE_DOMAIN_NAME = PROPERTY_PREFIX + 'shareDomain';
+
 
 /** Build meetings statistic per employee and summarized. */
 async function listMeetingStatistic() {
@@ -75,7 +89,7 @@ async function listMeetingStatistic() {
     try {
         let haveEmployees = false;
         // visitEvents_() will call our visitor function for each employee and calendar event combination
-        await visitEvents_((event, employee, employees, calendar, personio) => {
+        await visitEvents_(async (event, employee, employees, calendar, personio) => {
 
             if (!haveEmployees) {
                 for (const e of employees) {
@@ -105,7 +119,7 @@ async function listMeetingStatistic() {
                     if (week != null) {
 
                         let validMeeting = (event?.attendees?.length) > 1;
-                        if (isSigOrChapther_(event)) {
+                        if (isSigOrChapter_(event)) {
                             validMeeting = true;
                             stats.durationSig += durationHours;
                         } else if (isOneOnOne_(event, employees, email)) {
@@ -170,7 +184,7 @@ async function listMeetings() {
     const rows = [];
     try {
         // visitEvents_() will call our visitor function for each employee and calendar event combination
-        await visitEvents_((event, employee, employees, calendar, personio) => {
+        await visitEvents_(async (event, employee, employees, calendar, personio) => {
             const email = employee.attributes.email.value;
 
             // recurring event, organized by this employee with 2 attendees means it's a 1on1
@@ -201,6 +215,100 @@ async function listMeetings() {
 }
 
 
+/** Share team meeting artifacts with the organization. */
+async function shareTeamMeetingArtifacts() {
+
+    const shareDomainName = getScriptProperties_().getProperty(SHARE_DOMAIN_NAME) || '';
+    if (!shareDomainName) {
+        Logger.log('No share domain configured, skipping sharing team meeting artifacts');
+        return;
+    }
+
+    let hits = 0;
+    let hits_published = 0;
+    const teamMeetingsCalendarId = getScriptProperties_().getProperty(TEAM_MEETINGS_CALENDAR) || '';
+    try {
+        // visitEvents_() will call the visitor function for each employee and calendar event combination
+        await visitEvents_(async (event, employee, employees, calendar, personio) => {
+            const email = employee.attributes.email.value;
+
+            // Only process SIG/Chapter/WG events
+            if (!isSigOrChapter_(event)) {
+                return true;
+            }
+
+            // If team meetings calendar is configured, only process events from that calendar
+            if (teamMeetingsCalendarId && event?.organizer?.email !== teamMeetingsCalendarId) {
+                return true;
+            }
+
+            // Only the creator initially owns the meeting attributes and can share them
+            if (event?.creator?.email !== email) {
+                return true;
+            }
+
+            const publishedAt = +event.extendedProperties?.private?.attachmentsPublishedAt;
+            if (publishedAt) {
+                Logger.log("event " + event.summary + " at " + event.start.dateTime + " already published at " + publishedAt);
+                return true;
+            }
+
+            const geminiNotes = event.attachments?.find(a => a.mimeType === 'application/vnd.google-apps.document'
+                && a.fileUrl.includes('usp=meet_tnfm_calendar')
+                && a.title.includes('Notes'));
+            const recording = event.attachments?.find(a => a.mimeType === 'video/mp4'
+                && a.title.includes('Recording'));
+
+            console.log('meet: ' + event.summary + ' ' + event.start.dateTime + ' notes=' + geminiNotes + ' rec=' + recording);
+
+            if (geminiNotes && recording) {
+
+                hits++;
+
+                // Share with organization
+                try {
+                    const drive = await DriveClientV1.withImpersonatingService(getServiceAccountCredentials_(), email);
+
+                    // Share the Gemini notes document
+                    Logger.log(`Sharing notes ${geminiNotes.fileId} for event ${event.summary}`);
+                    try {
+                        await drive.shareWith(geminiNotes.fileId, 'domain', shareDomainName,'reader', true);
+                    } catch (e) {
+                        Logger.log(`Failed to share notes ${geminiNotes.fileId} (may have been moved already): ${e}`);
+                    }
+
+                    // Share the recording video
+                    Logger.log(`Sharing recording ${recording.fileId} for event ${event.summary}`);
+                    try {
+                        await drive.shareWith(recording.fileId, 'domain', shareDomainName,'reader', true);
+                    } catch (e) {
+                        Logger.log(`Failed to share recording ${recording.fileId} (may have been moved already): ${e}`);
+                    }
+
+                    // Summarize and post to Slack
+                    await summarizeAndPostToSlack_(event, geminiNotes, recording, drive, employees);
+
+                    // Mark as published
+                    hits_published++;
+                    setEventPrivateProperty_(event, 'attachmentsPublishedAt', Date.now());
+                    await calendar.update('primary', event.id, event);
+
+                    Logger.log(`Successfully shared artifacts for ${event.summary} at ${event.start.dateTime}`);
+                } catch (e) {
+                    Logger.log(`Failed to share artifacts for ${event.summary}: ${e}`);
+                }
+            }
+
+            return true;
+        });
+    } catch (e) {
+        Logger.log("First error while visiting calendar events: " + e);
+    }
+
+    Logger.log(`Found ${hits} recorded meets, published ${hits_published} new artifacts`);
+}
+
+
 function getGiantSwarmAttendees_(event, allowedDomains) {
     return (event.attendees || []).filter(attendee => allowedDomains.filter(domain => (attendee.email || '').includes(domain)).length);
 }
@@ -211,18 +319,214 @@ function isTeamEvent_(event) {
 }
 
 
-function isSigOrChapther_(event) {
-    return /(^|\s)(SIG|chapter)(\s|$)/i.test(event.summary) || (event.attendees || []).find(attendee => attendee.email.startsWith('sig-'));
+function isSigOrChapter_(event) {
+    return /(^|\s)(SIG|chapter|WG)(\s|$)/i.test(event.summary) || (event.attendees || []).find(a => a.email.startsWith('sig-') || a.email.startsWith('wg-') || a.email.startsWith('all@'));
 }
 
 
 function isOneOnOne_(event, employees, ownerEmail) {
     return Array.isArray(event.attendees) && event.attendees.length === 2
         && ((Array.isArray(event.recurrence) && event.recurrence.length) || event.recurringEventId)
-        && !isSigOrChapther_(event)
+        && !isSigOrChapter_(event)
         && !isTeamEvent_(event)
         && event.attendees.find(attendee => attendee.email === ownerEmail)
         && event.attendees.filter(attendee => employees.find(employee => employee.attributes.email.value === attendee.email)).length === event.attendees.length;
+}
+
+
+/** Summarize meeting notes and post to Slack.
+ *
+ * @param event The calendar event
+ * @param geminiNotes The Gemini notes attachment object
+ * @param recording The recording attachment object
+ * @param drive The DriveClientV1 instance with access to the documents
+ * @param employees The list of active employees from Personio
+ */
+async function summarizeAndPostToSlack_(event, geminiNotes, recording, drive, employees) {
+    try {
+        const geminiApiKey = getGeminiApiKey_();
+        const slackBotToken = getSlackBotToken_();
+
+        if (!geminiApiKey) {
+            Logger.log('No Gemini API key configured, skipping summarization');
+            return;
+        }
+
+        if (!slackBotToken) {
+            Logger.log('No Slack bot token configured, skipping Slack posting');
+            return;
+        }
+
+        // Initialize clients
+        const gemini = new GeminiRestClient(geminiApiKey);
+        const slack = new SlackWebClient(slackBotToken);
+
+        // Extract file ID from the notes URL
+        const notesFileId = geminiNotes.fileId || DriveClientV1.extractFileId(geminiNotes.fileUrl);
+        if (!notesFileId) {
+            throw new Error('Could not extract file ID from Gemini notes');
+        }
+
+        Logger.log(`Summarizing notes ${notesFileId} for event ${event.summary}`);
+
+        // Format the date
+        const eventDate = new Date(event.start.dateTime || event.start.date);
+        const formattedDate = Utilities.formatDate(eventDate, Session.getScriptTimeZone(), 'dd/MM/yy');
+
+        const nameToSlackHandleMapping = async () => {
+            // Use all active employees instead of event.attendees (which may be incomplete)
+            const employeeEmails = employees.map(emp => emp.attributes.email.value).filter(Boolean);
+            if (employeeEmails.length === 0) {
+                return '';
+            }
+
+            const mappingLines = [];
+            for (const email of employeeEmails) {
+                try {
+                    const slackUser = await slack.lookupByEmail(email);
+                    if (slackUser) {
+                        // Get the employee's full name from Personio
+                        const employee = employees.find(emp => emp.attributes.email.value === email);
+                        const firstName = employee?.attributes?.first_name?.value || '';
+                        const lastName = employee?.attributes?.last_name?.value || '';
+                        const fullName = `${firstName} ${lastName}`.trim();
+
+                        const slackHandle = slackUser.name; // Slack username (without @)
+                        const displayName = fullName || slackUser.profile?.display_name || slackUser.real_name || slackUser.name;
+                        mappingLines.push(`${displayName} -> @${slackHandle}`);
+                    }
+                } catch (e) {
+                    Logger.log(`Failed to lookup Slack user for email ${email}: ${e}`);
+                }
+            }
+
+            return mappingLines.join('\n');
+        };
+
+        // Create the summarization prompt
+        const prompt = `You are summarizing meeting notes for a Slack post. Generate ONLY the content for the takeaways sections as described below. Do NOT include the header, meeting name, date, or document links - those will be added separately.
+
+Generate the following sections:
+
+🧠 Top Takeaways
+Format each takeaway with an appropriate emoji prefix:
+- Use ✅ for decisions made
+- Use 🚧 for blockers or challenges
+- Use 🔜 for next steps or action items
+- Use 💡 for key insights or ideas
+- Use ⚠️ for risks or concerns
+
+Keep each takeaway to 1-2 sentences maximum. Focus on outcomes, not discussions.
+
+🙋 Key Contributors & Takeaways
+
+Note: Only include this section if any of the following apply:
+- Someone is assigned an action or deliverable
+- A decision was clearly advocated for or blocked by a participant
+- Someone flagged a risk, dependency, or introduced a new direction
+
+🎯 Skip this section entirely if there's nothing impactful to highlight - this isn't about logging everyone's contributions.
+
+If you do include this section, format each entry as:
+• @{{SlackHandle}} – {{Brief description of their assigned task, key decision, or flagged blocker}}
+
+Keep it short and outcome-focused. Only mention people with specific, actionable contributions.
+
+Guidelines:
+- Be concise and direct
+- Focus on outcomes and decisions, not process
+- Use clear, simple language
+- Only output the sections above, nothing else
+
+Name to SlackHandle mapping for employees:
+${await nameToSlackHandleMapping()}`;
+
+        // Summarize the document
+        const summaryContent = await gemini.summarizeGoogleDoc(notesFileId, prompt, drive);
+        Logger.log(`Generated summary: ${summaryContent}`);
+
+        // Broadcast to all channels where the bot is a member
+        Logger.log(`Broadcasting summary to Slack channels`);
+        const channels = await slack.getUserChannels();
+        for (const channel of channels) {
+            await postMeetingSummary_(slack, channel.id, event.summary, formattedDate, summaryContent, geminiNotes.fileUrl, recording.fileUrl);
+        }
+
+        Logger.log(`Successfully posted summary for ${event.summary} to Slack`);
+    } catch (e) {
+        Logger.log(`Failed to summarize and post to Slack: ${e}`);
+        throw e;
+    }
+}
+
+
+/** Post a formatted meeting summary to a Slack channel.
+ *
+ * @param slackClient The SlackWebClient instance
+ * @param channelId The channel to post to
+ * @param meetingName The name of the meeting
+ * @param date The formatted date string
+ * @param summaryContent The AI-generated summary content (takeaways and contributors)
+ * @param docLink Link to the Google Doc
+ * @param recordingLink Link to the recording
+ */
+async function postMeetingSummary_(slackClient, channelId, meetingName, date, summaryContent, docLink, recordingLink) {
+    const blocks = [
+        {
+            type: 'header',
+            text: {
+                type: 'plain_text',
+                text: '👋 Meeting Summary — Fresh from the AI',
+                emoji: true
+            }
+        },
+        {
+            type: 'section',
+            fields: [
+                {
+                    type: 'mrkdwn',
+                    text: `*📌 Meeting:*\n${meetingName}`
+                },
+                {
+                    type: 'mrkdwn',
+                    text: `*📅 Date:*\n${date}`
+                }
+            ]
+        },
+        {
+            type: 'divider'
+        },
+        {
+            type: 'section',
+            text: {
+                type: 'mrkdwn',
+                text: summaryContent
+            }
+        },
+        {
+            type: 'divider'
+        },
+        {
+            type: 'section',
+            text: {
+                type: 'mrkdwn',
+                text: `📄 <${docLink}|Full Summary + Transcript>\n🎥 <${recordingLink}|Recording>`
+            }
+        }
+    ];
+
+    // Use plain text as fallback for notifications
+    const fallbackText = `Meeting Summary: ${meetingName} (${date})`;
+
+    await slackClient.postMessage(channelId, fallbackText, blocks);
+}
+
+
+/** Set a private property on an event. */
+function setEventPrivateProperty_(event, key, value) {
+    const props = event.extendedProperties ? event.extendedProperties : event.extendedProperties = {};
+    const privateProps = props.private ? props.private : props.private = {};
+    privateProps[key] = value;
 }
 
 
@@ -285,7 +589,7 @@ async function visitEvents_(visitor, listParams) {
             });
 
             for (const event of allEvents) {
-                done = !visitor(event, employee, employees, calendar, personio);
+                done = !await visitor(event, employee, employees, calendar, personio);
                 if (done) {
                     break;
                 }
@@ -381,4 +685,16 @@ function getPersonioCreds_() {
         .map(field => field.trim());
 
     return {clientId: credentialFields[0], clientSecret: credentialFields[1]};
+}
+
+
+/** Get the Slack bot token for posting messages. */
+function getSlackBotToken_() {
+    return getScriptProperties_().getProperty(SLACK_BOT_TOKEN) || null;
+}
+
+
+/** Get the Gemini API key for summarization. */
+function getGeminiApiKey_() {
+    return getScriptProperties_().getProperty(GEMINI_API_KEY) || null;
 }
