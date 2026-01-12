@@ -23,7 +23,7 @@ jobs:
           | jq -r '.content' \
           | base64 -d > artifacts/users.yaml
     - name: Upload Artifact
-      uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       with:
         name: users
         path: artifacts/users.yaml
@@ -38,7 +38,7 @@ jobs:
           | jq -r '.content' \
           | base64 -d > artifacts/labels.yaml
     - name: Upload Artifact
-      uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       with:
         name: labels
         path: artifacts/labels.yaml
