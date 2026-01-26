@@ -383,7 +383,7 @@ async function summarizeAndPostToSlack_(event, geminiNotes, recording, drive, em
             const mappingLines = [];
             for (const email of employeeEmails) {
                 try {
-                    const slackUser = await slack.lookupByEmail(email);
+                    const slackUser = await getSlackUserByEmailCached_(slack, email);
                     if (slackUser) {
                         // Get the employee's full name from Personio
                         const employee = employees.find(emp => emp.attributes.email.value === email);
@@ -685,6 +685,39 @@ function getPersonioCreds_() {
         .map(field => field.trim());
 
     return {clientId: credentialFields[0], clientSecret: credentialFields[1]};
+}
+
+
+/** Get Slack user by email with caching to avoid rate limits.
+ *
+ * @param slack The SlackWebClient instance
+ * @param email The email address to look up
+ * @returns The Slack user object or null if not found
+ */
+async function getSlackUserByEmailCached_(slack, email) {
+    const CACHE_TTL_MIN_MS = 3.5 * 24 * 60 * 60 * 1000; // 0.5 weeks
+    const CACHE_TTL_MAX_MS = 14 * 24 * 60 * 60 * 1000;  // 2 weeks
+    const cacheKey = `slackUser.${email}`;
+    const scriptProps = getScriptProperties_();
+
+    // Try to get from cache first (timestamp and TTL stored with value to minimize property accesses)
+    const cachedData = scriptProps.getProperty(cacheKey);
+    if (cachedData) {
+        const { ts, ttl, user } = JSON.parse(cachedData);
+        if (ts && ttl && (Date.now() - ts) < ttl) {
+            return user;
+        }
+    }
+
+    // Fetch from Slack API if not cached or expired
+    const slackUser = await slack.lookupByEmail(email);
+    if (slackUser) {
+        // Randomize TTL to avoid mass expiry causing rate limits
+        const ttl = CACHE_TTL_MIN_MS + Math.random() * (CACHE_TTL_MAX_MS - CACHE_TTL_MIN_MS);
+        scriptProps.setProperty(cacheKey, JSON.stringify({ ts: Date.now(), ttl, user: slackUser }));
+    }
+
+    return slackUser;
 }
 
 
