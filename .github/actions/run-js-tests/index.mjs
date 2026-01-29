@@ -1,4 +1,4 @@
-const {getInput, setFailed} = require('@actions/core');
+import {getInput, setFailed} from '@actions/core';
 
 async function runTest() {
     try {
