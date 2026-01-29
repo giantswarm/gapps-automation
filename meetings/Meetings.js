@@ -438,7 +438,7 @@ Guidelines:
 - Use clear, simple language
 - Only output the sections above, nothing else
 
-Name to SlackHandle mapping for employees:
+Name to SlackHandle mapping in the format "{{Display Name}} -> @{{SlackHandle}}" for employees, for replacing names with handles:
 ${await nameToSlackHandleMapping()}`;
 
         // Summarize the document
@@ -472,14 +472,6 @@ ${await nameToSlackHandleMapping()}`;
  */
 async function postMeetingSummary_(slackClient, channelId, meetingName, date, summaryContent, docLink, recordingLink) {
     const blocks = [
-        {
-            type: 'header',
-            text: {
-                type: 'plain_text',
-                text: '👋 Meeting Summary — Fresh from the AI',
-                emoji: true
-            }
-        },
         {
             type: 'section',
             fields: [
