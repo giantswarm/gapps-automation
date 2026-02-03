@@ -254,10 +254,11 @@ async function shareTeamMeetingArtifacts() {
             }
 
             const geminiNotes = event.attachments?.find(a => a.mimeType === 'application/vnd.google-apps.document'
-                && a.fileUrl.includes('usp=meet_tnfm_calendar')
-                && a.title.includes('Notes'));
+                && a.title?.includes('Notes')
+                && a.title?.includes(event.summary));
             const recording = event.attachments?.find(a => a.mimeType === 'video/mp4'
-                && a.title.includes('Recording'));
+                && a.title?.includes('Recording')
+                && a.title?.includes(event.summary));
 
             console.log('meet: ' + event.summary + ' ' + event.start.dateTime + ' notes=' + geminiNotes + ' rec=' + recording);
 
