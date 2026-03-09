@@ -126,6 +126,7 @@ function fetchAiCosts() {
     }
 
     if (rows.length > 0) {
+        rows.sort(function(a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
         appendToSheet_(spreadsheet, rows, fetchedDates);
     }
 
