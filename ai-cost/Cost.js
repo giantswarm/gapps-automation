@@ -19,7 +19,6 @@ const TRIGGER_HANDLER_FUNCTION = 'fetchAiCosts';
 
 const ANTHROPIC_ADMIN_KEY_PROP = PROPERTY_PREFIX + 'anthropicAdminKey';
 const OPENAI_ADMIN_KEY_PROP = PROPERTY_PREFIX + 'openaiAdminKey';
-const LAST_BATCH_PROP = PROPERTY_PREFIX + 'lastBatch';
 
 const COLUMNS = [
     'date', 'source', 'record_type', 'model', 'actor',
@@ -35,6 +34,8 @@ const OPENAI_BASE = 'https://api.openai.com';
  *  Source: https://developers.openai.com/api/docs/pricing
  */
 const OPENAI_PRICING = {
+    'gpt-5':        { input: 1.25 / 1e6, cached: 0.125 / 1e6, output: 10.00 / 1e6 },
+    'gpt-5-mini':   { input: 0.25 / 1e6, cached: 0.025 / 1e6, output: 2.00  / 1e6 },
     'gpt-5.1':      { input: 1.25 / 1e6, cached: 0.125 / 1e6, output: 10.00 / 1e6 },
     'gpt-4.1':      { input: 2.00 / 1e6, cached: 0.50  / 1e6, output: 8.00  / 1e6 },
     'gpt-4.1-mini': { input: 0.40 / 1e6, cached: 0.10  / 1e6, output: 1.60  / 1e6 },
@@ -59,8 +60,12 @@ function fetchAiCosts() {
     const anthropicKey = props.getProperty(ANTHROPIC_ADMIN_KEY_PROP) || '';
     const openaiKey = props.getProperty(OPENAI_ADMIN_KEY_PROP) || '';
 
-    const startDate = defaultStartDate_();
     const endDate = defaultEndDate_();
+    // Start one day before today so that all sources (including cost endpoints
+    // that only report completed days) cover the same date range for dedup.
+    const d = new Date(toIso8601_(defaultStartDate_()));
+    d.setUTCDate(d.getUTCDate() - 1);
+    const startDate = d.toISOString().slice(0, 10);
 
     Logger.log('Fetching AI costs for %s to %s', startDate, endDate);
 
@@ -120,7 +125,7 @@ function fetchAiCosts() {
         fetchedDates.add(row.date);
     }
 
-    if (rows.length > 0 || fetchedDates.size > 0) {
+    if (rows.length > 0) {
         appendToSheet_(spreadsheet, rows, fetchedDates);
     }
 
@@ -291,14 +296,8 @@ function fetchAnthropicUsage_(apiKey, startDate, endDate) {
 }
 
 function fetchAnthropicCosts_(apiKey, startDate, endDate) {
-    // Cost data is only available for completed days; include the previous day
-    // to ensure at least one finalized bucket exists in the range.
-    const d = new Date(toIso8601_(startDate));
-    d.setUTCDate(d.getUTCDate() - 1);
-    const costStart = d.toISOString().slice(0, 10);
-
     const url = ANTHROPIC_BASE + '/v1/organizations/cost_report'
-        + '?starting_at=' + toIso8601_(costStart)
+        + '?starting_at=' + toIso8601_(startDate)
         + '&ending_at=' + toIso8601_(endDate)
         + '&bucket_width=1d';
 
@@ -425,13 +424,8 @@ function fetchOpenaiUsage_(apiKey, startDate, endDate) {
 }
 
 function fetchOpenaiCosts_(apiKey, startDate, endDate) {
-    // Cost data is only available for completed days; include the previous day.
-    const d = new Date(toIso8601_(startDate));
-    d.setUTCDate(d.getUTCDate() - 1);
-    const costStart = d.toISOString().slice(0, 10);
-
     const url = OPENAI_BASE + '/v1/organization/costs'
-        + '?start_time=' + toUnixSeconds_(costStart)
+        + '?start_time=' + toUnixSeconds_(startDate)
         + '&end_time=' + toUnixSeconds_(endDate)
         + '&bucket_width=1d';
 
@@ -460,12 +454,10 @@ function fetchOpenaiCosts_(apiKey, startDate, endDate) {
 
 /** Write fetched rows to the target sheet.
  *
- * Reads only the last row's date. If the date matches, overwrites the previous batch in-place
- * (tracked via script property). Otherwise appends.
+ * Removes any existing rows whose date is in fetchedDates, then appends all new rows.
  */
 function appendToSheet_(spreadsheet, newRows, fetchedDates) {
     const sheet = SheetUtil.ensureSheet(spreadsheet, 'Data-' + new Date().getUTCFullYear());
-    const props = getScriptProperties_();
 
     let lastRow = sheet.getLastRow();
 
@@ -475,31 +467,34 @@ function appendToSheet_(spreadsheet, newRows, fetchedDates) {
         lastRow = 1;
     }
 
-    // Convert new row objects to arrays
-    const newRowArrays = newRows.map(function(obj) {
-        return COLUMNS.map(function(col) { return obj[col] !== undefined ? obj[col] : ''; });
-    });
-
-    // Determine write position: overwrite previous batch if same date, otherwise append
-    let writeAt = lastRow + 1;
-    if (lastRow > 1) {
-        const lastDate = sheet.getRange(lastRow, 1).getValue();
-        const dateStr = lastDate instanceof Date ? lastDate.toISOString().slice(0, 10) : String(lastDate);
-        if (fetchedDates.has(dateStr)) {
-            const batchStart = parseInt(props.getProperty(LAST_BATCH_PROP) || '0', 10);
-            writeAt = (batchStart > 1 && batchStart <= lastRow) ? batchStart : lastRow + 1;
+    // Remove existing rows for the fetched dates (contiguous ranges, bottom-to-top)
+    if (lastRow > 1 && fetchedDates.size > 0) {
+        const dates = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+        let i = dates.length - 1;
+        while (i >= 0) {
+            const val = dates[i][0];
+            const dateStr = val instanceof Date ? val.toISOString().slice(0, 10) : String(val);
+            if (fetchedDates.has(dateStr)) {
+                const rangeEnd = i;
+                while (i > 0) {
+                    const prev = dates[i - 1][0];
+                    const prevStr = prev instanceof Date ? prev.toISOString().slice(0, 10) : String(prev);
+                    if (!fetchedDates.has(prevStr)) break;
+                    i--;
+                }
+                sheet.deleteRows(i + 2, rangeEnd - i + 1);
+            }
+            i--;
         }
     }
 
-    if (newRowArrays.length > 0) {
-        // Clear previous batch remnants if overwriting and old batch was larger
-        if (writeAt <= lastRow) {
-            sheet.getRange(writeAt, 1, lastRow - writeAt + 1, COLUMNS.length).clearContent();
-        }
-        sheet.getRange(writeAt, 1, newRowArrays.length, COLUMNS.length).setValues(newRowArrays);
+    // Append new rows
+    if (newRows.length > 0) {
+        const rowArrays = newRows.map(function(obj) {
+            return COLUMNS.map(function(col) { return obj[col] !== undefined ? obj[col] : ''; });
+        });
+        sheet.getRange(sheet.getLastRow() + 1, 1, rowArrays.length, COLUMNS.length).setValues(rowArrays);
     }
 
-    props.setProperty(LAST_BATCH_PROP, String(writeAt));
-
-    Logger.log('Sheet updated: wrote %s rows at row %s', newRowArrays.length, writeAt);
+    Logger.log('Sheet updated: %s data rows', sheet.getLastRow() - 1);
 }
