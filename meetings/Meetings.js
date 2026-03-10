@@ -247,6 +247,13 @@ async function shareTeamMeetingArtifacts() {
                 return true;
             }
 
+            // Skip events that haven't ended yet - future events can't have legitimate
+            // notes/recordings, and any attachments found would be from a previous occurrence
+            const eventEnd = new Date(event.end?.dateTime || event.end?.date);
+            if (isNaN(eventEnd) || eventEnd > new Date()) {
+                return true;
+            }
+
             const publishedAt = +event.extendedProperties?.private?.attachmentsPublishedAt;
             if (publishedAt) {
                 Logger.log("event " + event.summary + " at " + event.start.dateTime + " already published at " + publishedAt);
