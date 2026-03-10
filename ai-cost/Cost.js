@@ -470,16 +470,19 @@ function appendToSheet_(spreadsheet, newRows, fetchedDates) {
 
     // Remove existing rows for the fetched dates (contiguous ranges, bottom-to-top)
     if (lastRow > 1 && fetchedDates.size > 0) {
+        const tz = spreadsheet.getSpreadsheetTimeZone();
         const dates = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
         let i = dates.length - 1;
         while (i >= 0) {
             const val = dates[i][0];
-            const dateStr = val instanceof Date ? val.toISOString().slice(0, 10) : String(val);
+            const dateStr = val instanceof Date
+                ? Utilities.formatDate(val, tz, 'yyyy-MM-dd') : String(val);
             if (fetchedDates.has(dateStr)) {
                 const rangeEnd = i;
                 while (i > 0) {
                     const prev = dates[i - 1][0];
-                    const prevStr = prev instanceof Date ? prev.toISOString().slice(0, 10) : String(prev);
+                    const prevStr = prev instanceof Date
+                        ? Utilities.formatDate(prev, tz, 'yyyy-MM-dd') : String(prev);
                     if (!fetchedDates.has(prevStr)) break;
                     i--;
                 }
