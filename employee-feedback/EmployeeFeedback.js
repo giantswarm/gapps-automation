@@ -1,5 +1,9 @@
 const GITHUB_RAW_BASE = "https://raw.githubusercontent.com/giantswarm/feedback-templates/refs/heads/main/";
 
+const ROLES_MANIFEST_FILE = "roles.json";
+
+const TEMPLATES_FOLDER = "questions/";
+
 const PROPERTY_PREFIX = "EmployeeFeedback.";
 
 const FORM_ID_KEY = PROPERTY_PREFIX + "formId";
@@ -112,20 +116,51 @@ function onFormSubmit(e) {
 }
 
 /**
- * Fetch Markdown templates for selected roles
+ * Fetch the role-to-filename mapping from the feedback-templates repo.
+ *
+ * Expected format in roles.json:
+ *   { "Human Readable Role": "filename-stem", ... }
+ *
+ * The keys must match the option values in the intake form's Roles field.
+ * The values are filenames in the repo without the .md extension.
+ *
+ * Example:
+ *   {
+ *     "generic":             "generic",
+ *     "Software Engineer":   "engineer",
+ *     "Engineering Manager": "manager"
+ *   }
+ */
+function fetchRolesMapping() {
+  const url = GITHUB_RAW_BASE + ROLES_MANIFEST_FILE;
+  Logger.log("Fetching roles mapping from %s", url);
+  const resp = UrlFetchApp.fetch(url);
+  return JSON.parse(resp.getContentText());
+}
+
+/**
+ * Fetch Markdown templates for selected roles using the roles mapping.
+ * Roles not present in roles.json are skipped with a warning.
  */
 function fetchTemplatesForRoles(roles) {
+  const mapping = fetchRolesMapping();
   const templates = {};
 
   roles.forEach(role => {
-    const url = GITHUB_RAW_BASE + role.toLowerCase() + ".md";
-    Logger.log(url);
+    const filename = mapping[role];
+    if (!filename) {
+      Logger.log("No mapping found for role '%s' in %s, skipping", role, ROLES_MANIFEST_FILE);
+      return;
+    }
+
+    const url = GITHUB_RAW_BASE + TEMPLATES_FOLDER + filename + ".md";
+    Logger.log("Fetching template for role '%s' from %s", role, url);
 
     try {
       const resp = UrlFetchApp.fetch(url);
       templates[role] = resp.getContentText();
     } catch (e) {
-      Logger.log(`Error fetching ${role}: ${e}`);
+      Logger.log("Error fetching template for role '%s': %s", role, e);
     }
   });
   return templates;

@@ -81,6 +81,18 @@ Alternatively, remove it via the [Apps Script dashboard](https://script.google.c
 
 ### Dependencies
 
-- GitHub repository `giantswarm/feedback-templates` must be public and contain Markdown role templates at the root level (e.g. `generic.md`, `engineer.md`, `manager.md`)
+- GitHub repository `giantswarm/feedback-templates` must be public and contain:
+  - **`roles.json`** — mapping of human-readable role names to template filenames:
+    ```json
+    {
+      "generic":             "generic",
+      "Software Engineer":   "engineer",
+      "Engineering Manager": "manager"
+    }
+    ```
+    Keys must exactly match the option values in the intake form's **Roles** field.
+    Values are filenames in the repo without the `.md` extension.
+  - **`<filename>.md`** — one Markdown template file per role
 - The intake form must collect **Respondent Email** (Form settings → Collect email addresses)
 - The intake form must have fields named exactly: **Name**, **Roles**, **Custom Questions**
+- The **Roles** field options must exactly match the keys in `roles.json`
