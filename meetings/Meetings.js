@@ -341,8 +341,11 @@ function isTeamEvent_(event) {
 
 
 function isSigOrChapterOrSyncEvent_(event) {
+    const hasGroup = (event.attendees || []).find(a => a.email.startsWith('sig-') || a.email.startsWith('wg-') || a.email.startsWith('chapter-') || a.email.startsWith('all@') || a.email.startsWith('giantswarm.io@'));
+    const hasMany = (event.attendees || []).length > 2;
     return /(^|\s)(SIG|chapter|WG|Jour Fixe)(\s|$)/i.test(event.summary)
-        || (event.attendees || []).find(a => a.email.startsWith('sig-') || a.email.startsWith('wg-') || a.email.startsWith('chapter-') || a.email.startsWith('all@') || a.email.startsWith('giantswarm.io@'));
+        || (/(^|\s)(Sync)(\s|$)/i.test(event.summary) && (hasGroup || hasMany))
+        || hasGroup;
 }
 
 
