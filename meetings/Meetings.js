@@ -119,7 +119,7 @@ async function listMeetingStatistic() {
                     if (week != null) {
 
                         let validMeeting = (event?.attendees?.length) > 1;
-                        if (isSigOrChapter_(event)) {
+                        if (isSigOrChapterOrSyncEvent_(event)) {
                             validMeeting = true;
                             stats.durationSig += durationHours;
                         } else if (isOneOnOne_(event, employees, email)) {
@@ -245,7 +245,7 @@ async function shareTeamMeetingArtifacts() {
             const email = employee.attributes.email.value;
 
             // Only process SIG/Chapter/WG events
-            if (!isSigOrChapter_(event)) {
+            if (!isSigOrChapterOrSyncEvent_(event)) {
                 return true;
             }
 
@@ -340,15 +340,16 @@ function isTeamEvent_(event) {
 }
 
 
-function isSigOrChapter_(event) {
-    return /(^|\s)(SIG|chapter|WG)(\s|$)/i.test(event.summary) || (event.attendees || []).find(a => a.email.startsWith('sig-') || a.email.startsWith('wg-') || a.email.startsWith('all@'));
+function isSigOrChapterOrSyncEvent_(event) {
+    return (/(^|\s)(SIG|chapter|WG|Jour Fixe)(\s|$)/i.test(event.summary)
+        || (event.attendees || []).find(a => a.email.startsWith('sig-') || a.email.startsWith('wg-') || a.email.startsWith('chapter-') || a.email.startsWith('all@') || a.email.startsWith('giantswarm.io@'));
 }
 
 
 function isOneOnOne_(event, employees, ownerEmail) {
     return Array.isArray(event.attendees) && event.attendees.length === 2
         && ((Array.isArray(event.recurrence) && event.recurrence.length) || event.recurringEventId)
-        && !isSigOrChapter_(event)
+        && !isSigOrChapterOrSyncEvent_(event)
         && !isTeamEvent_(event)
         && event.attendees.find(attendee => attendee.email === ownerEmail)
         && event.attendees.filter(attendee => employees.find(employee => employee.attributes.email.value === attendee.email)).length === event.attendees.length;
