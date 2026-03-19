@@ -119,7 +119,7 @@ async function listMeetingStatistic() {
                     if (week != null) {
 
                         let validMeeting = (event?.attendees?.length) > 1;
-                        if (isSigOrChapter_(event)) {
+                        if (isSigOrChapterOrSyncEvent_(event)) {
                             validMeeting = true;
                             stats.durationSig += durationHours;
                         } else if (isOneOnOne_(event, employees, email)) {
@@ -224,6 +224,18 @@ async function shareTeamMeetingArtifacts() {
         return;
     }
 
+    // limit to 2 weeks in the past (performance, guard against reposting old meets on filter change)
+    const fetchTimeMin = Util.addDateMillies(new Date(), -14 * 24 * 60 * 60 * 1000);
+    fetchTimeMin.setUTCHours(24, 0, 0, 0); // round up to end of day
+
+    // limit Google Calendar events fetch up until today (performance)
+    const fetchTimeMax = Util.addDateMillies(new Date(), 24 * 60 * 60 * 1000);
+    fetchTimeMax.setUTCHours(24, 0, 0, 0); // round up to end of day
+    const listEventParams = {
+        timeMin: fetchTimeMin.toISOString(),
+        timeMax: fetchTimeMax.toISOString(),
+    };
+
     let hits = 0;
     let hits_published = 0;
     const teamMeetingsCalendarId = getScriptProperties_().getProperty(TEAM_MEETINGS_CALENDAR) || '';
@@ -233,7 +245,7 @@ async function shareTeamMeetingArtifacts() {
             const email = employee.attributes.email.value;
 
             // Only process SIG/Chapter/WG events
-            if (!isSigOrChapter_(event)) {
+            if (!isSigOrChapterOrSyncEvent_(event)) {
                 return true;
             }
 
@@ -247,15 +259,23 @@ async function shareTeamMeetingArtifacts() {
                 return true;
             }
 
+            // Skip events that haven't ended yet - future events can't have legitimate
+            // notes/recordings, and any attachments found would be from a previous occurrence
+            const eventEnd = new Date(event.end?.dateTime || event.end?.date);
+            if (isNaN(eventEnd) || eventEnd > new Date()) {
+                return true;
+            }
+
             const publishedAt = +event.extendedProperties?.private?.attachmentsPublishedAt;
-            if (publishedAt) {
+            const eventStartPlusOneHour = new Date(event.start.dateTime).getTime() + 60 * 60 * 1000;
+            if (publishedAt && publishedAt >= eventStartPlusOneHour) {
                 Logger.log("event " + event.summary + " at " + event.start.dateTime + " already published at " + publishedAt);
                 return true;
             }
 
             const geminiNotes = event.attachments?.find(a => a.mimeType === 'application/vnd.google-apps.document'
-                && a.title?.includes('Notes')
-                && a.title?.includes(event.summary));
+                && a.title?.includes('Notes by Gemini')) || event.attachments?.find(a => a.mimeType === 'application/vnd.google-apps.document'
+                && a.title?.includes('Notes'));
             const recording = event.attachments?.find(a => a.mimeType === 'video/mp4'
                 && a.title?.includes('Recording')
                 && a.title?.includes(event.summary));
@@ -301,7 +321,7 @@ async function shareTeamMeetingArtifacts() {
             }
 
             return true;
-        });
+        }, listEventParams);
     } catch (e) {
         Logger.log("First error while visiting calendar events: " + e);
     }
@@ -320,15 +340,19 @@ function isTeamEvent_(event) {
 }
 
 
-function isSigOrChapter_(event) {
-    return /(^|\s)(SIG|chapter|WG)(\s|$)/i.test(event.summary) || (event.attendees || []).find(a => a.email.startsWith('sig-') || a.email.startsWith('wg-') || a.email.startsWith('all@'));
+function isSigOrChapterOrSyncEvent_(event) {
+    const hasGroup = (event.attendees || []).find(a => a.email.startsWith('sig-') || a.email.startsWith('wg-') || a.email.startsWith('chapter-') || a.email.startsWith('all@') || a.email.startsWith('giantswarm.io@'));
+    const hasMany = (event.attendees || []).length > 2;
+    return /(^|\s)(SIG|chapter|WG|Jour Fixe)(\s|$)/i.test(event.summary)
+        || (/(^|\s)(Sync)(\s|$)/i.test(event.summary) && (hasGroup || hasMany))
+        || hasGroup;
 }
 
 
 function isOneOnOne_(event, employees, ownerEmail) {
     return Array.isArray(event.attendees) && event.attendees.length === 2
         && ((Array.isArray(event.recurrence) && event.recurrence.length) || event.recurringEventId)
-        && !isSigOrChapter_(event)
+        && !isSigOrChapterOrSyncEvent_(event)
         && !isTeamEvent_(event)
         && event.attendees.find(attendee => attendee.email === ownerEmail)
         && event.attendees.filter(attendee => employees.find(employee => employee.attributes.email.value === attendee.email)).length === event.attendees.length;
@@ -561,7 +585,7 @@ async function visitEvents_(visitor, listParams) {
         employee.attributes.status.value !== 'inactive' && isEmailAllowed(employee.attributes.email.value)
     );
 
-    Logger.log('Visiting events between %s and %s for %s accounts', fetchTimeMin.toISOString(), fetchTimeMax.toISOString(), '' + employees.length);
+    Logger.log('Visiting events between %s and %s for %s accounts', listParams?.timeMin || fetchTimeMin.toISOString(), listParams?.timeMax || fetchTimeMax.toISOString(), '' + employees.length);
 
     let firstError = null;
     let processedCount = 0;
