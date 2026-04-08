@@ -10,6 +10,8 @@ const FORM_ID_KEY = PROPERTY_PREFIX + "formId";
 
 const FOLDER_ID_KEY = PROPERTY_PREFIX + "folderId";
 
+const RESPONSES_SHEET_ID_KEY = PROPERTY_PREFIX + "responsesSheetId";
+
 /**
  * Convenience function to configure script properties.
  *
@@ -37,23 +39,220 @@ function install() {
     .forForm(formId)
     .onFormSubmit()
     .create();
-
   Logger.log("Installed onFormSubmit trigger for form %s", formId);
+
+  const responsesSheetId = PropertiesService.getScriptProperties().getProperty(RESPONSES_SHEET_ID_KEY);
+  if (responsesSheetId) {
+    ScriptApp.newTrigger("onFeedbackResponseReceived")
+      .forSpreadsheet(responsesSheetId)
+      .onFormSubmit()
+      .create();
+    Logger.log("Installed onFeedbackResponseReceived trigger for spreadsheet %s", responsesSheetId);
+  }
 }
 
 /**
- * Remove all onFormSubmit triggers installed by this project.
+ * Remove stale ScriptProperties entries for forms and sheets that no longer exist.
+ * Safe to run at any time — active entries are left untouched.
+ *
+ * USAGE:
+ *   clasp run 'cleanup'
+ */
+/**
+ * Returns true if the form file is trashed or inaccessible.
+ * Uses the Drive API v3 directly so the result is authoritative regardless of
+ * which Google account owns the Trash (DriveApp.isTrashed() is user-scoped).
+ */
+function isFormStale_(formId) {
+  try {
+    const resp = UrlFetchApp.fetch(
+      "https://www.googleapis.com/drive/v3/files/" + formId + "?fields=trashed",
+      { headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+        muteHttpExceptions: true }
+    );
+    if (resp.getResponseCode() !== 200) return true; // 403/404 → inaccessible
+    return JSON.parse(resp.getContentText()).trashed === true;
+  } catch (e) {
+    return true;
+  }
+}
+
+function cleanup() {
+  const props = PropertiesService.getScriptProperties();
+  const allProps = props.getProperties();
+  const toDelete = [];
+
+  const responsesSheetId = allProps[RESPONSES_SHEET_ID_KEY];
+  const ss = responsesSheetId ? SpreadsheetApp.openById(responsesSheetId) : null;
+  const existingSheets = ss ? ss.getSheets() : [];
+  const existingSheetIds = new Set(existingSheets.map(s => String(s.getSheetId())));
+
+  Object.keys(allProps).forEach(key => {
+    if (key.startsWith(PROPERTY_PREFIX + "notify.")) {
+      const sheetId = key.slice((PROPERTY_PREFIX + "notify.").length);
+      if (!existingSheetIds.has(sheetId)) {
+        toDelete.push(key);
+        Logger.log("Removing stale notify entry for missing sheet %s", sheetId);
+      } else {
+        // Sheet exists — check if its form is still properly linked to this spreadsheet.
+        // A form in Trash is still "accessible" but stale; a permanently deleted form throws.
+        const [, formId] = allProps[key].split("|");  // format: email|formId|formTitle
+        let stale = false;
+        if (isFormStale_(formId)) {
+          stale = true;
+        } else {
+          try {
+            const form = FormApp.openById(formId);
+            stale = form.getDestinationType() !== FormApp.DestinationType.SPREADSHEET
+              || form.getDestinationId() !== responsesSheetId;
+          } catch (e) {
+            stale = true;
+          }
+        }
+        if (stale) {
+          toDelete.push(key);
+          Logger.log("Removing stale notify entry for form %s", formId);
+          const sheet = existingSheets.find(s => String(s.getSheetId()) === sheetId);
+          if (sheet) {
+            try { FormApp.openById(formId).removeDestination(); } catch (e) {}
+            try {
+              ss.deleteSheet(sheet);
+              Logger.log("Deleted orphaned response sheet %s", sheetId);
+            } catch (e) {
+              Logger.log("Could not delete orphaned sheet %s: %s", sheetId, e);
+            }
+          }
+        }
+      }
+    } else if (key.startsWith(PROPERTY_PREFIX + "pendingNotify.")) {
+      const formId = key.slice((PROPERTY_PREFIX + "pendingNotify.").length);
+      let stale = false;
+      if (isFormStale_(formId)) {
+        stale = true;
+      } else {
+        try {
+          const form = FormApp.openById(formId);
+          stale = form.getDestinationType() !== FormApp.DestinationType.SPREADSHEET
+            || form.getDestinationId() !== responsesSheetId;
+        } catch (e) {
+          stale = true;
+        }
+      }
+      if (stale) {
+        toDelete.push(key);
+        Logger.log("Removing stale pendingNotify entry for form %s", formId);
+        if (ss) {
+          const linkedSheet = existingSheets.find(s => {
+            const url = s.getFormUrl();
+            return url && url.includes(formId);
+          });
+          if (linkedSheet) {
+            try { FormApp.openById(formId).removeDestination(); } catch (e) {}
+            try {
+              ss.deleteSheet(linkedSheet);
+              Logger.log("Deleted orphaned sheet '%s' for pending form %s", linkedSheet.getName(), formId);
+            } catch (e) {
+              Logger.log("Could not delete sheet for pending form %s: %s", formId, e);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  toDelete.forEach(key => props.deleteProperty(key));
+  Logger.log("Cleanup complete. Removed %d stale entries.", toDelete.length);
+
+  // Fallback: scan all sheets directly for orphaned form links.
+  // Catches sheets with no corresponding ScriptProperty entry (e.g. manually cleaned props,
+  // or forms generated before property tracking was in place).
+  if (ss) {
+    ss.getSheets().forEach(sheet => {
+      const formUrl = sheet.getFormUrl();
+      if (!formUrl) return;
+      const match = formUrl.match(/\/forms\/d\/([^/]+)\//);
+      const linkedFormId = match && match[1];
+      if (!linkedFormId || !isFormStale_(linkedFormId)) return;
+      // Unlink first (automation is owner, so removeDestination always succeeds).
+      try { FormApp.openById(linkedFormId).removeDestination(); } catch (e) {}
+      try {
+        ss.deleteSheet(sheet);
+        Logger.log("Deleted orphaned sheet '%s'", sheet.getName());
+      } catch (e) {
+        Logger.log("Could not delete sheet '%s': %s", sheet.getName(), e);
+      }
+    });
+  }
+}
+
+/**
+ * Remove all triggers installed by this project.
  *
  * USAGE:
  *   clasp run 'uninstall'
  */
 function uninstall() {
+  const managed = ["onFormSubmit", "onFeedbackResponseReceived"];
   ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === "onFormSubmit")
+    .filter(t => managed.includes(t.getHandlerFunction()))
     .forEach(t => {
       ScriptApp.deleteTrigger(t);
       Logger.log("Uninstalled trigger for %s", t.getHandlerFunction());
     });
+}
+
+/**
+ * Fires immediately when someone submits a response to any generated feedback form.
+ * Triggered via the responses spreadsheet (push-based, no polling).
+ * All generated forms share one spreadsheet; each form gets its own tab.
+ *
+ * Fast path: notify.<sheetId> already resolved (all responses after the first).
+ * Resolve path: first response — use sheet.getFormUrl() to find the linked form,
+ *   match against pendingNotify.<formId>, cache the result, then notify.
+ */
+function onFeedbackResponseReceived(e) {
+  const sheet = e.range.getSheet();
+  const sheetId = sheet.getSheetId();
+  const notifyKey = PROPERTY_PREFIX + "notify." + sheetId;
+  const props = PropertiesService.getScriptProperties();
+
+  let value = props.getProperty(notifyKey);
+
+  if (!value) {
+    // First response for this sheet — resolve via the sheet's linked form URL.
+    const formUrl = sheet.getFormUrl();
+    const match = formUrl && formUrl.match(/\/forms\/d\/([^/]+)\//);
+    const linkedFormId = match && match[1];
+
+    if (linkedFormId) {
+      const pendingKey = PROPERTY_PREFIX + "pendingNotify." + linkedFormId;
+      const pendingValue = props.getProperty(pendingKey);
+      if (pendingValue) {
+        const [coordinatorEmail, formTitle] = pendingValue.split("|");
+        value = coordinatorEmail + "|" + linkedFormId + "|" + formTitle;
+        props.setProperty(notifyKey, value);
+        props.deleteProperty(pendingKey);
+        Logger.log("Resolved pending notification for form %s → sheet %s", linkedFormId, sheetId);
+      }
+    }
+  }
+
+  if (!value) {
+    Logger.log("No coordinator info found for sheet %s (%s), skipping", sheetId, sheet.getName());
+    return;
+  }
+
+  const parts = value.split("|");
+  const coordinatorEmail = parts[0];
+  const formId = parts[1];
+  const formTitle = parts[2] || "a feedback form";
+  const editUrl = "https://docs.google.com/forms/d/" + formId + "/edit#responses";
+
+  MailApp.sendEmail({
+    to: coordinatorEmail,
+    subject: "New feedback response received: " + formTitle,
+    htmlBody: `Someone submitted a response to <a href="${editUrl}">${formTitle}</a>.`
+  });
 }
 
 /**
@@ -104,7 +303,18 @@ function onFormSubmit(e) {
     formFile.moveTo(DriveApp.getFolderById(folderId));
   }
 
-  formFile.setOwner(email);
+  // Link form to the shared responses spreadsheet and register for push notifications.
+  // Resolution of the sheet tab is deferred to the first response (onFeedbackResponseReceived)
+  // via sheet.getFormUrl(), avoiding unreliable SpreadsheetApp caching issues.
+  const responsesSheetId = PropertiesService.getScriptProperties().getProperty(RESPONSES_SHEET_ID_KEY);
+  if (responsesSheetId) {
+    form.setDestination(FormApp.DestinationType.SPREADSHEET, responsesSheetId);
+    PropertiesService.getScriptProperties().setProperty(
+      PROPERTY_PREFIX + "pendingNotify." + form.getId(), email + "|Feedback for " + employeeName
+    );
+  }
+
+  form.addEditor(email);
 
   MailApp.sendEmail({
     to: email,

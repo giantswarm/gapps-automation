@@ -14,10 +14,11 @@ Generates personalised feedback forms on demand. When a coordinator submits the 
 
 Configure via Script Properties (use `setProperties` or the Apps Script UI):
 
-| Mandatory | Property Key                  | Value Example                                       |
-|-----------|-------------------------------|-----------------------------------------------------|
-| **yes**   | `EmployeeFeedback.formId`     | `1FAIpQLSe...` (ID from the intake form URL)        |
-| no        | `EmployeeFeedback.folderId`   | `1a2B3c...` (Drive folder ID to store output forms) |
+| Mandatory | Property Key                          | Value Example                                                      |
+|-----------|---------------------------------------|--------------------------------------------------------------------|
+| **yes**   | `EmployeeFeedback.formId`             | `1FAIpQLSe...` (ID from the intake form URL)                       |
+| no        | `EmployeeFeedback.folderId`           | `1a2B3c...` (Drive folder ID to store output forms)               |
+| no        | `EmployeeFeedback.responsesSheetId`   | `1a2B3c...` (Drive spreadsheet ID to collect responses and enable push notifications) |
 
 The form ID is the long string in the Google Form URL:
 `https://docs.google.com/forms/d/**<FORM_ID>**/edit`
