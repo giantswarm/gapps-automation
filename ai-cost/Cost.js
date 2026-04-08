@@ -53,19 +53,30 @@ const OPENAI_PRICING = {
  * Existing rows for the fetched dates are replaced (de-duplicated), all other rows are preserved.
  */
 function fetchAiCosts() {
-
-    const props = getScriptProperties_();
-    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-
-    const anthropicKey = props.getProperty(ANTHROPIC_ADMIN_KEY_PROP) || '';
-    const openaiKey = props.getProperty(OPENAI_ADMIN_KEY_PROP) || '';
-
     const endDate = defaultEndDate_();
     // Start one day before today so that all sources (including cost endpoints
     // that only report completed days) cover the same date range for dedup.
     const d = new Date(toIso8601_(defaultStartDate_()));
     d.setUTCDate(d.getUTCDate() - 1);
     const startDate = d.toISOString().slice(0, 10);
+
+    fetchAiCostsForRange_(startDate, endDate);
+}
+
+function backfillAiCosts(startDate, endDate) {
+    if (!startDate || !endDate) {
+        throw new Error('startDate and endDate are required (YYYY-MM-DD, endDate exclusive)');
+    }
+    fetchAiCostsForRange_(startDate, endDate);
+}
+
+function fetchAiCostsForRange_(startDate, endDate) {
+
+    const props = getScriptProperties_();
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+
+    const anthropicKey = props.getProperty(ANTHROPIC_ADMIN_KEY_PROP) || '';
+    const openaiKey = props.getProperty(OPENAI_ADMIN_KEY_PROP) || '';
 
     Logger.log('Fetching AI costs for %s to %s', startDate, endDate);
 
@@ -292,7 +303,7 @@ function fetchAnthropicUsage_(apiKey, startDate, endDate) {
             }
             return rows;
         },
-        function(json) { return json.has_more ? json.next_page : null; }
+        function(json) { return json.has_more ? url + '&page=' + encodeURIComponent(json.next_page) : null; }
     );
 }
 
@@ -318,7 +329,7 @@ function fetchAnthropicCosts_(apiKey, startDate, endDate) {
             }
             return rows;
         },
-        function(json) { return json.has_more ? json.next_page : null; }
+        function(json) { return json.has_more ? url + '&page=' + encodeURIComponent(json.next_page) : null; }
     );
 }
 
@@ -331,8 +342,9 @@ function fetchClaudeCodeUsage_(apiKey, startDate, endDate) {
 
     for (const day of days) {
         Logger.log('  Claude Code: fetching day %s', day);
+        const ccUrl = ANTHROPIC_BASE + '/v1/organizations/usage_report/claude_code?starting_at=' + day + '&limit=1000';
         const dayRows = fetchAllPages_(
-            ANTHROPIC_BASE + '/v1/organizations/usage_report/claude_code?starting_at=' + day + '&limit=1000',
+            ccUrl,
             anthropicHeaders_(apiKey),
             function(json) {
                 const rows = [];
@@ -379,7 +391,7 @@ function fetchClaudeCodeUsage_(apiKey, startDate, endDate) {
                 }
                 return rows;
             },
-            function(json) { return json.has_more ? json.next_page : null; }
+            function(json) { return json.has_more ? ccUrl + '&page=' + encodeURIComponent(json.next_page) : null; }
         );
         allRows.push(...dayRows);
     }
@@ -420,7 +432,7 @@ function fetchOpenaiUsage_(apiKey, startDate, endDate) {
             }
             return rows;
         },
-        function(json) { return json.has_more && json.next_page ? json.next_page : null; }
+        function(json) { return json.has_more && json.next_page ? url + '&page=' + encodeURIComponent(json.next_page) : null; }
     );
 }
 
@@ -446,7 +458,7 @@ function fetchOpenaiCosts_(apiKey, startDate, endDate) {
             }
             return rows;
         },
-        function(json) { return json.has_more && json.next_page ? json.next_page : null; }
+        function(json) { return json.has_more && json.next_page ? url + '&page=' + encodeURIComponent(json.next_page) : null; }
     );
 }
 
