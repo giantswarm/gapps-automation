@@ -12,6 +12,7 @@ The following configuration properties are available:
 |-----------|------------------------------------|-------------------------------------------------|
 | **yes**   | Meetings.personioToken             | `CLIENT_ID&#124;CLIENT_SECRET`                  |
 | **yes**   | Meetings.serviceAccountCredentials | `{SERVICE_ACCOUNT_CREDENTIALS_FILE_CONTENT...}` |
+| no        | Meetings.artifactsFolderId         | `{TARGET_FOLDER_ID_FOR_MEET_ARTIFACTS}`         |
 | no        | Meetings.allowedDomains            | `giantswarm.io,giantswarm.com`                  |
 | no        | Meetings.emailWhiteList            | `jonas@giantswarm.io,marcel@giantswarm.io`      |
 | no        | Meetings.lookaheadDays             | `180`                                           |
