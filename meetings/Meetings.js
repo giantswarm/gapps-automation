@@ -489,8 +489,8 @@ Note: Only include this section if any of the following apply:
 
 🎯 Skip this section entirely if there's nothing impactful to highlight - this isn't about logging everyone's contributions.
 
-If you do include this section, format each entry as:
-• <@{{SlackUserID}}> – {{Brief description of their assigned task, key decision, or flagged blocker}}
+If you do include this section, use the correct mention using the Slack user ID (see lookup table below) and format each entry as:
+• <@{{$SLACK_USER_ID}}> – {{Brief description of their assigned task, key decision, or flagged blocker}}
 
 Keep it short and outcome-focused. Only mention people with specific, actionable contributions.
 
@@ -500,8 +500,11 @@ Guidelines:
 - Use clear, simple language
 - Only output the sections above, nothing else
 
-Name to Slack mention mapping in the format "{{Display Name}} -> <@{{SlackUserID}}>" for employees, for replacing names with mentions:
+Name to Slack user ID lookup table (format "$DISPLAY_NAME -> $SLACK_USER_ID") for all employees:
+<lookup_begin>
 ${await nameToSlackHandleMapping()}
+</lookup_end>
+
 ${glossary ? `
 Company terminology glossary — use this to correct any misspelled or misunderstood terms (e.g. from speech-to-text errors) in your summary:
 ${glossary}` : ''}`;
