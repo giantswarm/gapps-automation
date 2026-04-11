@@ -30,7 +30,7 @@ jobs:
       - name: Set Test Matrix
         id: set_test_matrix
         run: |
-          echo "test_matrix={\"include\":["$(ls -1 ./tests | grep -E '.*\.m?js' | jq -jcnR '{"test":[inputs | select(length>0)][]}' | sed 's/}{/},{/g')"]}" >> $GITHUB_OUTPUT
+          echo "test_matrix={\"include\":["$(ls -1 ./tests | grep -E '^[a-zA-Z0-9._-]*\.m?js$' | jq -jcnR '{"test":[inputs | select(length>0)][]}' | sed 's/}{/},{/g')"]}" >> $GITHUB_OUTPUT
   test_lib:
     name: Test Library
     needs:
