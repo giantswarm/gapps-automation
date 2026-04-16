@@ -435,7 +435,7 @@ async function summarizeAndPostToSlack_(event, geminiNotes, recording, drive, em
         const eventDate = new Date(event.start.dateTime || event.start.date);
         const formattedDate = Utilities.formatDate(eventDate, Session.getScriptTimeZone(), 'dd/MM/yy');
 
-        const nameToSlackHandleMapping = async () => {
+        const nameToSlackMentionMapping = async () => {
             // Use all active employees instead of event.attendees (which may be incomplete)
             const employeeEmails = employees.map(emp => emp.attributes.email.value).filter(Boolean);
             if (employeeEmails.length === 0) {
@@ -490,7 +490,7 @@ Note: Only include this section if any of the following apply:
 🎯 Skip this section entirely if there's nothing impactful to highlight - this isn't about logging everyone's contributions.
 
 If you do include this section, use the correct mention using the Slack user ID (see lookup table below) and format each entry as:
-• <@{{$SLACK_USER_ID}}> – {{Brief description of their assigned task, key decision, or flagged blocker}}
+• <@{{$SLACK_MENTION}}> – {{Brief description of their assigned task, key decision, or flagged blocker}}
 
 Keep it short and outcome-focused. Only mention people with specific, actionable contributions.
 
@@ -500,14 +500,16 @@ Guidelines:
 - Use clear, simple language
 - Only output the sections above, nothing else
 
-Name to Slack user ID lookup table (format "$DISPLAY_NAME -> $SLACK_USER_ID") for all employees:
-<lookup_begin>
-${await nameToSlackHandleMapping()}
-</lookup_end>
+Name to Slack user ID lookup table (format "$DISPLAY_NAME -> $SLACK_MENTION") for all employees:
+<slack_mention_lookup_begin>
+${await nameToSlackMentionMapping()}
+</slack_mention_lookup_end>
 
 ${glossary ? `
 Company terminology glossary — use this to correct any misspelled or misunderstood terms (e.g. from speech-to-text errors) in your summary:
-${glossary}` : ''}`;
+<glossary_end>
+${glossary}
+</glossary_end>` : ''}`;
 
         // Summarize the document
         const summaryContent = await gemini.summarizeGoogleDoc(notesFileId, prompt, drive);
