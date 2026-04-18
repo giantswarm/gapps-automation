@@ -54,10 +54,10 @@ const OPENAI_PRICING = {
  */
 function fetchAiCosts() {
     const endDate = defaultEndDate_();
-    // Start one day before today so that all sources (including cost endpoints
-    // that only report completed days) cover the same date range for dedup.
+    // Query the last 7 days to account for reporting delays in analytics/cost
+    // APIs.  Rows are de-duplicated by (date, source).
     const d = new Date(toIso8601_(defaultStartDate_()));
-    d.setUTCDate(d.getUTCDate() - 1);
+    d.setUTCDate(d.getUTCDate() - 6);
     const startDate = d.toISOString().slice(0, 10);
 
     fetchAiCostsForRange_(startDate, endDate);
@@ -130,15 +130,15 @@ function fetchAiCostsForRange_(startDate, endDate) {
         Logger.log('Skipping openai: %s not set', OPENAI_ADMIN_KEY_PROP);
     }
 
-    // Collect dates present in fetched data
-    const fetchedDates = new Set();
+    // Collect (date, source) keys present in fetched data for targeted dedup
+    const fetchedKeys = new Set();
     for (const row of rows) {
-        fetchedDates.add(row.date);
+        fetchedKeys.add(row.date + '|' + row.source);
     }
 
     if (rows.length > 0) {
         rows.sort(function(a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
-        appendToSheet_(spreadsheet, rows, fetchedDates);
+        appendToSheet_(spreadsheet, rows, fetchedKeys);
     }
 
     Logger.log('Done. %s total new rows.', rows.length);
@@ -467,9 +467,9 @@ function fetchOpenaiCosts_(apiKey, startDate, endDate) {
 
 /** Write fetched rows to the target sheet.
  *
- * Removes any existing rows whose date is in fetchedDates, then appends all new rows.
+ * Removes any existing rows whose (date, source) key is in fetchedKeys, then appends all new rows.
  */
-function appendToSheet_(spreadsheet, newRows, fetchedDates) {
+function appendToSheet_(spreadsheet, newRows, fetchedKeys) {
     const sheet = SheetUtil.ensureSheet(spreadsheet, 'Data-' + new Date().getUTCFullYear());
 
     let lastRow = sheet.getLastRow();
@@ -480,22 +480,24 @@ function appendToSheet_(spreadsheet, newRows, fetchedDates) {
         lastRow = 1;
     }
 
-    // Remove existing rows for the fetched dates (contiguous ranges, bottom-to-top)
-    if (lastRow > 1 && fetchedDates.size > 0) {
+    // Remove existing rows matching fetched (date, source) keys (contiguous ranges, bottom-to-top)
+    if (lastRow > 1 && fetchedKeys.size > 0) {
         const tz = spreadsheet.getSpreadsheetTimeZone();
-        const dates = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
-        let i = dates.length - 1;
+        const data = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+        let i = data.length - 1;
         while (i >= 0) {
-            const val = dates[i][0];
+            const val = data[i][0];
             const dateStr = val instanceof Date
                 ? Utilities.formatDate(val, tz, 'yyyy-MM-dd') : String(val);
-            if (fetchedDates.has(dateStr)) {
+            const key = dateStr + '|' + String(data[i][1]);
+            if (fetchedKeys.has(key)) {
                 const rangeEnd = i;
                 while (i > 0) {
-                    const prev = dates[i - 1][0];
+                    const prev = data[i - 1][0];
                     const prevStr = prev instanceof Date
                         ? Utilities.formatDate(prev, tz, 'yyyy-MM-dd') : String(prev);
-                    if (!fetchedDates.has(prevStr)) break;
+                    const prevKey = prevStr + '|' + String(data[i - 1][1]);
+                    if (!fetchedKeys.has(prevKey)) break;
                     i--;
                 }
                 sheet.deleteRows(i + 2, rangeEnd - i + 1);
