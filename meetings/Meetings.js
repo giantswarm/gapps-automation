@@ -221,6 +221,201 @@ async function listMeetings() {
 }
 
 
+/** Debug helper for shareTeamMeetingArtifacts that collects event filtering information. */
+async function debugShareTeamMeetingArtifacts() {
+    const shareDomainName = getScriptProperties_().getProperty(SHARE_DOMAIN_NAME) || '';
+
+    const fetchTimeMin = Util.addDateMillies(new Date(), -14 * 24 * 60 * 60 * 1000);
+    fetchTimeMin.setUTCHours(24, 0, 0, 0);
+
+    const fetchTimeMax = Util.addDateMillies(new Date(), 24 * 60 * 60 * 1000);
+    fetchTimeMax.setUTCHours(24, 0, 0, 0);
+    const listEventParams = {
+        timeMin: fetchTimeMin.toISOString(),
+        timeMax: fetchTimeMax.toISOString(),
+    };
+
+    const teamMeetingsCalendarId = getScriptProperties_().getProperty(TEAM_MEETINGS_CALENDAR) || '';
+
+    // Map of event.summary to {event, reason}
+    const eventMap = {};
+
+    // Track events by unique ID to see if creator ever matches a calendar owner
+    const eventCreatorTracking = {}; // iCalUID -> { summary, creator, seenAsOwner: boolean, start }
+
+    try {
+        await visitEvents_(async (event, employee, employees, calendar, personio) => {
+            const email = employee.attributes.email.value;
+            const summary = event.summary || 'Untitled Event';
+            const eventId = event.iCalUID || event.id;
+
+            if (!shareDomainName) {
+                return true;
+            }
+
+            if (teamMeetingsCalendarId && event?.organizer?.email !== teamMeetingsCalendarId) {
+                return true;
+            }
+
+            const eventEnd = new Date(event.end?.dateTime || event.end?.date);
+            if (isNaN(eventEnd) || eventEnd > new Date()) {
+                return true;
+            }
+
+            const eventStart = new Date(event.start?.dateTime || event.start?.date);
+            if (isNaN(eventStart) || eventStart < fetchTimeMin || eventStart > fetchTimeMax) {
+                return true;
+            }
+
+            // Track this event across all visits
+            if (!eventCreatorTracking[eventId]) {
+                eventCreatorTracking[eventId] = {
+                    summary: summary,
+                    creator: event?.creator?.email,
+                    organizer: event?.organizer?.email,
+                    start: event.start?.dateTime || event.start?.date,
+                    seenAsOwner: false
+                };
+            }
+
+            if (event?.creator?.email !== email) {
+                return true;
+            }
+
+            // Mark that we've seen this event where the creator is the calendar owner
+            eventCreatorTracking[eventId].seenAsOwner = true;
+
+            // Check each filter condition in order
+            if (!isSigOrChapterOrSyncEvent_(event)) {
+                // Provide detailed breakdown matching the updated isSigOrChapterOrSyncEvent_ logic
+                const summaryMatchSigChapterWg = /(^|\s)(SIG|chapter|WG|Jour Fixe|Weekly)(\s|$)/i.test(event.summary);
+                const summaryMatchSync = /(^|\s)(Sync)(\s|$)/i.test(event.summary);
+                const hasGroup = (event.attendees || []).find(a =>
+                    a.email.startsWith('sig-') ||
+                    a.email.startsWith('wg-') ||
+                    a.email.startsWith('chapter-') ||
+                    a.email.startsWith('all@') ||
+                    a.email.startsWith('giantswarm.io@')
+                );
+                const hasMany = (event.attendees || []).length > 2;
+                const attendeeEmails = (event.attendees || []).map(a => a.email).join(', ');
+
+                const details = [];
+                details.push(`summary: "${event.summary}"`);
+                details.push(`summaryMatchSigChapterWg: ${summaryMatchSigChapterWg}`);
+                details.push(`summaryMatchSync: ${summaryMatchSync}`);
+                details.push(`hasGroup: ${!!hasGroup}${hasGroup ? ` (${hasGroup.email})` : ''}`);
+                details.push(`hasMany: ${hasMany} (${(event.attendees || []).length} attendees)`);
+                details.push(`attendees: ${attendeeEmails || 'none'}`);
+
+                updateEventMap_(eventMap, summary, event, `Excluded: Not a SIG/Chapter/WG event - ${details.join('; ')}`);
+                return true;
+            }
+
+            const publishedAt = +event.extendedProperties?.private?.attachmentsPublishedAt;
+            const eventStartPlusOneHour = new Date(event.start.dateTime).getTime() + 60 * 60 * 1000;
+            if (publishedAt && publishedAt >= eventStartPlusOneHour) {
+                updateEventMap_(eventMap, summary, event, `Excluded: Already published at ${new Date(publishedAt).toISOString()}`);
+                return true;
+            }
+
+            const geminiNotes = event.attachments?.find(a => a.mimeType === 'application/vnd.google-apps.document'
+                && a.title?.includes('Notes by Gemini')) || event.attachments?.find(a => a.mimeType === 'application/vnd.google-apps.document'
+                && a.title?.includes('Notes'));
+            const recording = event.attachments?.find(a => a.mimeType === 'video/mp4'
+                && a.title?.includes('Recording')
+                && a.title?.includes(event.summary));
+
+            if (!geminiNotes && !recording) {
+                updateEventMap_(eventMap, summary, event, 'Excluded: No Gemini notes or recording found');
+                return true;
+            } else if (!geminiNotes) {
+                updateEventMap_(eventMap, summary, event, `Excluded: No Gemini notes found (recording: ${recording?.title || 'none'})`);
+                return true;
+            } else if (!recording) {
+                updateEventMap_(eventMap, summary, event, `Excluded: No recording found (notes: ${geminiNotes?.title || 'none'})`);
+                return true;
+            }
+
+            // All checks passed - would be shared
+            updateEventMap_(eventMap, summary, event, `Included: Would share artifacts (notes: ${geminiNotes.title}, recording: ${recording.title})`);
+
+            return true;
+        }, listEventParams);
+    } catch (e) {
+        Logger.log("Error while analyzing events: " + e);
+    }
+
+    // Find events that passed SIG/Chapter filter but creator never matched any calendar owner
+    const neverOwnedByCreator = Object.entries(eventCreatorTracking)
+        .filter(([id, info]) => !info.seenAsOwner)
+        .map(([id, info]) => ({
+            summary: info.summary,
+            creator: info.creator,
+            organizer: info.organizer,
+            start: info.start
+        }));
+
+    // Log each event individually (one line per event)
+    // Filter out events outside the query time range
+    Logger.log("=== Events by Name (most recent occurrence) ===");
+    for (const [summary, data] of Object.entries(eventMap)) {
+        const eventStart = new Date(data.event.start);
+        if (eventStart >= fetchTimeMin && eventStart <= fetchTimeMax) {
+            Logger.log(JSON.stringify({ summary, event: data.event, reason: data.reason }));
+        }
+    }
+
+    Logger.log("=== Events Without Creator ===");
+    for (const event of neverOwnedByCreator) {
+        const eventStart = new Date(event.start);
+        if (eventStart >= fetchTimeMin && eventStart <= fetchTimeMax) {
+            Logger.log(JSON.stringify(event));
+        }
+    }
+
+    Logger.log("=== Stats ===");
+    Logger.log(JSON.stringify({
+        totalUniqueEvents: Object.keys(eventCreatorTracking).length,
+        eventsWithoutCreator: neverOwnedByCreator.length
+    }));
+}
+
+
+/** Helper to update event map with most recent event for each summary. */
+function updateEventMap_(eventMap, summary, event, reason) {
+    const eventStart = new Date(event.start?.dateTime || event.start?.date);
+
+    if (!eventMap[summary]) {
+        eventMap[summary] = {
+            event: {
+                start: event.start?.dateTime || event.start?.date,
+                end: event.end?.dateTime || event.end?.date,
+                creator: event.creator?.email,
+                organizer: event.organizer?.email,
+                attachments: event.attachments?.length || 0
+            },
+            reason: reason
+        };
+    } else {
+        // Update if this event is more recent
+        const existingStart = new Date(eventMap[summary].event.start);
+        if (eventStart > existingStart) {
+            eventMap[summary] = {
+                event: {
+                    start: event.start?.dateTime || event.start?.date,
+                    end: event.end?.dateTime || event.end?.date,
+                    creator: event.creator?.email,
+                    organizer: event.organizer?.email,
+                    attachments: event.attachments?.length || 0
+                },
+                reason: reason
+            };
+        }
+    }
+}
+
+
 /** Share team meeting artifacts with the organization. */
 async function shareTeamMeetingArtifacts() {
 
@@ -281,6 +476,13 @@ async function shareTeamMeetingArtifacts() {
             // notes/recordings, and any attachments found would be from a previous occurrence
             const eventEnd = new Date(event.end?.dateTime || event.end?.date);
             if (isNaN(eventEnd) || eventEnd > new Date()) {
+                return true;
+            }
+
+            // Skip events whose start timestamp is outside the intended query range
+            // (handles recurring events that return with original start date from years ago)
+            const eventStart = new Date(event.start?.dateTime || event.start?.date);
+            if (isNaN(eventStart) || eventStart < fetchTimeMin || eventStart > fetchTimeMax) {
                 return true;
             }
 
@@ -377,10 +579,11 @@ function isTeamEvent_(event) {
 
 
 function isSigOrChapterOrSyncEvent_(event) {
-    const hasGroup = (event.attendees || []).find(a => a.email.startsWith('sig-') || a.email.startsWith('wg-') || a.email.startsWith('chapter-') || a.email.startsWith('all@') || a.email.startsWith('giantswarm.io@'));
+    const emailPrefixes = ['sig-', 'wg-', 'chapter-', 'all@', 'giantswarm.io@'];
+    const hasGroup = event?.attendees?.length && emailPrefixes.some(prefix => event.attendees.some(a => a.email.startsWith(prefix)));
     const hasMany = (event.attendees || []).length > 2;
-    return /(^|\s)(SIG|chapter|WG|Jour Fixe)(\s|$)/i.test(event.summary)
-        || (/(^|\s)(Sync)(\s|$)/i.test(event.summary) && (hasGroup || hasMany))
+    return /(^|\s)(SIG|chapter|WG|Jour Fixe|Weekly)(\s|$)/i.test(event.summary)
+        || (/(^|\s)(Sync)(\s|$)/i.test(event.summary) && hasMany)
         || hasGroup;
 }
 
