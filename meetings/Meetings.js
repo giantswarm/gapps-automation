@@ -52,6 +52,12 @@ const GEMINI_API_KEY = PROPERTY_PREFIX + 'geminiApiKey';
 /** Share domain (domain to share meeting recordings/summaries with). */
 const SHARE_DOMAIN_NAME = PROPERTY_PREFIX + 'shareDomain';
 
+/** Shared Drive folder ID to move meeting artifacts into (optional). */
+const ARTIFACTS_FOLDER_ID = PROPERTY_PREFIX + 'artifactsFolderId';
+
+/** URL to the company glossary for correcting terminology in summaries. */
+const GLOSSARY_URL = 'https://raw.githubusercontent.com/giantswarm/handbook/main/content/docs/glossary/_index.md';
+
 
 /** Build meetings statistic per employee and summarized. */
 async function listMeetingStatistic() {
@@ -414,6 +420,7 @@ function updateEventMap_(eventMap, summary, event, reason) {
 async function shareTeamMeetingArtifacts() {
 
     const shareDomainName = getScriptProperties_().getProperty(SHARE_DOMAIN_NAME) || '';
+    const artifactsFolderId = getScriptProperties_().getProperty(ARTIFACTS_FOLDER_ID) || '';
     if (!shareDomainName) {
         Logger.log('No share domain configured, skipping sharing team meeting artifacts');
         return;
@@ -430,6 +437,17 @@ async function shareTeamMeetingArtifacts() {
         timeMin: fetchTimeMin.toISOString(),
         timeMax: fetchTimeMax.toISOString(),
     };
+
+    // Fetch company glossary once for correcting terminology in summaries
+    let glossary = '';
+    try {
+        const glossaryResponse = UrlFetchApp.fetch(GLOSSARY_URL, { muteHttpExceptions: true });
+        if (glossaryResponse.getResponseCode() === 200) {
+            glossary = glossaryResponse.getContentText();
+        }
+    } catch (e) {
+        Logger.log(`Failed to fetch glossary: ${e}`);
+    }
 
     let hits = 0;
     let hits_published = 0;
@@ -492,24 +510,42 @@ async function shareTeamMeetingArtifacts() {
                 try {
                     const drive = await DriveClientV1.withImpersonatingService(getServiceAccountCredentials_(), email);
 
-                    // Share the Gemini notes document
-                    Logger.log(`Sharing notes ${geminiNotes.fileId} for event ${event.summary}`);
-                    try {
-                        await drive.shareWith(geminiNotes.fileId, 'domain', shareDomainName,'reader', true);
-                    } catch (e) {
-                        Logger.log(`Failed to share notes ${geminiNotes.fileId} (may have been moved already): ${e}`);
-                    }
-
-                    // Share the recording video
-                    Logger.log(`Sharing recording ${recording.fileId} for event ${event.summary}`);
-                    try {
-                        await drive.shareWith(recording.fileId, 'domain', shareDomainName,'reader', true);
-                    } catch (e) {
-                        Logger.log(`Failed to share recording ${recording.fileId} (may have been moved already): ${e}`);
+                    // Move artifacts to shared drive folder (inherits shared drive permissions)
+                    // or share with domain if no folder is configured
+                    if (artifactsFolderId) {
+                        try {
+                            Logger.log(`Moving notes ${geminiNotes.fileId} to folder ${artifactsFolderId}`);
+                            await drive.moveToFolder(geminiNotes.fileId, artifactsFolderId);
+                        } catch (e) {
+                            Logger.log(`Failed to move notes ${geminiNotes.fileId}: ${e}`);
+                            return true;
+                        }
+                        try {
+                            Logger.log(`Moving recording ${recording.fileId} to folder ${artifactsFolderId}`);
+                            await drive.moveToFolder(recording.fileId, artifactsFolderId);
+                        } catch (e) {
+                            Logger.log(`Failed to move recording ${recording.fileId}: ${e}`);
+                            return true;
+                        }
+                    } else {
+                        Logger.log(`Sharing notes ${geminiNotes.fileId} for event ${event.summary}`);
+                        try {
+                            await drive.shareWith(geminiNotes.fileId, 'domain', shareDomainName,'reader', true);
+                        } catch (e) {
+                            Logger.log(`Failed to share notes ${geminiNotes.fileId}: ${e}`);
+                            return true;
+                        }
+                        Logger.log(`Sharing recording ${recording.fileId} for event ${event.summary}`);
+                        try {
+                            await drive.shareWith(recording.fileId, 'domain', shareDomainName,'reader', true);
+                        } catch (e) {
+                            Logger.log(`Failed to share recording ${recording.fileId}: ${e}`);
+                            return true;
+                        }
                     }
 
                     // Summarize and post to Slack
-                    await summarizeAndPostToSlack_(event, geminiNotes, recording, drive, employees);
+                    await summarizeAndPostToSlack_(event, geminiNotes, recording, drive, employees, glossary);
 
                     // Mark as published
                     hits_published++;
@@ -569,8 +605,9 @@ function isOneOnOne_(event, employees, ownerEmail) {
  * @param recording The recording attachment object
  * @param drive The DriveClientV1 instance with access to the documents
  * @param employees The list of active employees from Personio
+ * @param glossary Company glossary markdown for correcting terminology (optional)
  */
-async function summarizeAndPostToSlack_(event, geminiNotes, recording, drive, employees) {
+async function summarizeAndPostToSlack_(event, geminiNotes, recording, drive, employees, glossary) {
     try {
         const geminiApiKey = getGeminiApiKey_();
         const slackBotToken = getSlackBotToken_();
@@ -601,7 +638,7 @@ async function summarizeAndPostToSlack_(event, geminiNotes, recording, drive, em
         const eventDate = new Date(event.start.dateTime || event.start.date);
         const formattedDate = Utilities.formatDate(eventDate, Session.getScriptTimeZone(), 'dd/MM/yy');
 
-        const nameToSlackHandleMapping = async () => {
+        const nameToSlackMentionMapping = async () => {
             // Use all active employees instead of event.attendees (which may be incomplete)
             const employeeEmails = employees.map(emp => emp.attributes.email.value).filter(Boolean);
             if (employeeEmails.length === 0) {
@@ -619,9 +656,9 @@ async function summarizeAndPostToSlack_(event, geminiNotes, recording, drive, em
                         const lastName = employee?.attributes?.last_name?.value || '';
                         const fullName = `${firstName} ${lastName}`.trim();
 
-                        const slackHandle = slackUser.name; // Slack username (without @)
+                        const slackMention = `<@${slackUser.id}>`;
                         const displayName = fullName || slackUser.profile?.display_name || slackUser.real_name || slackUser.name;
-                        mappingLines.push(`${displayName} -> @${slackHandle}`);
+                        mappingLines.push(`${displayName} -> ${slackMention}`);
                     }
                 } catch (e) {
                     Logger.log(`Failed to lookup Slack user for email ${email}: ${e}`);
@@ -655,8 +692,8 @@ Note: Only include this section if any of the following apply:
 
 🎯 Skip this section entirely if there's nothing impactful to highlight - this isn't about logging everyone's contributions.
 
-If you do include this section, format each entry as:
-• @{{SlackHandle}} – {{Brief description of their assigned task, key decision, or flagged blocker}}
+If you do include this section, use the correct mention using the Slack user ID (see lookup table below) and format each entry as:
+• <@{{$SLACK_MENTION}}> – {{Brief description of their assigned task, key decision, or flagged blocker}}
 
 Keep it short and outcome-focused. Only mention people with specific, actionable contributions.
 
@@ -666,8 +703,16 @@ Guidelines:
 - Use clear, simple language
 - Only output the sections above, nothing else
 
-Name to SlackHandle mapping in the format "{{Display Name}} -> @{{SlackHandle}}" for employees, for replacing names with handles:
-${await nameToSlackHandleMapping()}`;
+Name to Slack user ID lookup table (format "$DISPLAY_NAME -> $SLACK_MENTION") for all employees:
+<slack_mention_lookup_begin>
+${await nameToSlackMentionMapping()}
+</slack_mention_lookup_end>
+
+${glossary ? `
+Company terminology glossary — use this to correct any misspelled or misunderstood terms (e.g. from speech-to-text errors) in your summary:
+<glossary_end>
+${glossary}
+</glossary_end>` : ''}`;
 
         // Summarize the document
         const summaryContent = await gemini.summarizeGoogleDoc(notesFileId, prompt, drive);
@@ -950,4 +995,13 @@ function getSlackBotToken_() {
 /** Get the Gemini API key for summarization. */
 function getGeminiApiKey_() {
     return getScriptProperties_().getProperty(GEMINI_API_KEY) || null;
+}
+
+
+/** Set script properties.
+ *
+ * Usage: clasp run 'setProperties' --params '[{"Meetings.artifactsFolderId": "FOLDER_ID"}, false]'
+ */
+function setProperties(properties, deleteAllOthers) {
+    TriggerUtil.setProperties(properties, deleteAllOthers);
 }
