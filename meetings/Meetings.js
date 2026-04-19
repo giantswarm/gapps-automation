@@ -761,13 +761,9 @@ async function postMeetingSummary_(slackClient, channelId, meetingName, date, su
         {
             type: 'divider'
         },
-        {
-            type: 'section',
-            text: {
-                type: 'mrkdwn',
-                text: summaryContent
-            }
-        },
+        // Split summary into multiple section blocks to stay within Slack's
+        // 3000-character limit per section text field.
+        ...splitForSlackBlocks_(summaryContent),
         {
             type: 'divider'
         },
@@ -784,6 +780,74 @@ async function postMeetingSummary_(slackClient, channelId, meetingName, date, su
     const fallbackText = `Meeting Summary: ${meetingName} (${date})`;
 
     await slackClient.postMessage(channelId, fallbackText, blocks);
+}
+
+/** Max characters allowed in a single Slack section block text field. */
+const SLACK_SECTION_TEXT_LIMIT = 3000;
+
+/** Split text into Slack section blocks, each within the character limit.
+ *
+ *  Splits on paragraph boundaries (\n\n), merges small paragraphs into
+ *  chunks that fit, and as a last resort splits on single newlines.
+ */
+function splitForSlackBlocks_(text) {
+    if (text.length <= SLACK_SECTION_TEXT_LIMIT) {
+        return [{ type: 'section', text: { type: 'mrkdwn', text: text } }];
+    }
+
+    // Split on paragraph boundaries and merge small paragraphs into chunks that fit
+    const paragraphs = text.split(/\n\n+/).filter(function(s) { return s.length > 0; });
+    const chunks = [];
+    let buffer = '';
+    for (const para of paragraphs) {
+        const separator = buffer ? '\n\n' : '';
+        if (buffer.length + separator.length + para.length <= SLACK_SECTION_TEXT_LIMIT) {
+            buffer += separator + para;
+        } else {
+            if (buffer) chunks.push(buffer);
+            buffer = para;
+        }
+    }
+    if (buffer) chunks.push(buffer);
+
+    // Further split any chunk that still exceeds the limit (single huge paragraph)
+    const finalChunks = [];
+    for (const chunk of chunks) {
+        if (chunk.length <= SLACK_SECTION_TEXT_LIMIT) {
+            finalChunks.push(chunk);
+        } else {
+            finalChunks.push(...splitOnBoundary_(chunk, SLACK_SECTION_TEXT_LIMIT));
+        }
+    }
+
+    return finalChunks.map(function(c) {
+        return { type: 'section', text: { type: 'mrkdwn', text: c.trim() } };
+    }).filter(function(b) { return b.text.text.length > 0; });
+}
+
+/** Split a single oversized chunk on paragraph or line boundaries. */
+function splitOnBoundary_(text, limit) {
+    const results = [];
+    let remaining = text;
+
+    while (remaining.length > limit) {
+        // Try to break at a double-newline (paragraph boundary)
+        let splitIdx = remaining.lastIndexOf('\n\n', limit);
+        // Fall back to single newline
+        if (splitIdx <= 0) splitIdx = remaining.lastIndexOf('\n', limit);
+        // Last resort: hard break at the limit, avoiding surrogate pair splits
+        if (splitIdx <= 0) {
+            splitIdx = limit;
+            const code = remaining.charCodeAt(splitIdx - 1);
+            if (code >= 0xD800 && code <= 0xDBFF) splitIdx--;
+        }
+
+        results.push(remaining.slice(0, splitIdx));
+        remaining = remaining.slice(splitIdx).replace(/^\n+/, '');
+    }
+
+    if (remaining) results.push(remaining);
+    return results;
 }
 
 
