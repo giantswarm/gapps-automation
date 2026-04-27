@@ -366,3 +366,17 @@ function computeSalary(employees) {
 
     return rowsOut;
 }
+
+/**
+ * Calculates ESOP initial allocation for a new hire.
+ *
+ * @param {number} valuePerYear     — Annual option value (salary-based)
+ * @param {number} companyValuation — Company valuation at grant time
+ * @param {number} totalSharesPool  — Total shares in the pool
+ * @return {Object} { numOptions, totalValueAtStart }
+ */
+function calculateEsopInitial(valuePerYear, companyValuation, totalSharesPool) {
+    const totalValueAtStart = valuePerYear * 4;
+    const numOptions = totalSharesPool * (totalValueAtStart / companyValuation);
+    return {numOptions: numOptions, totalValueAtStart: totalValueAtStart};
+}
