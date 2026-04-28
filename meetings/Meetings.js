@@ -436,6 +436,7 @@ async function shareTeamMeetingArtifacts() {
     const listEventParams = {
         timeMin: fetchTimeMin.toISOString(),
         timeMax: fetchTimeMax.toISOString(),
+        conferenceDataVersion: 1,
     };
 
     // Fetch company glossary once for correcting terminology in summaries
@@ -638,9 +639,23 @@ async function summarizeAndPostToSlack_(event, geminiNotes, recording, drive, em
         const eventDate = new Date(event.start.dateTime || event.start.date);
         const formattedDate = Utilities.formatDate(eventDate, Session.getScriptTimeZone(), 'yyyy-MM-dd');
 
+        // Limit mentions to actual Meet attendees to avoid false name matches against unrelated employees
+        let meetAttendeeEmails = null;
+        try {
+            meetAttendeeEmails = await getMeetAttendeeEmails_(event);
+            if (meetAttendeeEmails) {
+                Logger.log(`Found ${meetAttendeeEmails.size} Meet attendees for ${event.summary}`);
+            }
+        } catch (e) {
+            Logger.log(`Failed to get Meet attendees for ${event.summary}, falling back to all employees: ${e}`);
+        }
+
+        const attendeeLabel = meetAttendeeEmails ? 'meeting attendees' : 'all employees';
         const nameToSlackMentionMapping = async () => {
-            // Use all active employees instead of event.attendees (which may be incomplete)
-            const employeeEmails = employees.map(emp => emp.attributes.email.value).filter(Boolean);
+            const relevantEmployees = meetAttendeeEmails
+                ? employees.filter(emp => meetAttendeeEmails.has(emp.attributes.email.value))
+                : employees;
+            const employeeEmails = relevantEmployees.map(emp => emp.attributes.email.value).filter(Boolean);
             if (employeeEmails.length === 0) {
                 return '';
             }
@@ -697,7 +712,7 @@ Guidelines:
 - Use clear, simple language
 - Only output the sections above, nothing else
 
-Name to Slack user ID lookup table (format "$DISPLAY_NAME -> $SLACK_MENTION") for all employees:
+Name to Slack user ID lookup table (format "$DISPLAY_NAME -> $SLACK_MENTION") for ${attendeeLabel}:
 <slack_mention_lookup_begin>
 ${await nameToSlackMentionMapping()}
 </slack_mention_lookup_end>
@@ -928,6 +943,102 @@ async function visitEvents_(visitor, listParams) {
     if (firstError) {
         throw firstError;
     }
+}
+
+
+/** Get emails of people who actually attended the Google Meet for a calendar event.
+ *
+ * Uses the Google Meet REST API to retrieve conference participants, then resolves
+ * their display names to primary emails via the Google Directory (People API).
+ * Both data sources use Google's identity system, so display names match reliably.
+ *
+ * Requires the following scopes to be authorized for the service account
+ * in Workspace Admin Console (domain-wide delegation):
+ * - meetings.space.readonly (Google Meet conference records)
+ * - directory.readonly (Google Directory people listing)
+ *
+ * @param event The calendar event (must include conferenceData, requires conferenceDataVersion=1 in list params)
+ * @returns {Promise<Set<string>|null>} Set of attendee email addresses, or null if attendance could not be determined
+ */
+async function getMeetAttendeeEmails_(event) {
+    const meetingCode = event.conferenceData?.conferenceId
+        || extractMeetingCode_(event);
+
+    if (!meetingCode) {
+        return null;
+    }
+
+    const email = event.creator?.email;
+    if (!email) {
+        return null;
+    }
+
+    const creds = getServiceAccountCredentials_();
+    const meet = await MeetClient.withImpersonatingService(creds, email);
+
+    // Search for conference records within a window around the event
+    const eventStart = new Date(event.start.dateTime || event.start.date);
+    const startFilter = new Date(eventStart.getTime() - 30 * 60 * 1000).toISOString();
+    const endFilter = new Date(eventStart.getTime() + 30 * 60 * 1000).toISOString();
+
+    const filter = `space.meeting_code="${meetingCode}" AND start_time>="${startFilter}" AND start_time<="${endFilter}"`;
+    const records = await meet.listConferenceRecords(filter);
+
+    if (!records.length) {
+        return null;
+    }
+
+    const participants = await meet.listParticipants(records[0].name);
+
+    // Resolve participant display names to emails via Google Directory
+    // (both Meet and Directory use Google identity, so names match)
+    const directoryNameToEmail = await getDirectoryNameToEmail_(creds, email);
+
+    const attendeeEmails = new Set();
+    for (const participant of participants) {
+        const displayName = (participant.signedinUser?.displayName || '').trim().toLowerCase();
+        if (displayName && directoryNameToEmail[displayName]) {
+            attendeeEmails.add(directoryNameToEmail[displayName]);
+        }
+    }
+
+    return attendeeEmails.size > 0 ? attendeeEmails : null;
+}
+
+
+/** Build a mapping from Google Directory display names (lowercase) to primary emails.
+ *
+ * @param serviceAccountCredentials Service account credentials JSON
+ * @param impersonateEmail Email of domain user to impersonate
+ * @returns {Promise<Object>} Map of lowercase display name to primary email
+ */
+async function getDirectoryNameToEmail_(serviceAccountCredentials, impersonateEmail) {
+    const directory = await DirectoryClient.withImpersonatingService(serviceAccountCredentials, impersonateEmail);
+    const people = await directory.listDirectoryPeople();
+
+    const nameToEmail = {};
+    for (const person of people) {
+        const name = person.names?.[0]?.displayName;
+        const email = person.emailAddresses?.[0]?.value;
+        if (name && email) {
+            nameToEmail[name.trim().toLowerCase()] = email;
+        }
+    }
+
+    return nameToEmail;
+}
+
+
+/** Extract Google Meet meeting code from calendar event entry points. */
+function extractMeetingCode_(event) {
+    const videoEntryPoint = event.conferenceData?.entryPoints?.find(ep => ep.entryPointType === 'video');
+    if (videoEntryPoint?.uri) {
+        const match = videoEntryPoint.uri.match(/meet\.google\.com\/([a-z]+-[a-z]+-[a-z]+)/);
+        if (match) {
+            return match[1];
+        }
+    }
+    return null;
 }
 
 
