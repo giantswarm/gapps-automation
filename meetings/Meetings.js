@@ -637,7 +637,7 @@ async function summarizeAndPostToSlack_(event, geminiNotes, recording, drive, em
 
         // Format the date
         const eventDate = new Date(event.start.dateTime || event.start.date);
-        const formattedDate = Utilities.formatDate(eventDate, Session.getScriptTimeZone(), 'dd/MM/yy');
+        const formattedDate = Utilities.formatDate(eventDate, Session.getScriptTimeZone(), 'yyyy-MM-dd');
 
         // Limit mentions to actual Meet attendees to avoid false name matches against unrelated employees
         let meetAttendeeEmails = null;
@@ -688,24 +688,18 @@ async function summarizeAndPostToSlack_(event, geminiNotes, recording, drive, em
 
 Generate the following sections:
 
-🧠 Top Takeaways
-Format each takeaway with an appropriate emoji prefix:
-- Use ✅ for decisions made
-- Use 🚧 for blockers or challenges
-- Use 🔜 for next steps or action items
-- Use 💡 for key insights or ideas
-- Use ⚠️ for risks or concerns
-
+🧠 *Top Takeaways*
+Use plain bullet points (•) for each takeaway. Do NOT use emoji prefixes on individual items.
 Keep each takeaway to 1-2 sentences maximum. Focus on outcomes, not discussions.
 
-🙋 Key Contributors & Takeaways
+🙋 *Key Contributors*
 
 Note: Only include this section if any of the following apply:
 - Someone is assigned an action or deliverable
 - A decision was clearly advocated for or blocked by a participant
 - Someone flagged a risk, dependency, or introduced a new direction
 
-🎯 Skip this section entirely if there's nothing impactful to highlight - this isn't about logging everyone's contributions.
+Skip this section entirely if there's nothing impactful to highlight - this isn't about logging everyone's contributions.
 
 If you do include this section, use the correct mention using the Slack user ID (see lookup table below) and format each entry as:
 • <@{{$SLACK_MENTION}}> – {{Brief description of their assigned task, key decision, or flagged blocker}}
@@ -762,16 +756,10 @@ async function postMeetingSummary_(slackClient, channelId, meetingName, date, su
     const blocks = [
         {
             type: 'section',
-            fields: [
-                {
-                    type: 'mrkdwn',
-                    text: `*📌 Meeting:*\n${meetingName}`
-                },
-                {
-                    type: 'mrkdwn',
-                    text: `*📅 Date:*\n${date}`
-                }
-            ]
+            text: {
+                type: 'mrkdwn',
+                text: `*${meetingName}*  ·  ${date}`
+            }
         },
         {
             type: 'divider'
@@ -783,11 +771,13 @@ async function postMeetingSummary_(slackClient, channelId, meetingName, date, su
             type: 'divider'
         },
         {
-            type: 'section',
-            text: {
-                type: 'mrkdwn',
-                text: `📄 <${docLink}|Full Summary + Transcript>\n🎥 <${recordingLink}|Recording>`
-            }
+            type: 'context',
+            elements: [
+                {
+                    type: 'mrkdwn',
+                    text: `<${docLink}|Full Summary + Transcript>  ·  <${recordingLink}|Recording>`
+                }
+            ]
         }
     ];
 
