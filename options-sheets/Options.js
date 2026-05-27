@@ -133,3 +133,220 @@ const calculateVesting = function (shares, start, end1, end2, end3, now, richOut
 
     return [+(new Number(vestedShares).toFixed(2)), +(new Number(totalVestedMonths).toFixed(2))];
 };
+
+
+/**
+ * Computes the share allocation for a single batch (or a column of batches).
+ *
+ * Translation of the spreadsheet formula:
+ *   IF(employeeId = "")
+ *     -> NaN                                         // manual override or no person, no recalc
+ *   ELSE
+ *     -> totalShares(quarter(startDate))
+ *        * (4 * optionsSelect * salaryAt(employeeId, startDate) * locationFactor)
+ *        / valuation(quarter(startDate))
+ *
+ * where quarter is derived from startDate as "YYYY Qn". The salary at startDate is used to pick the salary
+ * at that point in time.
+ *
+ * Ranges are passed in (rather than fetched via SpreadsheetApp.openById) because custom functions
+ * cannot use scoped services. Stage cross-spreadsheet data with =IMPORTRANGE(...) in a sheet of the
+ * host spreadsheet and pass that range in.
+ *
+ * Range mode: pass employeeId, allocatedShares, startDate, optionsSelect AND
+ * locationFactor all as 1-column ranges of the same row count. The function returns a column of
+ * results — one per input row — computed in a single invocation. Either all of those six args are
+ * ranges (same length) or all are scalars; mixing is rejected.
+ *
+ * Gates (evaluated in order):
+ *   1. `allocatedShares` is non-zero numeric → return `allocatedShares` (manual override wins).
+ *   2. `employeeId` is empty → NaN.
+ *
+ * salaryHistoryRange:  Salary_History_Import-style wide table including the header row. Col 1 is
+ *                      "Personio ID" (the match key). Salary columns are identified by header cells
+ *                      that are actual Date values (e.g. "2020 - Jan", "2021 - Jul"); non-date headers
+ *                      (ID, First/Last Name, Team, Position, Status, OTP Q4 ..., Notes) are ignored.
+ *                      The salary used is the value in the column whose header date is the latest
+ *                      one <= startDate that is non-empty for that person.
+ * valuationRange:      col 0 = quarter key (sorted ascending), col 5 = valuation, col 6 = total shares
+ *                      (approximate-match lookup, like VLOOKUP(..., TRUE)). If startDate falls past
+ *                      the last quarter in the range, the last populated row is used as fallback.
+ *
+ * @param employeeId {string|number|Array<Array<any>>} Personio ID, or a 1-column range of IDs.
+ * @param allocatedShares {number|string|Array<Array<any>>} Already-stored shares per employee (Options_Raw column); if non-zero, returned as-is.
+ * @param startDate {Date|string|number|Array<Array<any>>} Vesting start date, or 1-column range.
+ * @param optionsSelect {number|Array<Array<any>>} Options select multiplier, or 1-column range.
+ * @param locationFactor {number|Array<Array<any>>} Location factor multiplier, or 1-column range.
+ * @param salaryHistoryRange {Array<Array<any>>} Salary_History_Import range incl. header row (e.g. Salary_History_Import!$A:$Z).
+ * @param valuationRange {Array<Array<any>>} Valuation table (e.g. Salary2023_Valuation!$A$1:$G$43).
+ * @param strictSalary {boolean} Require strict historical salary (true) or take the one before or after (false).
+ * @return {number|Array<Array<number>>} The computed shares for this batch (scalar mode) or column of results (range mode).
+ * @customfunction
+ */
+function CALCULATE_SHARES(employeeId, allocatedShares, startDate, optionsSelect, locationFactor, salaryHistoryRange, valuationRange, strictSalary = false) {
+    const perRow = [employeeId, allocatedShares, startDate, optionsSelect, locationFactor];
+    const arrayCount = perRow.filter(a => Array.isArray(a)).length;
+    if (arrayCount === 0) {
+        return calculateSharesOne_(employeeId, allocatedShares, startDate, optionsSelect, locationFactor, salaryHistoryRange, valuationRange, strictSalary);
+    }
+    if (arrayCount !== perRow.length) {
+        throw new Error('CALCULATE_SHARES: employeeId, allocatedShares, startDate, optionsSelect and locationFactor must either all be ranges or all be scalars');
+    }
+    const n = perRow[0].length;
+    if (!perRow.every(a => a.length === n)) {
+        throw new Error('CALCULATE_SHARES: per-row ranges must have the same row count (got ' + perRow.map(a => a.length).join(', ') + ')');
+    }
+    const out = new Array(n);
+    for (let i = 0; i < n; ++i) {
+        try {
+            out[i] = [calculateSharesOne_(employeeId[i][0], allocatedShares[i][0], startDate[i][0], optionsSelect[i][0], locationFactor[i][0], salaryHistoryRange, valuationRange, strictSalary)];
+        } catch (e) {
+            out[i] = [e.message];
+        }
+    }
+    return out;
+}
+
+
+/** Scalar core of CALCULATE_SHARES. See CALCULATE_SHARES for parameter semantics. */
+function calculateSharesOne_(employeeId, allocatedShares, startDate, optionsSelect, locationFactor, salaryHistoryRange, valuationRange, strictSalary) {
+    const alloc = toNumber_(allocatedShares);
+    if (alloc) {
+        return alloc;
+    }
+
+    const id = (employeeId == null) ? '' : String(employeeId).trim();
+    if (!id) {
+        return NaN;
+    }
+
+    const date = startDate instanceof Date ? startDate : new Date(startDate);
+    if (isNaN(date)) {
+        throw new Error('CALCULATE_SHARES: startDate is invalid');
+    }
+
+    if (!Array.isArray(salaryHistoryRange) || !Array.isArray(salaryHistoryRange[0])) {
+        throw new Error('CALCULATE_SHARES: salaryHistoryRange must be a 2D range, got '
+            + describeRange_(salaryHistoryRange) + '. Pass e.g. Salary_History!A:Z (with the header row).');
+    }
+    if (!Array.isArray(valuationRange) || !Array.isArray(valuationRange[0])) {
+        throw new Error('CALCULATE_SHARES: valuationRange must be a 2D range, got '
+            + describeRange_(valuationRange) + '. Pass e.g. Valuation!A7:G37.');
+    }
+    const quarterKey = date.getFullYear() + ' Q' + (Math.floor(date.getMonth() / 3) + 1);
+
+    const salary = lookupSalaryAtDate_(salaryHistoryRange, id, date, strictSalary);
+    if (salary == null) {
+        throw new Error('CALCULATE_SHARES: no salary for Personio ID "' + id + '" at or before ' + date.toISOString().slice(0, 10));
+    }
+
+    const totalSharesRaw = vlookupApprox_(valuationRange, quarterKey, 6);
+    const valuationRaw = vlookupApprox_(valuationRange, quarterKey, 5);
+    const totalShares = toNumber_(totalSharesRaw);
+    const valuation = toNumber_(valuationRaw);
+    if (totalShares == null) {
+        throw new Error('CALCULATE_SHARES: no Total Shares for "' + quarterKey + '" in valuationRange ('
+            + describeRange_(valuationRange) + '). Make sure the range spans through column G (Total Shares); e.g. A7:G37. Raw col 6 lookup: ' + JSON.stringify(totalSharesRaw));
+    }
+    if (!valuation) {
+        throw new Error('CALCULATE_SHARES: no Valuation for "' + quarterKey + '" in valuationRange ('
+            + describeRange_(valuationRange) + '). Raw col 5 lookup: ' + JSON.stringify(valuationRaw));
+    }
+
+    return totalShares * (4 * Number(optionsSelect) * salary * Number(locationFactor)) / valuation;
+}
+
+
+/** Coerce a cell value to a number, tolerating currency symbols (€/$/£/¥) and US-style thousand
+ *  separators (commas). Returns null for null/empty/'-'/Date/unparseable. Numbers pass through. */
+function toNumber_(value) {
+    if (typeof value === 'number') return isNaN(value) ? null : value;
+    if (value == null || value instanceof Date) return null;
+    const s = String(value).trim().replace(/[€$£¥\s]/g, '').replace(/,/g, '');
+    if (s === '' || s === '-') return null;
+    const n = Number(s);
+    return isNaN(n) ? null : n;
+}
+
+
+/** Returns the salary for `employeeId` (matched against col 1 = "Personio ID") from a
+ *  Salary_History_Import-style range. The salary column is the one whose Date header is the latest
+ *  <= `date` with a numeric value in the matching row. Non-Date header cells are skipped.
+ *
+ *  If `strictSalary` is false and no salary on/before `date` is found, falls back to the earliest
+ *  salary at a date > `date` (assumes salary unchanged outside the known range). Returns null only
+ *  if no salary value exists for the person at any date. */
+function lookupSalaryAtDate_(range, employeeId, date, strictSalary) {
+    if (!Array.isArray(range) || range.length < 2) return null;
+
+    const header = range[0];
+    const dateCols = [];
+    for (let i = 0; i < header.length; ++i) {
+        const h = header[i];
+        if (h instanceof Date && !isNaN(h)) {
+            dateCols.push({col: i, date: h});
+        }
+    }
+    dateCols.sort((a, b) => a.date - b.date);
+
+    const target = String(employeeId).trim();
+    let personRow = null;
+    for (let r = 1; r < range.length; ++r) {
+        const row = range[r];
+        if (!row) continue;
+        if (String(row[1] == null ? '' : row[1]).trim() === target) {
+            personRow = row;
+            break;
+        }
+    }
+    if (!personRow) return null;
+
+    let salary = null;
+    let firstFutureSalary = null;
+    for (const c of dateCols) {
+        const n = toNumber_(personRow[c.col]);
+        if (n == null) continue;
+        if (c.date <= date) {
+            salary = n;
+        } else if (firstFutureSalary == null) {
+            firstFutureSalary = n;
+        }
+    }
+    if (salary != null) return salary;
+    if (!strictSalary && firstFutureSalary != null) return firstFutureSalary;
+    return null;
+}
+
+
+/** VLOOKUP approximate match on column 0 (range assumed sorted ascending, like Sheets VLOOKUP ... TRUE).
+ *  Returns the value at column `col` of the row with the largest key <= `key`. If no key matches
+ *  (target is past the last key, or before the first key, or the matching row has no value at `col`),
+ *  falls back to the last row in the range whose `col` holds a non-null/empty value. */
+function vlookupApprox_(range, key, col) {
+    if (!Array.isArray(range)) return null;
+    const target = String(key).trim();
+    let bestMatch = null;
+    let lastWithValue = null;
+    for (const row of range) {
+        if (!row) continue;
+        if (toNumber_(row[col]) == null) continue;
+        lastWithValue = row;
+        if (row[0] == null) continue;
+        const k = String(row[0]).trim();
+        if (k === '') continue;
+        if (k <= target) {
+            bestMatch = row;
+        }
+    }
+    const pick = bestMatch || lastWithValue;
+    return pick ? pick[col] : null;
+}
+
+
+/** Returns a short description of a 2D-array range for diagnostic error messages. */
+function describeRange_(range) {
+    if (!Array.isArray(range)) return 'not an array';
+    const rows = range.length;
+    const cols = (rows > 0 && Array.isArray(range[0])) ? range[0].length : 0;
+    return rows + ' rows × ' + cols + ' cols';
+}
