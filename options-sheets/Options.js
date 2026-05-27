@@ -136,7 +136,7 @@ const calculateVesting = function (shares, start, end1, end2, end3, now, richOut
 
 
 /**
- * Computes the share allocation for a single batch.
+ * Computes the share allocation for a single batch (or a column of batches).
  *
  * Translation of the spreadsheet formula:
  *   IF(employeeId = "")
@@ -153,27 +153,68 @@ const calculateVesting = function (shares, start, end1, end2, end3, now, richOut
  * cannot use scoped services. Stage cross-spreadsheet data with =IMPORTRANGE(...) in a sheet of the
  * host spreadsheet and pass that range in.
  *
+ * Range mode: pass employeeId, allocatedShares, startDate, optionsSelect AND
+ * locationFactor all as 1-column ranges of the same row count. The function returns a column of
+ * results — one per input row — computed in a single invocation. Either all of those six args are
+ * ranges (same length) or all are scalars; mixing is rejected.
+ *
+ * Gates (evaluated in order):
+ *   1. `allocatedShares` is non-zero numeric → return `allocatedShares` (manual override wins).
+ *   2. `employeeId` is empty → NaN.
+ *
  * salaryHistoryRange:  Salary_History_Import-style wide table including the header row. Col 1 is
  *                      "Personio ID" (the match key). Salary columns are identified by header cells
  *                      that are actual Date values (e.g. "2020 - Jan", "2021 - Jul"); non-date headers
  *                      (ID, First/Last Name, Team, Position, Status, OTP Q4 ..., Notes) are ignored.
  *                      The salary used is the value in the column whose header date is the latest
- *                      one <= referenceDate that is non-empty for that person.
+ *                      one <= startDate that is non-empty for that person.
  * valuationRange:      col 0 = quarter key (sorted ascending), col 5 = valuation, col 6 = total shares
  *                      (approximate-match lookup, like VLOOKUP(..., TRUE)). If startDate falls past
  *                      the last quarter in the range, the last populated row is used as fallback.
  *
- * @param employeeId {string|number} Personio ID (matches Salary_History_Import col B).
- * @param startDate {Date|string|number} Vesting period start date; selects the valuation quarter.
- * @param optionsSelect {number} Options select multiplier.
- * @param locationFactor {number} Location factor multiplier.
- * @param salaryHistoryRange {Array<Array<any>>} Salary_History_Import range incl. header row (e.g. =Salary_History_Import!A:Z).
- * @param valuationRange {Array<Array<any>>} Valuation table
- * @param strictSalary {boolean} Require strict historical salary (true) or take the one before or after (false)
- * @return {number} The computed shares for this batch.
+ * @param employeeId {string|number|Array<Array<any>>} Personio ID, or a 1-column range of IDs.
+ * @param allocatedShares {number|string|Array<Array<any>>} Already-stored shares per employee (Options_Raw column); if non-zero, returned as-is.
+ * @param startDate {Date|string|number|Array<Array<any>>} Vesting start date, or 1-column range.
+ * @param optionsSelect {number|Array<Array<any>>} Options select multiplier, or 1-column range.
+ * @param locationFactor {number|Array<Array<any>>} Location factor multiplier, or 1-column range.
+ * @param salaryHistoryRange {Array<Array<any>>} Salary_History_Import range incl. header row (e.g. Salary_History_Import!$A:$Z).
+ * @param valuationRange {Array<Array<any>>} Valuation table (e.g. Salary2023_Valuation!$A$1:$G$43).
+ * @param strictSalary {boolean} Require strict historical salary (true) or take the one before or after (false).
+ * @return {number|Array<Array<number>>} The computed shares for this batch (scalar mode) or column of results (range mode).
  * @customfunction
  */
-function CALCULATE_SHARES(employeeId, startDate, optionsSelect, locationFactor, salaryHistoryRange, valuationRange, strictSalary = false) {
+function CALCULATE_SHARES(employeeId, allocatedShares, startDate, optionsSelect, locationFactor, salaryHistoryRange, valuationRange, strictSalary = false) {
+    const perRow = [employeeId, allocatedShares, startDate, optionsSelect, locationFactor];
+    const arrayCount = perRow.filter(a => Array.isArray(a)).length;
+    if (arrayCount === 0) {
+        return calculateSharesOne_(employeeId, allocatedShares, startDate, optionsSelect, locationFactor, salaryHistoryRange, valuationRange, strictSalary);
+    }
+    if (arrayCount !== perRow.length) {
+        throw new Error('CALCULATE_SHARES: employeeId, allocatedShares, startDate, optionsSelect and locationFactor must either all be ranges or all be scalars');
+    }
+    const n = perRow[0].length;
+    if (!perRow.every(a => a.length === n)) {
+        throw new Error('CALCULATE_SHARES: per-row ranges must have the same row count (got ' + perRow.map(a => a.length).join(', ') + ')');
+    }
+    const out = new Array(n);
+    for (let i = 0; i < n; ++i) {
+        try {
+            out[i] = [calculateSharesOne_(employeeId[i][0], allocatedShares[i][0], startDate[i][0], optionsSelect[i][0], locationFactor[i][0], salaryHistoryRange, valuationRange, strictSalary)];
+        } catch (e) {
+            out[i] = [e.message];
+        }
+    }
+    return out;
+}
+
+
+/** Scalar core of CALCULATE_SHARES. See CALCULATE_SHARES for parameter semantics. */
+function calculateSharesOne_(employeeId, allocatedShares, startDate, optionsSelect, locationFactor, salaryHistoryRange, valuationRange, strictSalary) {
+    const alloc = toNumber_(allocatedShares);
+    if (alloc) {
+        return alloc;
+    }
+
     const id = (employeeId == null) ? '' : String(employeeId).trim();
     if (!id) {
         return NaN;
@@ -181,22 +222,22 @@ function CALCULATE_SHARES(employeeId, startDate, optionsSelect, locationFactor, 
 
     const date = startDate instanceof Date ? startDate : new Date(startDate);
     if (isNaN(date)) {
-        throw new Error('CALCULATE_SHARES: startDate (arg 2) is invalid');
+        throw new Error('CALCULATE_SHARES: startDate is invalid');
     }
 
     if (!Array.isArray(salaryHistoryRange) || !Array.isArray(salaryHistoryRange[0])) {
-        throw new Error('CALCULATE_SHARES: salaryHistoryRange (arg 5) must be a 2D range, got '
+        throw new Error('CALCULATE_SHARES: salaryHistoryRange must be a 2D range, got '
             + describeRange_(salaryHistoryRange) + '. Pass e.g. Salary_History!A:Z (with the header row).');
     }
     if (!Array.isArray(valuationRange) || !Array.isArray(valuationRange[0])) {
-        throw new Error('CALCULATE_SHARES: valuationRange (arg 6) must be a 2D range, got '
+        throw new Error('CALCULATE_SHARES: valuationRange must be a 2D range, got '
             + describeRange_(valuationRange) + '. Pass e.g. Valuation!A7:G37.');
     }
     const quarterKey = date.getFullYear() + ' Q' + (Math.floor(date.getMonth() / 3) + 1);
 
-    const salary = lookupSalaryAtDate_(salaryHistoryRange, id, startDate, strictSalary);
+    const salary = lookupSalaryAtDate_(salaryHistoryRange, id, date, strictSalary);
     if (salary == null) {
-        throw new Error('CALCULATE_SHARES: no salary for Personio ID "' + id + '" at or before ' + startDate.toISOString().slice(0, 10));
+        throw new Error('CALCULATE_SHARES: no salary for Personio ID "' + id + '" at or before ' + date.toISOString().slice(0, 10));
     }
 
     const totalSharesRaw = vlookupApprox_(valuationRange, quarterKey, 6);
