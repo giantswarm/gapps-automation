@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "github>giantswarm/renovate-presets:default.json5"
   ],
   "ignorePaths": ["**/.github/workflows/zz_**"]
 }
