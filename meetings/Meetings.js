@@ -416,6 +416,154 @@ function updateEventMap_(eventMap, summary, event, reason) {
 }
 
 
+/** Share artifacts (Gemini notes + recording) for a single event.
+ *
+ *  Returns {found, published}:
+ *  - found:     true if the event has both Gemini notes and a recording attachment
+ *  - published: true if move/share, Slack post and event update all succeeded
+ */
+async function shareEventArtifacts_(event, email, calendarId, calendar, employees, shareDomainName, artifactsFolderId, glossary) {
+    const geminiNotes = event.attachments?.find(a => a.mimeType === 'application/vnd.google-apps.document'
+        && a.title?.includes('Notes by Gemini')) || event.attachments?.find(a => a.mimeType === 'application/vnd.google-apps.document'
+        && a.title?.includes('Notes'));
+    const recording = event.attachments?.find(a => a.mimeType === 'video/mp4'
+        && a.title?.includes('Recording')
+        && a.title?.includes(event.summary));
+
+    console.log('meet: ' + event.summary + ' ' + event.start.dateTime + ' notes=' + geminiNotes + ' rec=' + recording);
+
+    if (!geminiNotes || !recording) {
+        return {found: false, published: false};
+    }
+
+    try {
+        const drive = await DriveClientV1.withImpersonatingService(getServiceAccountCredentials_(), email);
+
+        // Move artifacts to shared drive folder (inherits shared drive permissions)
+        // or share with domain if no folder is configured
+        if (artifactsFolderId) {
+            try {
+                Logger.log(`Moving notes ${geminiNotes.fileId} to folder ${artifactsFolderId}`);
+                await drive.moveToFolder(geminiNotes.fileId, artifactsFolderId);
+            } catch (e) {
+                Logger.log(`Failed to move notes ${geminiNotes.fileId}: ${e}`);
+                return {found: true, published: false};
+            }
+            try {
+                Logger.log(`Moving recording ${recording.fileId} to folder ${artifactsFolderId}`);
+                await drive.moveToFolder(recording.fileId, artifactsFolderId);
+            } catch (e) {
+                Logger.log(`Failed to move recording ${recording.fileId}: ${e}`);
+                return {found: true, published: false};
+            }
+        } else {
+            Logger.log(`Sharing notes ${geminiNotes.fileId} for event ${event.summary}`);
+            try {
+                await drive.shareWith(geminiNotes.fileId, 'domain', shareDomainName, 'reader', true);
+            } catch (e) {
+                Logger.log(`Failed to share notes ${geminiNotes.fileId}: ${e}`);
+                return {found: true, published: false};
+            }
+            Logger.log(`Sharing recording ${recording.fileId} for event ${event.summary}`);
+            try {
+                await drive.shareWith(recording.fileId, 'domain', shareDomainName, 'reader', true);
+            } catch (e) {
+                Logger.log(`Failed to share recording ${recording.fileId}: ${e}`);
+                return {found: true, published: false};
+            }
+        }
+
+        await summarizeAndPostToSlack_(event, geminiNotes, recording, drive, employees, glossary);
+
+        setEventPrivateProperty_(event, 'attachmentsPublishedAt', Date.now());
+        await calendar.update(calendarId, event.id, event);
+
+        Logger.log(`Successfully shared artifacts for ${event.summary} at ${event.start.dateTime}`);
+        return {found: true, published: true};
+    } catch (e) {
+        Logger.log(`Failed to share artifacts for ${event.summary}: ${e}`);
+        return {found: true, published: false};
+    }
+}
+
+
+/** Share artifacts for a single team meeting event, identified by calendar ID and event ID.
+ *
+ *  Intended for manual invocation from the Apps Script editor (or via clasp run) when the
+ *  periodic shareTeamMeetingArtifacts() misses an event, e.g. because it falls outside the
+ *  date window, doesn't match the SIG/Chapter/WG heuristic, or was already marked published.
+ *
+ *  Bypasses discovery filters (date range, event-type pattern, creator-equals-impersonatee,
+ *  attachmentsPublishedAt) since the caller picked the event explicitly. Still requires the
+ *  event to have both Gemini notes and a recording attachment.
+ *
+ *  Usage: clasp run 'shareTeamMeetingArtifactsForEvent' --params '["CALENDAR_ID", "EVENT_ID"]'
+ */
+async function shareTeamMeetingArtifactsForEvent(calendarId, eventId) {
+
+    if (!calendarId || !eventId) {
+        throw new Error('calendarId and eventId are required');
+    }
+
+    const shareDomainName = getScriptProperties_().getProperty(SHARE_DOMAIN_NAME) || '';
+    const artifactsFolderId = getScriptProperties_().getProperty(ARTIFACTS_FOLDER_ID) || '';
+    if (!shareDomainName) {
+        Logger.log('No share domain configured, skipping sharing team meeting artifacts');
+        return;
+    }
+
+    // Fetch company glossary for correcting terminology in summaries
+    let glossary = '';
+    try {
+        const glossaryResponse = UrlFetchApp.fetch(GLOSSARY_URL, {muteHttpExceptions: true});
+        if (glossaryResponse.getResponseCode() === 200) {
+            glossary = glossaryResponse.getContentText();
+        }
+    } catch (e) {
+        Logger.log(`Failed to fetch glossary: ${e}`);
+    }
+
+    const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
+        .split(',')
+        .map(d => d.trim());
+
+    const personioCreds = getPersonioCreds_();
+    const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
+    const employees = await personio.getPersonioJson('/company/employees').filter(employee =>
+        employee.attributes.status.value !== 'inactive'
+        && allowedDomains.includes(employee.attributes.email.value.substring(employee.attributes.email.value.lastIndexOf('@') + 1))
+    );
+
+    // To read the event we need to impersonate a user with access to the calendar.
+    // If calendarId looks like an allowed-domain user email, impersonate that user;
+    // otherwise fall back to the first allowed employee.
+    const calendarIsUserEmail = calendarId.includes('@')
+        && allowedDomains.includes(calendarId.substring(calendarId.lastIndexOf('@') + 1));
+    const initialEmail = calendarIsUserEmail ? calendarId : employees[0]?.attributes.email.value;
+    if (!initialEmail) {
+        throw new Error('Could not determine impersonation email for fetching the event');
+    }
+
+    const initialCalendar = await CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), initialEmail);
+    const event = await initialCalendar.get(calendarId, eventId, {conferenceDataVersion: 1});
+
+    // Re-impersonate as the event creator so Drive operations affect the right user's files
+    // (this mirrors the iteration logic in shareTeamMeetingArtifacts where creator==impersonatee)
+    const creatorEmail = event?.creator?.email;
+    if (!creatorEmail) {
+        throw new Error(`Event ${eventId} on calendar ${calendarId} has no creator email`);
+    }
+
+    const calendar = creatorEmail === initialEmail
+        ? initialCalendar
+        : await CalendarClient.withImpersonatingService(getServiceAccountCredentials_(), creatorEmail);
+
+    const result = await shareEventArtifacts_(event, creatorEmail, calendarId, calendar, employees, shareDomainName, artifactsFolderId, glossary);
+
+    Logger.log(`shareTeamMeetingArtifactsForEvent for "${event.summary}" (${eventId}): found=${result.found}, published=${result.published}`);
+}
+
+
 /** Share team meeting artifacts with the organization. */
 async function shareTeamMeetingArtifacts() {
 
@@ -494,70 +642,9 @@ async function shareTeamMeetingArtifacts() {
                 return true;
             }
 
-            const geminiNotes = event.attachments?.find(a => a.mimeType === 'application/vnd.google-apps.document'
-                && a.title?.includes('Notes by Gemini')) || event.attachments?.find(a => a.mimeType === 'application/vnd.google-apps.document'
-                && a.title?.includes('Notes'));
-            const recording = event.attachments?.find(a => a.mimeType === 'video/mp4'
-                && a.title?.includes('Recording')
-                && a.title?.includes(event.summary));
-
-            console.log('meet: ' + event.summary + ' ' + event.start.dateTime + ' notes=' + geminiNotes + ' rec=' + recording);
-
-            if (geminiNotes && recording) {
-
-                hits++;
-
-                // Share with organization
-                try {
-                    const drive = await DriveClientV1.withImpersonatingService(getServiceAccountCredentials_(), email);
-
-                    // Move artifacts to shared drive folder (inherits shared drive permissions)
-                    // or share with domain if no folder is configured
-                    if (artifactsFolderId) {
-                        try {
-                            Logger.log(`Moving notes ${geminiNotes.fileId} to folder ${artifactsFolderId}`);
-                            await drive.moveToFolder(geminiNotes.fileId, artifactsFolderId);
-                        } catch (e) {
-                            Logger.log(`Failed to move notes ${geminiNotes.fileId}: ${e}`);
-                            return true;
-                        }
-                        try {
-                            Logger.log(`Moving recording ${recording.fileId} to folder ${artifactsFolderId}`);
-                            await drive.moveToFolder(recording.fileId, artifactsFolderId);
-                        } catch (e) {
-                            Logger.log(`Failed to move recording ${recording.fileId}: ${e}`);
-                            return true;
-                        }
-                    } else {
-                        Logger.log(`Sharing notes ${geminiNotes.fileId} for event ${event.summary}`);
-                        try {
-                            await drive.shareWith(geminiNotes.fileId, 'domain', shareDomainName,'reader', true);
-                        } catch (e) {
-                            Logger.log(`Failed to share notes ${geminiNotes.fileId}: ${e}`);
-                            return true;
-                        }
-                        Logger.log(`Sharing recording ${recording.fileId} for event ${event.summary}`);
-                        try {
-                            await drive.shareWith(recording.fileId, 'domain', shareDomainName,'reader', true);
-                        } catch (e) {
-                            Logger.log(`Failed to share recording ${recording.fileId}: ${e}`);
-                            return true;
-                        }
-                    }
-
-                    // Summarize and post to Slack
-                    await summarizeAndPostToSlack_(event, geminiNotes, recording, drive, employees, glossary);
-
-                    // Mark as published
-                    hits_published++;
-                    setEventPrivateProperty_(event, 'attachmentsPublishedAt', Date.now());
-                    await calendar.update('primary', event.id, event);
-
-                    Logger.log(`Successfully shared artifacts for ${event.summary} at ${event.start.dateTime}`);
-                } catch (e) {
-                    Logger.log(`Failed to share artifacts for ${event.summary}: ${e}`);
-                }
-            }
+            const result = await shareEventArtifacts_(event, email, 'primary', calendar, employees, shareDomainName, artifactsFolderId, glossary);
+            if (result.found) hits++;
+            if (result.published) hits_published++;
 
             return true;
         }, listEventParams);
