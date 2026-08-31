@@ -105,9 +105,14 @@ const BLOCKED_LOCAL_PARTS = [
     'mailer-daemon', 'mailerdaemon', 'postmaster', 'abuse', 'bounce', 'bounces', 'daemon'
 ];
 
-/** Header names indicating that a message is itself automated (never auto-reply to those). */
+/** Header names indicating that a message is itself automated (never auto-reply to those).
+ *
+ * Deliberately excludes 'list-id'/'list-unsubscribe': the Google Group adds those (and
+ * Precedence: list) to every message that passes through it, including genuine employee
+ * forwards, so they aren't a usable signal here.
+ */
 const AUTOMATED_MESSAGE_HEADERS = [
-    'auto-submitted', 'x-autoreply', 'x-autorespond', 'x-auto-response-suppress', 'list-id', 'list-unsubscribe'
+    'auto-submitted', 'x-autoreply', 'x-autorespond', 'x-auto-response-suppress'
 ];
 
 /** Markers introducing a forwarded (or quoted original) message in a mail body. */
@@ -282,7 +287,7 @@ async function handleMessage_(gmail, config, messageId, dryRun) {
     }
 
     const precedence = (GmailClientV1.getHeader(headers, 'Precedence') || '').trim().toLowerCase();
-    if (['bulk', 'list', 'junk', 'auto_reply'].includes(precedence)) {
+    if (['bulk', 'junk', 'auto_reply'].includes(precedence)) {
         return {replied: false, handled: true, reason: 'automated message (Precedence: ' + precedence + ')'};
     }
 
