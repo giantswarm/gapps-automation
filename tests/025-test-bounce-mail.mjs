@@ -36,7 +36,7 @@ globalThis.Utilities = {
 
 globalThis.GmailClientV1 = GmailClientV1;
 
-const BOUNCE_MAIL = '../bounce-mail/BounceMail.js';
+const BOUNCE_MAIL = 'bounce-mail/BounceMail.js';
 
 
 // test parseAddress_
