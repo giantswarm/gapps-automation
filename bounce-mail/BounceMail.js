@@ -91,7 +91,7 @@ Thank you for your interest in Giant Swarm - we really appreciate you taking the
 
 A quick note on how our hiring works: we review applications exclusively through our careers portal, where you'll find every role we currently have open: https://www.giantswarm.io/careers, this is to ensure a fast, fair and smooth process for you.
 
-If one of our advertised positions matches your background, we'd love to see your application come through that channel. Our careers page is updated regularly, so feel free to check back as new opportunities open up. Unfortunately we're not able to consider applications sent by email.
+We'd love to see your application come through that channel. Our careers page is updated regularly, so feel free to check back as new opportunities open up. Unfortunately we're not able to consider applications sent by email.
 
 Wishing you all the best with your search.
 
