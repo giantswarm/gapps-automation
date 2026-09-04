@@ -1,11 +1,12 @@
 {
   "timeZone": "Europe/Berlin",
   "dependencies": {},
-  "chat": {},
+  "webapp": {
+    "access": "DOMAIN",
+    "executeAs": "USER_DEPLOYING"
+  },
   "oauthScopes": [
-    "https://www.googleapis.com/auth/chat.spaces.readonly",
-    "https://www.googleapis.com/auth/chat.memberships.app",
-    "https://www.googleapis.com/auth/chat.memberships.readonly",
+    "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/logging.write",
     "https://www.googleapis.com/auth/script.external_request",
     "https://www.googleapis.com/auth/script.scriptapp",
