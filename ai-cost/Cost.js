@@ -29,6 +29,32 @@ const COLUMNS = [
 const ANTHROPIC_BASE = 'https://api.anthropic.com';
 const OPENAI_BASE = 'https://api.openai.com';
 
+/** Anthropic standard-tier pricing per token (USD). Used to estimate per-model costs
+ *  from the usage report, since the cost report has no model breakdown.
+ *  Cache reads are 0.1x base input (0.025x on Fable 5.1 / Mythos 5.1), 5m cache writes
+ *  are 1.25x, 1h cache writes are 2x. The 1M context window is billed at standard rates.
+ *  Source: https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-09-04)
+ */
+const ANTHROPIC_PRICING = {
+    'claude-fable-5-1':  { input: 10.00 / 1e6, cache_read: 0.25 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
+    'claude-mythos-5-1': { input: 10.00 / 1e6, cache_read: 0.25 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
+    'claude-fable-5':    { input: 10.00 / 1e6, cache_read: 1.00 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
+    'claude-mythos-5':   { input: 10.00 / 1e6, cache_read: 1.00 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
+    'claude-opus-5':     { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
+    'claude-opus-4-8':   { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
+    'claude-opus-4-7':   { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
+    'claude-opus-4-6':   { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
+    'claude-opus-4-5':   { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
+    'claude-opus-4-1':   { input: 15.00 / 1e6, cache_read: 1.50 / 1e6, cache_5m: 18.75 / 1e6, cache_1h: 30.00 / 1e6, output: 75.00 / 1e6 },
+    'claude-opus-4':     { input: 15.00 / 1e6, cache_read: 1.50 / 1e6, cache_5m: 18.75 / 1e6, cache_1h: 30.00 / 1e6, output: 75.00 / 1e6 },
+    'claude-sonnet-5':   { input:  2.00 / 1e6, cache_read: 0.20 / 1e6, cache_5m:  2.50 / 1e6, cache_1h:  4.00 / 1e6, output: 10.00 / 1e6 },
+    'claude-sonnet-4-6': { input:  3.00 / 1e6, cache_read: 0.30 / 1e6, cache_5m:  3.75 / 1e6, cache_1h:  6.00 / 1e6, output: 15.00 / 1e6 },
+    'claude-sonnet-4-5': { input:  3.00 / 1e6, cache_read: 0.30 / 1e6, cache_5m:  3.75 / 1e6, cache_1h:  6.00 / 1e6, output: 15.00 / 1e6 },
+    'claude-sonnet-4':   { input:  3.00 / 1e6, cache_read: 0.30 / 1e6, cache_5m:  3.75 / 1e6, cache_1h:  6.00 / 1e6, output: 15.00 / 1e6 },
+    'claude-haiku-4-5':  { input:  1.00 / 1e6, cache_read: 0.10 / 1e6, cache_5m:  1.25 / 1e6, cache_1h:  2.00 / 1e6, output:  5.00 / 1e6 },
+    'claude-haiku-3-5':  { input:  0.80 / 1e6, cache_read: 0.08 / 1e6, cache_5m:  1.00 / 1e6, cache_1h:  1.60 / 1e6, output:  4.00 / 1e6 },
+};
+
 /** OpenAI standard-tier pricing per token (USD). Used to estimate per-model costs
  *  from the usage endpoint, since the costs endpoint has no model breakdown.
  *  Source: https://developers.openai.com/api/docs/pricing
@@ -213,6 +239,21 @@ function dateRange_(start, end) {
 }
 
 
+/** Estimate USD cost from token counts using the ANTHROPIC_PRICING table.
+ *  Returns 0 if the model is not in the table.
+ *  Model IDs like "claude-sonnet-4-5-20250929" (date suffix) or "claude-opus-4-8[1m]"
+ *  (long-context suffix) are matched by stripping the suffix.
+ */
+function estimateAnthropicCost_(model, inputTokens, cacheReadTokens, cache5mTokens, cache1hTokens, outputTokens) {
+    const base = (model || '').replace(/\[1m\]$/, '').replace(/-\d{8}$/, '');
+    const p = ANTHROPIC_PRICING[base];
+    if (!p) return 0;
+    return (inputTokens * p.input) + (cacheReadTokens * p.cache_read)
+        + (cache5mTokens * p.cache_5m) + (cache1hTokens * p.cache_1h)
+        + (outputTokens * p.output);
+}
+
+
 /** Estimate USD cost from token counts using the OPENAI_PRICING table.
  *  Returns 0 if the model is not in the table.
  *  Model IDs like "gpt-5.1-2025-11-13" are matched by stripping the date suffix.
@@ -289,15 +330,20 @@ function fetchAnthropicUsage_(apiKey, startDate, endDate) {
             for (const bucket of json.data || []) {
                 const date = (bucket.starting_at || '').slice(0, 10);
                 for (const result of bucket.results || []) {
-                    const cacheCreation = (result.cache_creation?.ephemeral_5m_input_tokens || 0)
-                        + (result.cache_creation?.ephemeral_1h_input_tokens || 0);
+                    const inputTok = result.uncached_input_tokens || 0;
+                    const outputTok = result.output_tokens || 0;
+                    const cacheReadTok = result.cache_read_input_tokens || 0;
+                    const cache5mTok = result.cache_creation?.ephemeral_5m_input_tokens || 0;
+                    const cache1hTok = result.cache_creation?.ephemeral_1h_input_tokens || 0;
                     rows.push(makeRow_({
                         date: date, source: 'anthropic', record_type: 'usage',
                         model: result.model || '',
-                        input_tokens: result.uncached_input_tokens || 0,
-                        output_tokens: result.output_tokens || 0,
-                        cache_read_tokens: result.cache_read_input_tokens || 0,
-                        cache_creation_tokens: cacheCreation,
+                        input_tokens: inputTok,
+                        output_tokens: outputTok,
+                        cache_read_tokens: cacheReadTok,
+                        cache_creation_tokens: cache5mTok + cache1hTok,
+                        cost_usd: estimateAnthropicCost_(result.model, inputTok, cacheReadTok, cache5mTok, cache1hTok, outputTok),
+                        cost_type: 'estimated',
                     }));
                 }
             }
