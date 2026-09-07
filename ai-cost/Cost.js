@@ -3,6 +3,15 @@
  *
  * Supported sources: anthropic, claude-code, openai
  *
+ * All costs are written in EUR (we are billed in EUR). Provider APIs report USD, which is
+ * converted using the ECB reference rate of the usage day (see Currency.convertCurrency).
+ *
+ * Seat based (subscription) costs live in the manually maintained Static-Data-<year> sheet.
+ * The script keeps the current month's rows present (carrying seat counts and EUR prices forward
+ * from the previous month) and fills in the informational EUR->USD reference rate. Seat tiers of
+ * the claude.ai Team plan are not exposed by any API, so user_count must be corrected by hand
+ * from the claude.ai members export.
+ *
  * Script Properties:
  *   AiCost.anthropicAdminKey  Anthropic admin API key (for anthropic + claude-code sources)
  *   AiCost.openaiAdminKey     OpenAI admin API key (for openai source)
@@ -23,8 +32,22 @@ const OPENAI_ADMIN_KEY_PROP = PROPERTY_PREFIX + 'openaiAdminKey';
 const COLUMNS = [
     'date', 'source', 'record_type', 'model', 'actor',
     'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens',
-    'num_requests', 'cost_usd', 'cost_type', 'sessions', 'metadata',
+    'num_requests', 'cost_eur', 'cost_type', 'sessions', 'metadata',
 ];
+
+/** Currency all costs are written in. */
+const COST_CURRENCY = 'EUR';
+/** Currency assumed for provider amounts that do not carry an explicit currency. */
+const PROVIDER_DEFAULT_CURRENCY = 'USD';
+
+/** Name prefix of the sheet holding manually maintained seat based costs. */
+const STATIC_SHEET_PREFIX = 'Static-Data-';
+/** Header of the static data sheet (created if the sheet is missing). */
+const STATIC_COLUMNS = ['month', 'provider', 'user_count', 'type', 'cost_cost_per_seat', 'eur-to-usd'];
+/** Provider whose seat rows are maintained by the script. */
+const STATIC_PROVIDER = 'claude-code';
+/** Prefix of cell notes written by the script (cells with other, manual notes are never overwritten). */
+const STATIC_AUTO_NOTE_PREFIX = 'Auto:';
 
 const ANTHROPIC_BASE = 'https://api.anthropic.com';
 const OPENAI_BASE = 'https://api.openai.com';
@@ -167,11 +190,25 @@ function fetchAiCostsForRange_(startDate, endDate) {
         appendToSheet_(spreadsheet, rows, fetchedKeys);
     }
 
+    // Seat based costs (static data): keep the current month's rows and exchange rate up to date
+    try {
+        updateStaticData_(spreadsheet);
+    } catch (e) {
+        Logger.log('Failed to update static data: %s', e.message);
+        firstError = firstError || e;
+    }
+
     Logger.log('Done. %s total new rows.', rows.length);
 
     if (firstError) {
         throw firstError;
     }
+}
+
+
+/** Ensure the current month's seat rows exist in Static-Data-<year> and refresh their exchange rate. */
+function updateStaticData() {
+    updateStaticData_(SpreadsheetApp.getActiveSpreadsheet());
 }
 
 
@@ -222,7 +259,7 @@ function makeRow_(fields) {
     return {
         date: '', source: '', record_type: '', model: '', actor: '',
         input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0,
-        num_requests: 0, cost_usd: 0, cost_type: '', sessions: 0, metadata: '',
+        num_requests: 0, cost_eur: 0, cost_type: '', sessions: 0, metadata: '',
         ...fields,
     };
 }
@@ -239,30 +276,48 @@ function dateRange_(start, end) {
 }
 
 
-/** Estimate USD cost from token counts using the ANTHROPIC_PRICING table.
+/** Convert a provider reported amount to COST_CURRENCY at the reference rate of the given day.
+ *
+ * @param {number} amount The amount as reported by the provider.
+ * @param {string} currency ISO 4217 code of the amount (falls back to PROVIDER_DEFAULT_CURRENCY).
+ * @param {string} date Usage day (YYYY-MM-DD) whose exchange rate to apply.
+ * @return {number} The amount in COST_CURRENCY (not rounded).
+ */
+function toCostCurrency_(amount, currency, date) {
+    const value = +amount || 0;
+    if (value === 0) return 0;
+    return Currency.convertCurrency(currency || PROVIDER_DEFAULT_CURRENCY, COST_CURRENCY, value, date);
+}
+
+
+/** Estimate cost in COST_CURRENCY from token counts using the ANTHROPIC_PRICING table (USD list
+ *  prices, converted at the reference rate of the usage day).
  *  Returns 0 if the model is not in the table.
  *  Model IDs like "claude-sonnet-4-5-20250929" (date suffix) or "claude-opus-4-8[1m]"
  *  (long-context suffix) are matched by stripping the suffix.
  */
-function estimateAnthropicCost_(model, inputTokens, cacheReadTokens, cache5mTokens, cache1hTokens, outputTokens) {
+function estimateAnthropicCost_(date, model, inputTokens, cacheReadTokens, cache5mTokens, cache1hTokens, outputTokens) {
     const base = (model || '').replace(/\[1m\]$/, '').replace(/-\d{8}$/, '');
     const p = ANTHROPIC_PRICING[base];
     if (!p) return 0;
-    return (inputTokens * p.input) + (cacheReadTokens * p.cache_read)
+    const usd = (inputTokens * p.input) + (cacheReadTokens * p.cache_read)
         + (cache5mTokens * p.cache_5m) + (cache1hTokens * p.cache_1h)
         + (outputTokens * p.output);
+    return toCostCurrency_(usd, 'USD', date);
 }
 
 
-/** Estimate USD cost from token counts using the OPENAI_PRICING table.
+/** Estimate cost in COST_CURRENCY from token counts using the OPENAI_PRICING table (USD list
+ *  prices, converted at the reference rate of the usage day).
  *  Returns 0 if the model is not in the table.
  *  Model IDs like "gpt-5.1-2025-11-13" are matched by stripping the date suffix.
  */
-function estimateOpenaiCost_(model, inputTokens, cachedTokens, outputTokens) {
+function estimateOpenaiCost_(date, model, inputTokens, cachedTokens, outputTokens) {
     const base = (model || '').replace(/-\d{4}-\d{2}-\d{2}$/, '');
     const p = OPENAI_PRICING[base];
     if (!p) return 0;
-    return (inputTokens * p.input) + (cachedTokens * p.cached) + (outputTokens * p.output);
+    const usd = (inputTokens * p.input) + (cachedTokens * p.cached) + (outputTokens * p.output);
+    return toCostCurrency_(usd, 'USD', date);
 }
 
 
@@ -342,7 +397,7 @@ function fetchAnthropicUsage_(apiKey, startDate, endDate) {
                         output_tokens: outputTok,
                         cache_read_tokens: cacheReadTok,
                         cache_creation_tokens: cache5mTok + cache1hTok,
-                        cost_usd: estimateAnthropicCost_(result.model, inputTok, cacheReadTok, cache5mTok, cache1hTok, outputTok),
+                        cost_eur: estimateAnthropicCost_(date, result.model, inputTok, cacheReadTok, cache5mTok, cache1hTok, outputTok),
                         cost_type: 'estimated',
                     }));
                 }
@@ -368,7 +423,7 @@ function fetchAnthropicCosts_(apiKey, startDate, endDate) {
                     rows.push(makeRow_({
                         date: date, source: 'anthropic', record_type: 'cost',
                         model: result.model || '',
-                        cost_usd: parseFloat(result.amount || '0') / 100,
+                        cost_eur: toCostCurrency_(parseFloat(result.amount || '0') / 100, result.currency, date),
                         cost_type: result.cost_type || '',
                     }));
                 }
@@ -412,6 +467,7 @@ function fetchClaudeCodeUsage_(apiKey, startDate, endDate) {
                     for (const mb of record.model_breakdown || []) {
                         const tokens = mb.tokens || {};
                         const costCents = mb.estimated_cost?.amount || 0;
+                        const costCurrency = mb.estimated_cost?.currency;
                         rows.push(makeRow_({
                             date: day, source: 'claude-code', record_type: 'usage',
                             model: mb.model || '', actor: actor,
@@ -419,7 +475,7 @@ function fetchClaudeCodeUsage_(apiKey, startDate, endDate) {
                             output_tokens: tokens.output || 0,
                             cache_read_tokens: tokens.cache_read || 0,
                             cache_creation_tokens: tokens.cache_creation || 0,
-                            cost_usd: costCents / 100, cost_type: 'tokens',
+                            cost_eur: toCostCurrency_(costCents / 100, costCurrency, day), cost_type: 'tokens',
                             sessions: core.num_sessions || 0,
                             metadata: JSON.stringify(meta),
                         }));
@@ -463,15 +519,16 @@ function fetchOpenaiUsage_(apiKey, startDate, endDate) {
                     const inputTok = result.input_tokens || 0;
                     const cachedTok = result.input_cached_tokens || 0;
                     const outputTok = result.output_tokens || 0;
+                    const date = new Date((bucket.start_time || 0) * 1000).toISOString().slice(0, 10);
                     rows.push(makeRow_({
-                        date: new Date((bucket.start_time || 0) * 1000).toISOString().slice(0, 10),
+                        date: date,
                         source: 'openai', record_type: 'usage',
                         model: result.model || '',
                         input_tokens: inputTok,
                         output_tokens: outputTok,
                         cache_read_tokens: cachedTok,
                         num_requests: result.num_model_requests || 0,
-                        cost_usd: estimateOpenaiCost_(result.model, inputTok, cachedTok, outputTok),
+                        cost_eur: estimateOpenaiCost_(date, result.model, inputTok, cachedTok, outputTok),
                         cost_type: 'estimated',
                     }));
                 }
@@ -497,7 +554,7 @@ function fetchOpenaiCosts_(apiKey, startDate, endDate) {
                 for (const result of bucket.results || []) {
                     rows.push(makeRow_({
                         date: date, source: 'openai', record_type: 'cost',
-                        cost_usd: result.amount?.value || 0,
+                        cost_eur: toCostCurrency_(result.amount?.value || 0, result.amount?.currency, date),
                         cost_type: result.line_item || '',
                     }));
                 }
@@ -561,4 +618,145 @@ function appendToSheet_(spreadsheet, newRows, fetchedKeys) {
     }
 
     Logger.log('Sheet updated: %s data rows', sheet.getLastRow() - 1);
+}
+
+
+// --- Section I: Static data (seat based costs) ---
+
+/** Keep the seat cost rows of the current (UTC) month in Static-Data-<year> up to date.
+ *
+ * - If no rows for (current month, STATIC_PROVIDER) exist, they are created by copying the rows of the most
+ *   recent earlier month (falling back to the previous year's sheet in January). Seat counts and EUR prices
+ *   are carried forward unchanged; user_count gets a note asking for a manual update from the members export,
+ *   because no API exposes the claude.ai Team seat tiers.
+ * - The eur-to-usd column of the current month's rows is set to the latest EUR->USD reference rate (4 decimals).
+ *   It is informational only (seat prices are EUR) and refreshed on every run until the month is over.
+ *   Cells carrying a note that does not start with STATIC_AUTO_NOTE_PREFIX are treated as manual and left alone.
+ *
+ * Past months are never modified.
+ *
+ * @param {Spreadsheet} spreadsheet The spreadsheet holding the Static-Data-<year> sheets.
+ */
+function updateStaticData_(spreadsheet) {
+    const now = new Date();
+    const year = now.getUTCFullYear();
+    const month = now.getUTCMonth() + 1;
+    const today = now.toISOString().slice(0, 10);
+
+    const sheet = SheetUtil.ensureSheet(spreadsheet, STATIC_SHEET_PREFIX + year);
+    if (sheet.getLastRow() === 0) {
+        sheet.getRange(1, 1, 1, STATIC_COLUMNS.length).setValues([STATIC_COLUMNS]);
+    }
+    const table = readStaticTable_(sheet);
+
+    const rate = SheetUtil.round(Currency.convertCurrency('EUR', 'USD', 1), 4);
+    const rateNote = STATIC_AUTO_NOTE_PREFIX + ' ECB reference rate EUR\u2192USD of ' + today
+        + ', refreshed daily while the month is current. Informational only, seat prices are EUR.'
+        + ' Replace the note to pin a manual value (e.g. the rate implied by the invoice).';
+
+    const current = table.rows.filter(function(r) { return r.provider === STATIC_PROVIDER && r.month === month; });
+    if (current.length > 0) {
+        let updated = 0;
+        for (const r of current) {
+            const cell = sheet.getRange(r.rowNumber, table.col.rate + 1);
+            const note = cell.getNote() || '';
+            if (note && note.indexOf(STATIC_AUTO_NOTE_PREFIX) !== 0) {
+                continue; // manual value, leave alone
+            }
+            if (r.rate !== rate || note !== rateNote) {
+                cell.setValue(rate).setNote(rateNote);
+                updated++;
+            }
+        }
+        Logger.log('Static data: %s/%s rows for %s-%s refreshed (EUR->USD %s)', updated, current.length, year, month, rate);
+        return;
+    }
+
+    // No rows for the current month yet: carry the most recent earlier month forward
+    let template = latestMonthRows_(table.rows, month);
+    let templateSource = STATIC_SHEET_PREFIX + year;
+    if (template.length === 0) {
+        const previousSheet = spreadsheet.getSheetByName(STATIC_SHEET_PREFIX + (year - 1));
+        if (previousSheet && previousSheet.getLastRow() > 1) {
+            template = latestMonthRows_(readStaticTable_(previousSheet).rows, 13);
+            templateSource = STATIC_SHEET_PREFIX + (year - 1);
+        }
+    }
+    if (template.length === 0) {
+        Logger.log('Static data: no earlier %s rows to carry forward into %s-%s, add them manually', STATIC_PROVIDER, year, month);
+        return;
+    }
+
+    const countNote = STATIC_AUTO_NOTE_PREFIX + ' carried forward from ' + templateSource + ' month ' + template[0].month
+        + ' on ' + today + '. Update from the claude.ai members export (Seat Tier column) and remove this note.';
+    const width = table.header.length;
+    const values = template.map(function(t) {
+        const row = new Array(width).fill('');
+        row[table.col.month] = month;
+        row[table.col.provider] = t.provider;
+        row[table.col.count] = t.count;
+        row[table.col.type] = t.type;
+        row[table.col.cost] = t.cost;
+        row[table.col.rate] = rate;
+        return row;
+    });
+
+    const firstRow = sheet.getLastRow() + 1;
+    const range = sheet.getRange(firstRow, 1, values.length, width);
+    range.setValues(values);
+    sheet.getRange(firstRow, table.col.month + 1, values.length, 1).setNumberFormat('0');
+    sheet.getRange(firstRow, table.col.count + 1, values.length, 1).setNumberFormat('0').setNote(countNote);
+    sheet.getRange(firstRow, table.col.cost + 1, values.length, 1).setNumberFormat('#,##0.00"\u20ac"');
+    sheet.getRange(firstRow, table.col.rate + 1, values.length, 1).setNumberFormat('0.0000').setNote(rateNote);
+
+    Logger.log('Static data: added %s %s rows for %s-%s (carried forward from %s month %s, EUR->USD %s)',
+        values.length, STATIC_PROVIDER, year, month, templateSource, template[0].month, rate);
+}
+
+
+/** Read a Static-Data sheet into {header, col, rows}. Columns are located by header name. */
+function readStaticTable_(sheet) {
+    const lastColumn = Math.max(sheet.getLastColumn(), STATIC_COLUMNS.length);
+    const header = sheet.getRange(1, 1, 1, lastColumn).getValues()[0].map(SheetUtil.sanitizeColumnName);
+    const indexOf = function(name) {
+        const i = header.indexOf(SheetUtil.sanitizeColumnName(name));
+        if (i < 0) throw new Error('Sheet ' + sheet.getName() + ' is missing column "' + name + '"');
+        return i;
+    };
+    const col = {
+        month: indexOf(STATIC_COLUMNS[0]),
+        provider: indexOf(STATIC_COLUMNS[1]),
+        count: indexOf(STATIC_COLUMNS[2]),
+        type: indexOf(STATIC_COLUMNS[3]),
+        cost: indexOf(STATIC_COLUMNS[4]),
+        rate: indexOf(STATIC_COLUMNS[5]),
+    };
+
+    const lastRow = sheet.getLastRow();
+    const data = lastRow > 1 ? sheet.getRange(2, 1, lastRow - 1, lastColumn).getValues() : [];
+    const rows = [];
+    data.forEach(function(r, i) {
+        const m = +r[col.month];
+        if (!(m >= 1 && m <= 12)) return;
+        rows.push({
+            rowNumber: i + 2,
+            month: m,
+            provider: String(r[col.provider] || '').trim(),
+            count: r[col.count],
+            type: r[col.type],
+            cost: r[col.cost],
+            rate: r[col.rate],
+        });
+    });
+
+    return {header: header, col: col, rows: rows};
+}
+
+
+/** Rows of STATIC_PROVIDER for the latest month strictly before the given month (empty if none). */
+function latestMonthRows_(rows, beforeMonth) {
+    const candidates = rows.filter(function(r) { return r.provider === STATIC_PROVIDER && r.month < beforeMonth; });
+    if (candidates.length === 0) return [];
+    const latest = Math.max.apply(null, candidates.map(function(r) { return r.month; }));
+    return candidates.filter(function(r) { return r.month === latest; });
 }
