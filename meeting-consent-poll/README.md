@@ -31,14 +31,21 @@ place with the current tally. External guests cannot open the web app and are as
    7 days ahead). Member IDs (`users/{id}`) are resolved to emails via the People API directory and
    a space qualifies when at least 80% of its members are event attendees. Spaces already used by
    another poll are skipped, a `displayName` containing the event title wins, then the oldest.
+   If nothing matches (Google only creates the meeting conversation once somebody writes into the
+   in-meeting chat, so before the meeting there is usually nothing to find), `createMeetingChatSpace_()`
+   sets up a `GROUP_CHAT` as the organizer via
+   [`spaces.setup`](https://developers.google.com/workspace/chat/set-up-spaces) with the internal,
+   non-declined attendees as members (a `DIRECT_MESSAGE` if there is just one). External guests
+   cannot be added to a space by the API. The created space is recorded per event (`space.<eventId>`)
+   so a failed post reuses it on the next run instead of creating another chat.
 3. The consent text is posted as the organizer with the `chat.messages` scope. State (attendees,
    names, responses, message name, random token) is stored in ScriptProperties keyed by event ID.
 4. `doGet()` records a response under a script lock and updates the message text via
    `spaces.messages.patch` as the organizer.
 5. State and dedup markers are cleaned up after 48 hours.
 
-If no meeting conversation is found yet (Google creates it lazily, and it only shows up once someone
-has written into it), the event is retried on every trigger run until it ends.
+If neither a meeting conversation is found nor a space can be created (no internal attendees besides
+the organizer), the event is retried on every trigger run until it ends.
 
 ## Deployment
 
@@ -51,6 +58,7 @@ has written into it), the event is retried on every trigger run until it ends.
    - `https://www.googleapis.com/auth/calendar` (used by the shared `CalendarClient`)
    - `https://www.googleapis.com/auth/directory.readonly`
    - `https://www.googleapis.com/auth/chat.spaces.readonly`
+   - `https://www.googleapis.com/auth/chat.spaces.create`
    - `https://www.googleapis.com/auth/chat.memberships.readonly`
    - `https://www.googleapis.com/auth/chat.messages`
 
@@ -73,12 +81,13 @@ has written into it), the event is retried on every trigger run until it ends.
    ```
    Optional: `ConsentPoll.lookaheadMinutes` (default 15), `ConsentPoll.minAttendees` (default 2).
 
-5. Test manually: create a meeting with a Meet link starting in a few minutes, write one message into
-   its meeting chat (this makes Google create the conversation), then run
+5. Test manually: create a meeting with a Meet link starting in a few minutes and run
    ```bash
    clasp run 'checkUpcomingMeetings'
    ```
-   and check the execution log. Click both links, verify the message text updates.
+   and check the execution log. A new group chat with the attendees should appear in Google Chat.
+   Click both links, verify the message text updates. To exercise the discovery path instead, write
+   one message into the meeting chat first (this makes Google create the meeting conversation).
 
 6. Install the trigger:
    ```bash
@@ -87,8 +96,13 @@ has written into it), the event is retried on every trigger run until it ends.
 
 ## Known limitations
 
-- Depends on the meeting conversation existing; meetings where the host disabled continuous chat
-  get no poll.
+- A group chat created by the script is a regular Google Chat conversation between the attendees, not
+  the Meet meeting conversation: it does not show up in the in-meeting chat panel and participants
+  see it in Google Chat. Once Google creates the real meeting conversation (first in-meeting message),
+  it is left alone because the poll has already been sent for that event.
+- For meetings with a single other internal attendee the poll goes into the existing 1:1 DM.
+- External guests are never added to a created space (Chat API restriction) and only reach the poll
+  if the meeting conversation was found instead.
 - Matching by member overlap is a heuristic; recurring meetings with identical attendees are
   disambiguated by title and creation time only.
 - Only meetings organized by active employees on `allowedDomains` are handled.
