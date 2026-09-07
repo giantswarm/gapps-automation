@@ -15,7 +15,7 @@ lib_trailer_file =
 lib_filter = 's/([[()\?\!\&\|,.;= +\-\*\t\t\n])(async|await)([() \t\n])/\1\3/g'
 lib_files = lib/OAuth2.gs lib/UrlFetchJsonClient.js lib/GeminiRestClient.js lib/SlackWebClient.js lib/CalendarListClient.js \
     lib/CalendarClient.js lib/MeetClient.js lib/DirectoryClient.js lib/PersonioAuthV1.js lib/PersonioClientV1.js lib/DriveClientV1.js lib/GmailClientV1.js lib/SheetUtil.js \
-    lib/TriggerUtil.js lib/Util.js lib/PeopleTime.js
+    lib/TriggerUtil.js lib/Util.js lib/Currency.js lib/PeopleTime.js
 
 .PHONY: all
 all: $(gas_projects)    ## Assemble and push all project using existing .clasp.json files (assumes all projects have been pushed before)
