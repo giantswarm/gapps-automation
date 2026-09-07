@@ -15,9 +15,6 @@
  *   - Time-based trigger scans organizer calendars for upcoming meetings with a Meet link
  *   - Finds the meeting conversation by impersonating the organizer and matching Chat group DM
  *     members (users/{id}, resolved via the People API directory) against the event attendees
- *   - If no meeting conversation exists yet (Google only creates it once someone writes into the
- *     in-meeting chat), creates a group chat with the internal attendees as the organizer via
- *     spaces.setup (chat.spaces.create scope), so the poll can go out before the meeting starts
  *   - Posts a text message as the organizer (chat.messages scope) with consent/decline links
  *   - doGet() records responses and patches the message text in place with the current tally
  *
@@ -74,13 +71,6 @@ const STATE_KEY_PREFIX = 'state.';
 /** Prefix for sent dedup markers stored in ScriptProperties (keyed by event ID). */
 const SENT_KEY_PREFIX = 'sent.';
 
-/** Prefix for chat spaces created by this script (keyed by event ID, value: "<spaceName>|<createdAt>").
- *
- * Recorded before the poll message is posted, so a failed post reuses the space on the next run
- * instead of creating a second group chat for the same meeting.
- */
-const CREATED_SPACE_KEY_PREFIX = 'space.';
-
 /** Maximum age for state entries before cleanup (48 hours). */
 const STATE_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 
@@ -93,15 +83,11 @@ const SPACE_CREATE_WINDOW_AFTER_MS = 60 * 60 * 1000;
 /** Minimum fraction of chat members that must be event attendees. */
 const MIN_MEMBER_OVERLAP = 0.8;
 
-/** spaces.setup accepts at most 49 memberships (the calling user is added automatically). */
-const MAX_SETUP_MEMBERS = 49;
-
 /** Chat API base URL. */
 const CHAT_API_BASE = 'https://chat.googleapis.com/v1';
 
 /** Scopes used via domain-wide delegation (impersonating the organizer). */
 const SCOPE_CHAT_SPACES_READONLY = 'https://www.googleapis.com/auth/chat.spaces.readonly';
-const SCOPE_CHAT_SPACES_CREATE = 'https://www.googleapis.com/auth/chat.spaces.create';
 const SCOPE_CHAT_MEMBERSHIPS_READONLY = 'https://www.googleapis.com/auth/chat.memberships.readonly';
 const SCOPE_CHAT_MESSAGES = 'https://www.googleapis.com/auth/chat.messages';
 
@@ -175,7 +161,6 @@ function checkUpcomingMeetings() {
     const context = {
         creds: creds,
         webAppUrl: webAppUrl,
-        allowedDomains: allowedDomains,
         directory: null,            // lazily loaded: {idToPerson: {}, emailToPerson: {}}
         usedSpaces: loadUsedSpaces_()
     };
@@ -451,107 +436,6 @@ function loadUsedSpaces_() {
 
 
 // ---------------------------------------------------------------------------
-// Meeting Chat Space Creation
-// ---------------------------------------------------------------------------
-
-/** Create a group chat for a meeting as the organizer (fallback when no meeting conversation exists).
- *
- * Uses spaces.setup (https://developers.google.com/workspace/chat/set-up-spaces), which creates the
- * space and adds the members in one call. Rules that shape this function:
- *   - The calling user (organizer) is added automatically and must not be listed
- *   - Only users of the Workspace organization can be added, so external guests are left out
- *   - At most 49 memberships per request
- *   - GROUP_CHAT needs at least two members and must not have a displayName
- *   - With exactly one member a DIRECT_MESSAGE is set up (the existing DM is returned if there is one)
- *   - requestId (a UUID) makes the call idempotent, and the created space is recorded per event so a
- *     failed poll post on a later run reuses it instead of creating another chat
- *
- * Returns the space or null if no members can be added.
- */
-function createMeetingChatSpace_(context, organizerEmail, event) {
-    const existing = loadCreatedSpace_(event.id);
-    if (existing) {
-        Logger.log('Reusing previously created chat space %s for event %s (%s)', existing, event.id, event.summary);
-        return {name: existing};
-    }
-
-    const directory = getDirectory_(context, organizerEmail);
-    const organizer = organizerEmail.toLowerCase();
-    const isInternal = email => context.allowedDomains.some(domain => email.endsWith('@' + domain));
-
-    const memberNames = [];
-    const seen = {};
-    for (const attendee of (event.attendees || [])) {
-        const email = (attendee.email || '').toLowerCase();
-        if (!email || email === organizer || seen[email] || attendee.resource
-            || email.endsWith('calendar.google.com') || attendee.responseStatus === 'declined') {
-            continue;
-        }
-        seen[email] = true;
-
-        // users/{id} is the canonical form, users/{email} works for organization members too
-        const person = directory.emailToPerson[email];
-        if (person) {
-            memberNames.push('users/' + person.id);
-        } else if (isInternal(email)) {
-            memberNames.push('users/' + email);
-        } else {
-            Logger.log('Not adding external attendee %s to the chat for event %s (%s)', email, event.id, event.summary);
-        }
-    }
-
-    if (memberNames.length === 0) {
-        Logger.log('No internal attendees besides the organizer for event %s (%s), not creating a chat space',
-            event.id, event.summary);
-        return null;
-    }
-
-    if (memberNames.length > MAX_SETUP_MEMBERS) {
-        Logger.log('Event %s (%s) has %s internal attendees, only the first %s are added to the chat space',
-            event.id, event.summary, '' + memberNames.length, '' + MAX_SETUP_MEMBERS);
-        memberNames.length = MAX_SETUP_MEMBERS;
-    }
-
-    const spaceType = memberNames.length === 1 ? 'DIRECT_MESSAGE' : 'GROUP_CHAT';
-    const setupService = UrlFetchJsonClient.createImpersonatingService(
-        'ConsentPollSetup-' + organizerEmail, context.creds, organizerEmail, SCOPE_CHAT_SPACES_CREATE);
-    const setupClient = new UrlFetchJsonClient(setupService);
-
-    const space = setupClient.postJson(CHAT_API_BASE + '/spaces:setup', {
-        space: {spaceType: spaceType},
-        requestId: Util.generateUUIDv4(),
-        memberships: memberNames.map(name => ({member: {name: name, type: 'HUMAN'}}))
-    });
-
-    if (!space || !space.name) {
-        throw new Error('spaces.setup returned no space for event ' + event.id);
-    }
-
-    saveCreatedSpace_(event.id, space.name);
-    Logger.log('Created %s %s with %s members as %s for event %s (%s)',
-        spaceType, space.name, '' + memberNames.length, organizerEmail, event.id, event.summary);
-
-    return space;
-}
-
-
-/** Load the name of a chat space previously created for an event, or null. */
-function loadCreatedSpace_(eventId) {
-    const raw = getScriptProperties_().getProperty(CREATED_SPACE_KEY_PREFIX + eventId);
-    if (!raw) {
-        return null;
-    }
-    return raw.split('|')[0] || null;
-}
-
-
-/** Record a chat space created for an event. */
-function saveCreatedSpace_(eventId, spaceName) {
-    getScriptProperties_().setProperty(CREATED_SPACE_KEY_PREFIX + eventId, spaceName + '|' + Date.now());
-}
-
-
-// ---------------------------------------------------------------------------
 // Consent Poll Sending
 // ---------------------------------------------------------------------------
 
@@ -563,26 +447,19 @@ function sendConsentPoll_(context, event) {
         return;
     }
 
+    const space = findMeetingChatSpace_(context, organizerEmail, event);
+    if (!space) {
+        Logger.log('No matching meeting conversation found for event %s (%s), will retry on next trigger run',
+            event.id, event.summary);
+        return;
+    }
+
+    Logger.log('Found meeting conversation %s for event %s (%s)', space.name, event.id, event.summary);
+
     const directory = getDirectory_(context, organizerEmail);
     const attendees = (event.attendees || [])
         .map(a => (a.email || '').toLowerCase())
         .filter(e => !!e && !e.endsWith('calendar.google.com'));   // drop rooms/resources
-
-    let space = findMeetingChatSpace_(context, organizerEmail, event);
-    let spaceCreated = false;
-    if (space) {
-        Logger.log('Found meeting conversation %s for event %s (%s)', space.name, event.id, event.summary);
-    } else {
-        // Google only creates the meeting conversation once someone writes into the in-meeting chat,
-        // so before the meeting there is usually nothing to find. Create a group chat instead.
-        space = createMeetingChatSpace_(context, organizerEmail, event);
-        if (!space) {
-            Logger.log('No meeting conversation found and none created for event %s (%s), will retry on next trigger run',
-                event.id, event.summary);
-            return;
-        }
-        spaceCreated = true;
-    }
 
     const names = {};
     for (const email of attendees) {
@@ -597,7 +474,6 @@ function sendConsentPoll_(context, event) {
         meetingTime: event.start.dateTime || event.start.date,
         organizerEmail: organizerEmail,
         spaceName: space.name,
-        spaceCreated: spaceCreated,
         attendees: attendees,
         names: names,
         responses: {},
@@ -901,12 +777,6 @@ function cleanupOldState_() {
             if (sentAt && (now - sentAt) > STATE_MAX_AGE_MS) {
                 getScriptProperties_().deleteProperty(key);
                 Logger.log('Cleaned up old sent marker: %s', key);
-            }
-        } else if (key.startsWith(CREATED_SPACE_KEY_PREFIX)) {
-            const createdAt = +(properties[key].split('|')[1]);
-            if (!createdAt || (now - createdAt) > STATE_MAX_AGE_MS) {
-                getScriptProperties_().deleteProperty(key);
-                Logger.log('Cleaned up old created space marker: %s', key);
             }
         }
     }
