@@ -26,10 +26,16 @@ place with the current tally. External guests cannot open the web app and are as
 1. `checkUpcomingMeetings()` (time trigger) loads active employees from Personio and scans each
    employee's primary calendar for events starting within `lookaheadMinutes` that they organize,
    have at least `minAttendees` attendees and a Google Meet link.
-2. `findMeetingChatSpace_()` impersonates the organizer and lists their `GROUP_CHAT` spaces created
-   between 8 days before and 1 hour after the meeting start (meeting conversations are created up to
-   7 days ahead). Member IDs (`users/{id}`) are resolved to emails via the People API directory and
-   a space qualifies when at least 80% of its members are event attendees. Spaces already used by
+2. `findMeetingChatSpace_()` looks for group DMs created between 8 days before and 1 hour after the
+   meeting start (meeting conversations are [created up to 7 days ahead](https://knowledge.workspace.google.com/admin/chat/managing-meeting-conversations-for-chat)),
+   from two sources:
+   - the **Chat audit log** (Admin SDK Reports API, impersonating `reportsUser`): `room_created`
+     events with `conversation_type == GROUP_DIRECT_MESSAGE` list the system generated conversations
+     before anyone wrote into them, `add_room_member` events list their members. Loaded once per run.
+   - fallback: `spaces.list` as the organizer, which only returns group DMs that already contain a
+     message. Member IDs (`users/{id}`) are resolved to emails via the People API directory.
+
+   A candidate qualifies when at least 80% of its members are event attendees. Spaces already used by
    another poll are skipped, a `displayName` containing the event title wins, then the oldest.
 3. The consent text is posted as the organizer with the `chat.messages` scope. State (attendees,
    names, responses, message name, random token) is stored in ScriptProperties keyed by event ID.
@@ -37,8 +43,9 @@ place with the current tally. External guests cannot open the web app and are as
    `spaces.messages.patch` as the organizer.
 5. State and dedup markers are cleaned up after 48 hours.
 
-If no meeting conversation is found yet (Google creates it lazily, and it only shows up once someone
-has written into it), the event is retried on every trigger run until it ends.
+If no meeting conversation is found yet, the event is retried on every trigger run until it ends.
+Without audit log access this only succeeds once someone has written into the conversation, because
+`spaces.list` hides empty group DMs.
 
 ## Deployment
 
@@ -53,8 +60,11 @@ has written into it), the event is retried on every trigger run until it ends.
    - `https://www.googleapis.com/auth/chat.spaces.readonly`
    - `https://www.googleapis.com/auth/chat.memberships.readonly`
    - `https://www.googleapis.com/auth/chat.messages`
+   - `https://www.googleapis.com/auth/admin.reports.audit.readonly` (Chat audit log)
 
-   Make sure the Google Chat API and People API are enabled in the service account's GCP project.
+   Make sure the Google Chat API, People API and Admin SDK API are enabled in the service account's
+   GCP project. The account impersonated for the audit log (`ConsentPoll.reportsUser`, default: the
+   account running the script) needs the **Reports** admin privilege in the Admin Console.
 
 3. Deploy the web app (execute as you, access: anyone within the domain) and note the `/exec` URL:
    ```bash
@@ -71,10 +81,11 @@ has written into it), the event is retried on every trigger run until it ends.
      "ConsentPoll.webAppUrl": "https://script.google.com/a/macros/example.com/s/.../exec"
    }, false]'
    ```
-   Optional: `ConsentPoll.lookaheadMinutes` (default 15), `ConsentPoll.minAttendees` (default 2).
+   Optional: `ConsentPoll.lookaheadMinutes` (default 15), `ConsentPoll.minAttendees` (default 2),
+   `ConsentPoll.reportsUser` (default: the account running the script).
 
-5. Test manually: create a meeting with a Meet link starting in a few minutes, write one message into
-   its meeting chat (this makes Google create the conversation), then run
+5. Test manually: create a meeting with a Meet link starting in a few minutes (without writing into
+   its meeting chat, to exercise the audit log path; write one message to test the fallback), then run
    ```bash
    clasp run 'checkUpcomingMeetings'
    ```
@@ -89,6 +100,11 @@ has written into it), the event is retried on every trigger run until it ends.
 
 - Depends on the meeting conversation existing; meetings where the host disabled continuous chat
   get no poll.
+- The audit log path assumes the `room_id` of the Chat audit log equals the `spaces/{id}` resource
+  name and that posting via the API into a not yet used conversation makes it visible to the
+  participants. Both have to be confirmed with the first real run (check the execution log).
+- Chat audit log data lags a couple of minutes behind; conversations created right before the
+  meeting are picked up by a later trigger run.
 - Matching by member overlap is a heuristic; recurring meetings with identical attendees are
   disambiguated by title and creation time only.
 - Only meetings organized by active employees on `allowedDomains` are handled.

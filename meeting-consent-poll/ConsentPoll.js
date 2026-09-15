@@ -13,8 +13,11 @@
  *
  * Architecture:
  *   - Time-based trigger scans organizer calendars for upcoming meetings with a Meet link
- *   - Finds the meeting conversation by impersonating the organizer and matching Chat group DM
- *     members (users/{id}, resolved via the People API directory) against the event attendees
+ *   - Finds the meeting conversation via the Chat audit log (Admin SDK Reports API, impersonating an
+ *     admin): system generated group DMs show up there before anyone wrote into them, unlike in
+ *     spaces.list. Falls back to listing the organizer's group DMs. Candidates are matched by member
+ *     overlap (members from the audit log, or users/{id} resolved via the People API directory)
+ *     against the event attendees
  *   - Posts a text message as the organizer (chat.messages scope) with consent/decline links
  *   - doGet() records responses and patches the message text in place with the current tally
  *
@@ -56,6 +59,15 @@ const LOOKAHEAD_MINUTES_KEY = PROPERTY_PREFIX + 'lookaheadMinutes';
  */
 const MIN_ATTENDEES_KEY = PROPERTY_PREFIX + 'minAttendees';
 
+/** Admin account to impersonate for reading the Chat audit log (Admin SDK Reports API).
+ *
+ * Needs the "Reports" admin privilege. If the audit log cannot be read, discovery falls back to
+ * listing the organizer's group DMs (which only works once someone wrote into the conversation).
+ *
+ * Default: the account executing the script (Session.getEffectiveUser())
+ */
+const REPORTS_USER_KEY = PROPERTY_PREFIX + 'reportsUser';
+
 /** Public URL of this script's web app deployment (the /exec URL).
  *
  * Default: ScriptApp.getService().getUrl()
@@ -90,6 +102,15 @@ const CHAT_API_BASE = 'https://chat.googleapis.com/v1';
 const SCOPE_CHAT_SPACES_READONLY = 'https://www.googleapis.com/auth/chat.spaces.readonly';
 const SCOPE_CHAT_MEMBERSHIPS_READONLY = 'https://www.googleapis.com/auth/chat.memberships.readonly';
 const SCOPE_CHAT_MESSAGES = 'https://www.googleapis.com/auth/chat.messages';
+
+/** Scope used via domain-wide delegation to read the Chat audit log (impersonating the reports user). */
+const SCOPE_REPORTS_AUDIT_READONLY = 'https://www.googleapis.com/auth/admin.reports.audit.readonly';
+
+/** Admin SDK Reports API base URL. */
+const REPORTS_API_BASE = 'https://admin.googleapis.com/admin/reports/v1';
+
+/** Chat audit log conversation_type of group DMs (meeting conversations are group DMs). */
+const AUDIT_GROUP_DM_TYPE = 'GROUP_DIRECT_MESSAGE';
 
 /** Maximum number of attendee names to show in the message before truncating. */
 const MAX_DISPLAY_NAMES = 20;
@@ -162,6 +183,7 @@ function checkUpcomingMeetings() {
         creds: creds,
         webAppUrl: webAppUrl,
         directory: null,            // lazily loaded: {idToPerson: {}, emailToPerson: {}}
+        auditRooms: undefined,      // lazily loaded: {roomId: {name, createTime, memberEmails: Set}}, null if unavailable
         usedSpaces: loadUsedSpaces_()
     };
 
@@ -289,25 +311,198 @@ function getDirectory_(context, impersonatedEmail) {
 
 /** Find the Chat group DM corresponding to a meeting's conversation.
  *
- * There is no API link between Calendar events and meeting conversations. Matching algorithm:
- *   1. Impersonate the organizer, list their GROUP_CHAT spaces
- *   2. Keep spaces created within [eventStart - 8 days, eventStart + 1 hour]
- *      (Google Chat creates meeting conversations up to 7 days ahead)
- *   3. Skip spaces already used by another poll
- *   4. Resolve member IDs to emails, require >= 80% of members to be event attendees
- *   5. Prefer a displayName containing the event title, then the earliest created candidate
- *      (for recurring meetings the conversation of the next instance may already exist)
+ * There is no API link between Calendar events and meeting conversations, and spaces.list hides
+ * group DMs until the first message was sent into them. Two sources for candidates, in order:
+ *   1. Chat audit log (Admin SDK Reports API, impersonating the reports user): room_created events
+ *      of GROUP_DIRECT_MESSAGE conversations reveal the system generated meeting conversations
+ *      before anyone wrote into them, add_room_member events reveal their members
+ *   2. spaces.list as the organizer (only conversations with at least one message)
+ *
+ * Candidate selection (both sources):
+ *   - created within [eventStart - 8 days, eventStart + 1 hour]
+ *     (Google Chat creates meeting conversations up to 7 days ahead)
+ *   - not already used by another poll
+ *   - >= 80% of the members are event attendees (members from the audit log, else resolved via
+ *     Chat memberships and the People API directory)
+ *   - prefer a displayName containing the event title, then the earliest created candidate
+ *     (for recurring meetings the conversation of the next instance may already exist)
  */
 function findMeetingChatSpace_(context, organizerEmail, event) {
-    const spacesService = UrlFetchJsonClient.createImpersonatingService(
-        'ConsentPollSpaces-' + organizerEmail, context.creds, organizerEmail, SCOPE_CHAT_SPACES_READONLY);
-    const spacesClient = new UrlFetchJsonClient(spacesService);
-
     const eventStart = new Date(event.start.dateTime || event.start.date);
-    const windowStart = new Date(eventStart.getTime() - SPACE_CREATE_WINDOW_BEFORE_MS);
-    const windowEnd = new Date(eventStart.getTime() + SPACE_CREATE_WINDOW_AFTER_MS);
+    const window = {
+        start: eventStart.getTime() - SPACE_CREATE_WINDOW_BEFORE_MS,
+        end: eventStart.getTime() + SPACE_CREATE_WINDOW_AFTER_MS
+    };
 
-    const candidateSpaces = [];
+    let candidates = [];
+    try {
+        candidates = listAuditCandidateSpaces_(context, organizerEmail, window);
+    } catch (e) {
+        Logger.log('Chat audit log lookup failed, falling back to spaces.list: %s', e);
+    }
+    Logger.log('Found %s candidate chat spaces in the audit log for event %s (%s)',
+        '' + candidates.length, event.id, event.summary);
+
+    const auditSpace = selectMeetingChatSpace_(context, organizerEmail, event, candidates);
+    if (auditSpace) {
+        return auditSpace;
+    }
+
+    candidates = listOrganizerCandidateSpaces_(context, organizerEmail, window);
+    Logger.log('Found %s candidate chat spaces via spaces.list for event %s (%s)',
+        '' + candidates.length, event.id, event.summary);
+
+    return selectMeetingChatSpace_(context, organizerEmail, event, candidates);
+}
+
+
+/** Load all group DM creations (and their member additions) from the Chat audit log, once per run.
+ *
+ * @returns {Object|null} {roomId: {name, createTime, memberEmails: Set}} or null if the log is unavailable
+ */
+function loadAuditRooms_(context) {
+    if (context.auditRooms !== undefined) {
+        return context.auditRooms;
+    }
+    context.auditRooms = null;   // stays null if loading fails, so we fail only once per run
+
+    const reportsUser = getReportsUser_();
+    if (!reportsUser) {
+        Logger.log('No reports user available, skipping Chat audit log lookup');
+        return null;
+    }
+
+    const service = UrlFetchJsonClient.createImpersonatingService(
+        'ConsentPollReports-' + reportsUser, context.creds, reportsUser, SCOPE_REPORTS_AUDIT_READONLY);
+    const reportsClient = new UrlFetchJsonClient(service);
+
+    // Every event we handle starts at or after now, so its window starts at or after now - 8 days
+    const startTime = new Date(Date.now() - SPACE_CREATE_WINDOW_BEFORE_MS).toISOString();
+
+    const rooms = {};
+    for (const activity of listChatAuditActivities_(reportsClient, 'room_created', startTime,
+        'conversation_type==' + AUDIT_GROUP_DM_TYPE)) {
+        const params = auditParameters_(activity);
+        if (!params.room_id) {
+            continue;
+        }
+        const memberEmails = new Set();
+        const actorEmail = (activity.actor?.email || '').toLowerCase();
+        if (actorEmail) {
+            memberEmails.add(actorEmail);
+        }
+        rooms[params.room_id] = {
+            name: 'spaces/' + params.room_id,
+            createTime: activity.id?.time,
+            memberEmails: memberEmails
+        };
+    }
+
+    let memberCount = 0;
+    for (const activity of listChatAuditActivities_(reportsClient, 'add_room_member', startTime)) {
+        const params = auditParameters_(activity);
+        const room = rooms[params.room_id];
+        if (!room) {
+            continue;
+        }
+        for (const target of [].concat(params.target_users || [])) {
+            const email = ('' + target).trim().toLowerCase();
+            if (email) {
+                room.memberEmails.add(email);
+                ++memberCount;
+            }
+        }
+    }
+
+    Logger.log('Loaded %s group DMs (%s member additions) from the Chat audit log since %s as %s',
+        '' + Object.keys(rooms).length, '' + memberCount, startTime, reportsUser);
+
+    context.auditRooms = rooms;
+    return rooms;
+}
+
+
+/** List Chat audit log activities of one event type since startTime (Admin SDK Reports API). */
+function listChatAuditActivities_(reportsClient, eventName, startTime, filters) {
+    const activities = [];
+    let pageToken = undefined;
+    do {
+        const query = UrlFetchJsonClient.buildQuery({
+            eventName: eventName,
+            startTime: startTime,
+            filters: filters,
+            maxResults: 1000,
+            pageToken: pageToken
+        });
+        const response = reportsClient.getJson(REPORTS_API_BASE + '/activity/users/all/applications/chat' + query) || {};
+        for (const activity of (response.items || [])) {
+            activities.push(activity);
+        }
+        pageToken = response.nextPageToken;
+    } while (pageToken);
+
+    return activities;
+}
+
+
+/** Flatten the parameters of an audit activity's first event into {name: value}. */
+function auditParameters_(activity) {
+    const params = {};
+    const event = (activity.events || [])[0] || {};
+    for (const parameter of (event.parameters || [])) {
+        if (parameter.multiValue !== undefined) {
+            params[parameter.name] = parameter.multiValue;
+        } else if (parameter.value !== undefined) {
+            params[parameter.name] = parameter.value;
+        } else if (parameter.intValue !== undefined) {
+            params[parameter.name] = parameter.intValue;
+        } else if (parameter.boolValue !== undefined) {
+            params[parameter.name] = parameter.boolValue;
+        }
+    }
+    return params;
+}
+
+
+/** Candidate spaces from the Chat audit log: group DMs created in the window, not used by another poll.
+ *
+ * When the audit log knows the members, the organizer must be one of them (the audit log covers the
+ * whole domain, not just the organizer's conversations). Otherwise members are resolved later.
+ *
+ * @returns {Array} [{space: {name, createTime}, memberEmails: Set|null}]
+ */
+function listAuditCandidateSpaces_(context, organizerEmail, window) {
+    const rooms = loadAuditRooms_(context) || {};
+    const organizer = organizerEmail.toLowerCase();
+
+    const candidates = [];
+    for (const roomId in rooms) {
+        const room = rooms[roomId];
+        if (context.usedSpaces[room.name] || !room.createTime) {
+            continue;
+        }
+        const createTime = new Date(room.createTime).getTime();
+        if (createTime < window.start || createTime > window.end) {
+            continue;
+        }
+        const memberEmails = room.memberEmails.size ? room.memberEmails : null;
+        if (memberEmails && !memberEmails.has(organizer)) {
+            continue;
+        }
+        candidates.push({space: {name: room.name, createTime: room.createTime}, memberEmails: memberEmails});
+    }
+    return candidates;
+}
+
+
+/** Candidate spaces from spaces.list as the organizer: group DMs created in the window, not used by another poll.
+ *
+ * @returns {Array} [{space: Space, memberEmails: null}]
+ */
+function listOrganizerCandidateSpaces_(context, organizerEmail, window) {
+    const spacesClient = createChatClient_(context.creds, organizerEmail, 'ConsentPollSpaces-', SCOPE_CHAT_SPACES_READONLY);
+
+    const candidates = [];
     let pageToken = undefined;
     do {
         const query = UrlFetchJsonClient.buildQuery({
@@ -321,18 +516,26 @@ function findMeetingChatSpace_(context, organizerEmail, event) {
             if (!space.createTime || context.usedSpaces[space.name]) {
                 continue;
             }
-            const createTime = new Date(space.createTime);
-            if (createTime >= windowStart && createTime <= windowEnd) {
-                candidateSpaces.push(space);
+            const createTime = new Date(space.createTime).getTime();
+            if (createTime >= window.start && createTime <= window.end) {
+                candidates.push({space: space, memberEmails: null});
             }
         }
 
         pageToken = response.nextPageToken;
     } while (pageToken);
 
-    Logger.log('Found %s candidate chat spaces for event %s (%s)', '' + candidateSpaces.length, event.id, event.summary);
+    return candidates;
+}
 
-    if (candidateSpaces.length === 0) {
+
+/** Pick the candidate whose members overlap the event attendees best (see findMeetingChatSpace_()).
+ *
+ * @param candidates [{space: {name, createTime, displayName?}, memberEmails: Set|null}]
+ * @returns {Object|null} The selected space ({name, createTime, displayName?}) or null
+ */
+function selectMeetingChatSpace_(context, organizerEmail, event, candidates) {
+    if (candidates.length === 0) {
         return null;
     }
 
@@ -340,34 +543,48 @@ function findMeetingChatSpace_(context, organizerEmail, event) {
         (event.attendees || []).map(a => (a.email || '').toLowerCase()).filter(e => !!e)
     );
 
-    const directory = getDirectory_(context, organizerEmail);
-    const membersService = UrlFetchJsonClient.createImpersonatingService(
-        'ConsentPollMembers-' + organizerEmail, context.creds, organizerEmail, SCOPE_CHAT_MEMBERSHIPS_READONLY);
-    const membersClient = new UrlFetchJsonClient(membersService);
-
     const title = (event.summary || '').trim().toLowerCase();
     const matches = [];
+    let membersClient = null;
 
-    for (const space of candidateSpaces) {
+    for (const candidate of candidates) {
+        const space = candidate.space;
         try {
-            const memberIds = listSpaceMemberIds_(membersClient, space.name);
-            if (memberIds.length === 0) {
-                continue;
-            }
-
+            let memberCount;
             let matchCount = 0;
-            for (const memberId of memberIds) {
-                const person = directory.idToPerson[memberId];
-                if (person && eventAttendeeEmails.has(person.email)) {
-                    matchCount++;
+            if (candidate.memberEmails) {
+                memberCount = candidate.memberEmails.size;
+                for (const email of candidate.memberEmails) {
+                    if (eventAttendeeEmails.has(email)) {
+                        matchCount++;
+                    }
+                }
+            } else {
+                const directory = getDirectory_(context, organizerEmail);
+                membersClient = membersClient
+                    || createChatClient_(context.creds, organizerEmail, 'ConsentPollMembers-', SCOPE_CHAT_MEMBERSHIPS_READONLY);
+                const memberIds = listSpaceMemberIds_(membersClient, space.name);
+                memberCount = memberIds.length;
+                for (const memberId of memberIds) {
+                    const person = directory.idToPerson[memberId];
+                    if (person && eventAttendeeEmails.has(person.email)) {
+                        matchCount++;
+                    }
                 }
             }
 
-            const overlap = matchCount / memberIds.length;
+            if (memberCount === 0) {
+                continue;
+            }
+
+            const overlap = matchCount / memberCount;
             Logger.log('Space %s: %s members, %s match event attendees (%s%% overlap)',
-                space.name, '' + memberIds.length, '' + matchCount, '' + Math.round(overlap * 100));
+                space.name, '' + memberCount, '' + matchCount, '' + Math.round(overlap * 100));
 
             if (overlap >= MIN_MEMBER_OVERLAP) {
+                if (space.displayName === undefined) {
+                    space.displayName = lookupSpaceDisplayName_(context, organizerEmail, space.name);
+                }
                 const titleMatch = !!title && (space.displayName || '').toLowerCase().includes(title);
                 matches.push({space: space, titleMatch: titleMatch, createTime: new Date(space.createTime).getTime()});
             }
@@ -382,6 +599,19 @@ function findMeetingChatSpace_(context, organizerEmail, event) {
 
     matches.sort((a, b) => (b.titleMatch - a.titleMatch) || (a.createTime - b.createTime));
     return matches[0].space;
+}
+
+
+/** Fetch a space's displayName as the organizer (spaces.get), null if unavailable. */
+function lookupSpaceDisplayName_(context, organizerEmail, spaceName) {
+    try {
+        const spacesClient = createChatClient_(context.creds, organizerEmail, 'ConsentPollSpaces-', SCOPE_CHAT_SPACES_READONLY);
+        const space = spacesClient.getJson(CHAT_API_BASE + '/' + spaceName) || {};
+        return space.displayName || null;
+    } catch (e) {
+        Logger.log('Failed to get space %s as %s: %s', spaceName, organizerEmail, e);
+        return null;
+    }
 }
 
 
@@ -498,8 +728,13 @@ function sendConsentPoll_(context, event) {
 
 /** Create a Chat client impersonating the given user with the chat.messages scope. */
 function createMessagesClient_(creds, userEmail) {
-    const service = UrlFetchJsonClient.createImpersonatingService(
-        'ConsentPollMessages-' + userEmail, creds, userEmail, SCOPE_CHAT_MESSAGES);
+    return createChatClient_(creds, userEmail, 'ConsentPollMessages-', SCOPE_CHAT_MESSAGES);
+}
+
+
+/** Create a JSON client impersonating the given user with one scope (serviceNamePrefix + userEmail names the token cache). */
+function createChatClient_(creds, userEmail, serviceNamePrefix, scope) {
+    const service = UrlFetchJsonClient.createImpersonatingService(serviceNamePrefix + userEmail, creds, userEmail, scope);
     return new UrlFetchJsonClient(service);
 }
 
@@ -837,6 +1072,20 @@ function getMinAttendees_() {
         return 2;
     }
     return count;
+}
+
+/** Get the admin account to impersonate for the Chat audit log (property override, else the executing account, else null). */
+function getReportsUser_() {
+    const configured = (getScriptProperties_().getProperty(REPORTS_USER_KEY) || '').trim();
+    if (configured) {
+        return configured;
+    }
+    try {
+        return (Session.getEffectiveUser().getEmail() || '').trim() || null;
+    } catch (e) {
+        Logger.log('Failed to determine the executing account: %s', e);
+        return null;
+    }
 }
 
 /** Get the web app URL (property override, else the deployed web app URL, else null). */
