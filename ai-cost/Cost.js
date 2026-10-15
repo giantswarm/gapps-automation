@@ -52,17 +52,18 @@ const STATIC_AUTO_NOTE_PREFIX = 'Auto:';
 const ANTHROPIC_BASE = 'https://api.anthropic.com';
 const OPENAI_BASE = 'https://api.openai.com';
 
-/** Anthropic standard-tier pricing per token (USD). Used to estimate per-model costs
- *  from the usage report, since the cost report has no model breakdown.
- *  Cache reads are 0.1x base input (0.025x on Fable 5.1 / Mythos 5.1), 5m cache writes
- *  are 1.25x, 1h cache writes are 2x. The 1M context window is billed at standard rates.
- *  Source: https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-09-04)
+/** Anthropic standard-tier pricing per token (USD). Used to estimate per-model costs from the usage
+ *  report (record_type usage, cost_type estimated), as a cross-check of the billed cost report rows.
+ *  Cache reads are 0.1x base input (0.025x on Fable 5.1 / Mythos 5.1, 0.05x on Opus 5.5), 5m cache
+ *  writes are 1.25x, 1h cache writes are 2x. The 1M context window is billed at standard rates.
+ *  Source: https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-10-07)
  */
 const ANTHROPIC_PRICING = {
     'claude-fable-5-1':  { input: 10.00 / 1e6, cache_read: 0.25 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
     'claude-mythos-5-1': { input: 10.00 / 1e6, cache_read: 0.25 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
     'claude-fable-5':    { input: 10.00 / 1e6, cache_read: 1.00 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
     'claude-mythos-5':   { input: 10.00 / 1e6, cache_read: 1.00 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
+    'claude-opus-5-5':   { input:  4.00 / 1e6, cache_read: 0.20 / 1e6, cache_5m:  5.00 / 1e6, cache_1h:  8.00 / 1e6, output: 20.00 / 1e6 },
     'claude-opus-5':     { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
     'claude-opus-4-8':   { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
     'claude-opus-4-7':   { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
@@ -70,6 +71,7 @@ const ANTHROPIC_PRICING = {
     'claude-opus-4-5':   { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
     'claude-opus-4-1':   { input: 15.00 / 1e6, cache_read: 1.50 / 1e6, cache_5m: 18.75 / 1e6, cache_1h: 30.00 / 1e6, output: 75.00 / 1e6 },
     'claude-opus-4':     { input: 15.00 / 1e6, cache_read: 1.50 / 1e6, cache_5m: 18.75 / 1e6, cache_1h: 30.00 / 1e6, output: 75.00 / 1e6 },
+    'claude-sonnet-5-5': { input:  2.00 / 1e6, cache_read: 0.20 / 1e6, cache_5m:  2.50 / 1e6, cache_1h:  4.00 / 1e6, output: 10.00 / 1e6 },
     'claude-sonnet-5':   { input:  2.00 / 1e6, cache_read: 0.20 / 1e6, cache_5m:  2.50 / 1e6, cache_1h:  4.00 / 1e6, output: 10.00 / 1e6 },
     'claude-sonnet-4-6': { input:  3.00 / 1e6, cache_read: 0.30 / 1e6, cache_5m:  3.75 / 1e6, cache_1h:  6.00 / 1e6, output: 15.00 / 1e6 },
     'claude-sonnet-4-5': { input:  3.00 / 1e6, cache_read: 0.30 / 1e6, cache_5m:  3.75 / 1e6, cache_1h:  6.00 / 1e6, output: 15.00 / 1e6 },
@@ -117,6 +119,25 @@ function backfillAiCosts(startDate, endDate) {
         throw new Error('startDate and endDate are required (YYYY-MM-DD, endDate exclusive)');
     }
     fetchAiCostsForRange_(startDate, endDate);
+}
+
+/** Throwaway: re-fetch 2026 from 2026-01-01 up to today, one call per month to stay within API bucket limits.
+ *  Completed months are remembered in a script property, so re-running after a timeout resumes. Remove once done. */
+function backfill2026() {
+    const props = getScriptProperties_();
+    const doneProp = PROPERTY_PREFIX + 'backfill2026Done';
+    const endDate = defaultEndDate_();
+    const pad = function(m) { return (m < 10 ? '0' : '') + m; };
+    for (let month = 1; month <= 12; month++) {
+        const start = '2026-' + pad(month) + '-01';
+        if (start >= endDate) break;
+        const done = (props.getProperty(doneProp) || '').split(',').filter(String);
+        if (done.indexOf(String(month)) >= 0) continue;
+        const nextMonth = month === 12 ? '2027-01-01' : '2026-' + pad(month + 1) + '-01';
+        backfillAiCosts(start, nextMonth < endDate ? nextMonth : endDate);
+        props.setProperty(doneProp, done.concat(String(month)).join(','));
+    }
+    Logger.log('Backfill 2026 complete');
 }
 
 function fetchAiCostsForRange_(startDate, endDate) {
@@ -408,24 +429,45 @@ function fetchAnthropicUsage_(apiKey, startDate, endDate) {
     );
 }
 
+/** Fetch actual (billed) Anthropic costs, one row per (day, model, cost_type).
+ *
+ * Grouping by description makes the API return one item per model and token type (input, output, cache ...);
+ * these are summed into a single row, keeping the per token type breakdown (EUR) in the metadata column.
+ */
 function fetchAnthropicCosts_(apiKey, startDate, endDate) {
     const url = ANTHROPIC_BASE + '/v1/organizations/cost_report'
         + '?starting_at=' + toIso8601_(startDate)
         + '&ending_at=' + toIso8601_(endDate)
-        + '&bucket_width=1d';
+        + '&bucket_width=1d&limit=31&group_by[]=description';
 
     return fetchAllPages_(url, anthropicHeaders_(apiKey),
         function(json) {
             const rows = [];
             for (const bucket of json.data || []) {
                 const date = (bucket.starting_at || '').slice(0, 10);
+                const byKey = new Map();
                 for (const result of bucket.results || []) {
-                    rows.push(makeRow_({
-                        date: date, source: 'anthropic', record_type: 'cost',
-                        model: result.model || '',
-                        cost_eur: toCostCurrency_(parseFloat(result.amount || '0') / 100, result.currency, date),
-                        cost_type: result.cost_type || '',
-                    }));
+                    const model = result.model || '';
+                    const costType = result.cost_type || '';
+                    const key = model + '|' + costType;
+                    let row = byKey.get(key);
+                    if (!row) {
+                        row = makeRow_({date: date, source: 'anthropic', record_type: 'cost', model: model, cost_type: costType});
+                        row.breakdown = {};
+                        byKey.set(key, row);
+                    }
+                    const eur = toCostCurrency_(parseFloat(result.amount || '0') / 100, result.currency, date);
+                    const detail = result.token_type || result.description || 'other';
+                    row.cost_eur += eur;
+                    row.breakdown[detail] = (row.breakdown[detail] || 0) + eur;
+                }
+                for (const row of byKey.values()) {
+                    for (const detail of Object.keys(row.breakdown)) {
+                        row.breakdown[detail] = SheetUtil.round(row.breakdown[detail], 4);
+                    }
+                    row.metadata = JSON.stringify(row.breakdown);
+                    delete row.breakdown;
+                    rows.push(row);
                 }
             }
             return rows;
