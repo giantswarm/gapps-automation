@@ -6,3 +6,6 @@ venv
 credentials.json
 */lib.js
 lib-output
+# downloaded invoices/receipts contain personal and billing data (public repository)
+Invoice-*.pdf
+Receipt-*.pdf
