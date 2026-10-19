@@ -822,7 +822,8 @@ async function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeCon
         const skipDueToFail = syncFailUpdatedAt != null && syncFailUpdatedAt === +timeOff.updatedAt;
 
         // check for dead zone
-        if (!skipDueToFail && timeOff.employeeId === employeeId && timeOff.updatedAt <= updateMax && !processedTimeOffIds[timeOff.id]) {
+        if (!skipDueToFail && timeOff.employeeId === employeeId && timeOff.updatedAt <= updateMax && !processedTimeOffIds[timeOff.id]
+            && !isOpenEndedBeforeTimeMin_(timeOff, fetchTimeMin)) {
 
             if (Date.now() >= deadlineTs) {
                 if (failCount > 0) {
@@ -842,6 +843,16 @@ async function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeCon
         putFailedSyncs_(primaryEmail, failedSyncs);
     }
     return true;
+}
+
+
+/** Check if an open-ended time-off's assumed single day lies before the event fetch window.
+ *
+ * Such time-offs may still be returned by Personio, but the corresponding event would never be found again
+ * in Google Calendar, leading to a new event being inserted on every run.
+ */
+function isOpenEndedBeforeTimeMin_(timeOff, timeMin) {
+    return !!timeOff.isOpenEnded && new Date(timeOff.endAt.switchHour24ToHour0().toISOString()) <= timeMin;
 }
 
 

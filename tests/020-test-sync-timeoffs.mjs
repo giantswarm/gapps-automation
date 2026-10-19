@@ -43,3 +43,14 @@ for (const [timeOffInput, expectedPayload] of [
     assert.equal(timeOff.endAt.hour, 24);
     assert.equal(+timeOff.updatedAt, 0, 'open-ended time-off must have a very early modification date');
 }
+
+// test isOpenEndedBeforeTimeMin_ (avoid re-inserting events for open-ended time-offs outside the fetch window)
+{
+    const isOpenEndedBeforeTimeMin_ = createTestFunctionWrapper('sync-timeoffs/SyncTimeOffs.js', 'isOpenEndedBeforeTimeMin_');
+    const timeMin = new Date('2026-10-01T00:00:00Z');
+    const day = date => ({startAt: PeopleTime.fromISO8601(date, 0), endAt: PeopleTime.fromISO8601(date, 24)});
+    assert.equal(isOpenEndedBeforeTimeMin_({isOpenEnded: true, ...day('2026-09-29T00:00:00Z')}, timeMin), true);
+    assert.equal(isOpenEndedBeforeTimeMin_({isOpenEnded: true, ...day('2026-09-30T00:00:00Z')}, timeMin), true);
+    assert.equal(isOpenEndedBeforeTimeMin_({isOpenEnded: true, ...day('2026-10-01T00:00:00Z')}, timeMin), false);
+    assert.equal(isOpenEndedBeforeTimeMin_({isOpenEnded: false, ...day('2026-09-29T00:00:00Z')}, timeMin), false);
+}
