@@ -24,7 +24,62 @@ const EMPLOYEE_REQUIRED_FIELDS = [
 ];
 
 
-/** Helper to format responses */
+/** Lookup table columns read by computeSalary(), by sheet name */
+const TABLE_COLUMNS = {
+    Data: ["Contract", "Todays Date", "OPS DUTY ANNUAL ONCALL BASE", "PERKS DEFAULT", "KIDS ALLOWANCE PER MONTH",
+        "Contract Adjust", "Cost Multiplier"],
+    TargetSalaries: ["Position", "Target Salary", "Variable \nCompany", "Variable Individual", "Options \nSelect"],
+    ExperienceLevel: ["Step", "Factor"],
+    ResponsibilityAmount: ["STEP", "Amount"],
+    Age: ["STEP", "Factor"]
+};
+
+const TABLES_CACHE_KEY = "salary-tables-v1";
+const TABLES_CACHE_TTL_SECONDS = 600;
+
+
+/** Read the lookup tables from the spreadsheet.
+ *
+ * @return {Object} Sheet name to array of row objects (keys are sanitized column names).
+ */
+function readTables() {
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const tables = {};
+    for (const [sheetName, columns] of Object.entries(TABLE_COLUMNS)) {
+        tables[sheetName] = SheetUtil.getSheetData(spreadsheet, sheetName, columns.map(SheetUtil.sanitizeColumnName))
+            .map(({$columnIndex, ...row}) => row);
+    }
+    return tables;
+}
+
+
+/** Like readTables(), but cached for TABLES_CACHE_TTL_SECONDS. */
+function readTablesCached() {
+    const cache = CacheService.getScriptCache();
+    const cached = cache.get(TABLES_CACHE_KEY);
+    if (cached) {
+        return JSON.parse(cached);
+    }
+
+    const json = JSON.stringify(readTables());
+    try {
+        cache.put(TABLES_CACHE_KEY, json, TABLES_CACHE_TTL_SECONDS);
+    } catch (e) {
+        console.warn("Failed to cache lookup tables: " + e.message);
+    }
+
+    // same values (e.g. Dates as strings) whether cached or not
+    return JSON.parse(json);
+}
+
+
+/** Simple trigger: invalidate cached lookup tables. */
+function onEdit(e) {
+    CacheService.getScriptCache().remove(TABLES_CACHE_KEY);
+}
+
+
+/** Helper to format responses, payload is the data (200) or an error message string/Error (otherwise) */
 function _respond(statusCode, payload) {
     let responseBody;
     if (statusCode === 200) {
@@ -36,7 +91,7 @@ function _respond(statusCode, payload) {
         responseBody = {
             status: statusCode,
             error: statusCode === 400 ? "Bad Request" : "Internal Server Error",
-            message: payload.message || "An error occurred"
+            message: (typeof payload === "string" ? payload : payload?.message) || "An error occurred"
         };
     }
 
@@ -70,12 +125,12 @@ function _respond(statusCode, payload) {
  */
 function doGet(e) {
     try {
-        const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-        const Data = SheetUtil.getSheetData(spreadsheet, "Data", []);
-        const Target = SheetUtil.getSheetData(spreadsheet, "TargetSalaries", []);
-        const ExpLvl = SheetUtil.getSheetData(spreadsheet, "ExperienceLevel", []);
-        const RespAmt = SheetUtil.getSheetData(spreadsheet, "ResponsibilityAmount", []);
-        const AgeTbl = SheetUtil.getSheetData(spreadsheet, "Age", []);
+        const tables = readTablesCached();
+        const Data = tables.Data;
+        const Target = tables.TargetSalaries;
+        const ExpLvl = tables.ExperienceLevel;
+        const RespAmt = tables.ResponsibilityAmount;
+        const AgeTbl = tables.Age;
         const targetByRole = SheetUtil.indexUnique(Target, "Position");
         const expByStep = SheetUtil.indexUnique(ExpLvl, "Step");
         const respByStep = SheetUtil.indexUnique(RespAmt, "STEP");
@@ -188,13 +243,13 @@ function computeSalary(employees) {
         return s.endsWith("%") ? parseFloat(s.slice(0, -1)) / 100 : parseFloat(s);
     };
 
-    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const tables = readTablesCached();
     const Employees = SheetUtil.mapRows(employees);
-    const Data = SheetUtil.getSheetData(spreadsheet, "Data");
-    const Target = SheetUtil.getSheetData(spreadsheet, "TargetSalaries");
-    const ExpLvl = SheetUtil.getSheetData(spreadsheet, "ExperienceLevel");
-    const RespAmt = SheetUtil.getSheetData(spreadsheet, "ResponsibilityAmount");
-    const AgeTbl = SheetUtil.getSheetData(spreadsheet, "Age");
+    const Data = tables.Data;
+    const Target = tables.TargetSalaries;
+    const ExpLvl = tables.ExperienceLevel;
+    const RespAmt = tables.ResponsibilityAmount;
+    const AgeTbl = tables.Age;
     const targetByRole = SheetUtil.indexUnique(Target, "Position");
     const expByStep = SheetUtil.indexUnique(ExpLvl, "Step");
     const respByStep = SheetUtil.indexUnique(RespAmt, "STEP");
