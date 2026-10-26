@@ -1,7 +1,7 @@
 /**
  * Fetch AI usage and cost statistics from LLM provider APIs and write to a Google Sheet.
  *
- * Supported sources: anthropic, claude-code, openai
+ * Supported sources: anthropic, claude-code, openai, Claude Team invoices (PDF attachments in a Gmail mailbox)
  *
  * All costs are written in EUR (we are billed in EUR). Provider APIs report USD, which is
  * converted using the ECB reference rate of the usage day (see Currency.convertCurrency).
@@ -9,12 +9,17 @@
  * Seat based (subscription) costs live in the manually maintained Static-Data-<year> sheet.
  * The script keeps the current month's rows present (carrying seat counts and EUR prices forward
  * from the previous month) and fills in the informational EUR->USD reference rate. Seat tiers of
- * the claude.ai Team plan are not exposed by any API, so user_count must be corrected by hand
- * from the claude.ai members export.
+ * the claude.ai Team plan are not exposed by any API. They, and the extra usage of the Team plan, are
+ * taken from the invoices Anthropic sends by mail (see fetchClaudeInvoices_). Without invoices,
+ * user_count must be corrected by hand from the claude.ai members export.
  *
  * Script Properties:
- *   AiCost.anthropicAdminKey  Anthropic admin API key (for anthropic + claude-code sources)
- *   AiCost.openaiAdminKey     OpenAI admin API key (for openai source)
+ *   AiCost.anthropicAdminKey          Anthropic admin API key (for anthropic + claude-code sources)
+ *   AiCost.openaiAdminKey             OpenAI admin API key (for openai source)
+ *   AiCost.invoiceMailbox             Mailbox receiving the Claude Team invoices (e.g. automation@example.com)
+ *   AiCost.serviceAccountCredentials  Service account credentials JSON (domain-wide delegation, scope
+ *                                     https://mail.google.com/), for reading invoiceMailbox
+ *   AiCost.invoiceSearchExpression    Optional, overrides INVOICE_DEFAULT_SEARCH (the date range is always added)
  *
  * Managed via: https://github.com/giantswarm/gapps-automation
  */
@@ -48,21 +53,39 @@ const STATIC_COLUMNS = ['month', 'provider', 'user_count', 'type', 'cost_cost_pe
 const STATIC_PROVIDER = 'claude-code';
 /** Prefix of cell notes written by the script (cells with other, manual notes are never overwritten). */
 const STATIC_AUTO_NOTE_PREFIX = 'Auto:';
+/** Static data type of the Team plan extra usage (monthly sum of the invoices, user_count 1). */
+const STATIC_EXTRA_USAGE_TYPE = 'Extra Usage';
+/** Static data type of prorated seat charges and credits (monthly sum of the invoices, user_count 1). */
+const STATIC_SEAT_ADJUSTMENT_TYPE = 'Seat Adjustment';
+/** Static data types summed up from invoices, which are never carried forward into a new month. */
+const STATIC_INVOICE_TYPES = [STATIC_EXTRA_USAGE_TYPE, STATIC_SEAT_ADJUSTMENT_TYPE];
+
+const INVOICE_MAILBOX_PROP = PROPERTY_PREFIX + 'invoiceMailbox';
+const SERVICE_ACCOUNT_CREDENTIALS_PROP = PROPERTY_PREFIX + 'serviceAccountCredentials';
+const INVOICE_SEARCH_PROP = PROPERTY_PREFIX + 'invoiceSearchExpression';
+/** Gmail search expression selecting candidate invoice mails (sent by Stripe on behalf of Anthropic, each with
+ *  an Invoice-<number>.pdf and a Receipt-<number>.pdf attachment). */
+const INVOICE_DEFAULT_SEARCH = 'from:invoice+statements@mail.anthropic.com has:attachment filename:pdf';
+/** Name prefix of the sheets listing every parsed invoice line item (one sheet per invoice year). */
+const INVOICE_SHEET_PREFIX = 'Invoices-';
+const INVOICE_COLUMNS = ['date', 'invoice', 'kind', 'tier', 'description', 'quantity', 'unit_price', 'amount',
+    'currency', 'amount_eur', 'message_id'];
 
 const ANTHROPIC_BASE = 'https://api.anthropic.com';
 const OPENAI_BASE = 'https://api.openai.com';
 
-/** Anthropic standard-tier pricing per token (USD). Used to estimate per-model costs
- *  from the usage report, since the cost report has no model breakdown.
- *  Cache reads are 0.1x base input (0.025x on Fable 5.1 / Mythos 5.1), 5m cache writes
- *  are 1.25x, 1h cache writes are 2x. The 1M context window is billed at standard rates.
- *  Source: https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-09-04)
+/** Anthropic standard-tier pricing per token (USD). Used to estimate per-model costs from the usage
+ *  report (record_type usage, cost_type estimated), as a cross-check of the billed cost report rows.
+ *  Cache reads are 0.1x base input (0.025x on Fable 5.1 / Mythos 5.1, 0.05x on Opus 5.5), 5m cache
+ *  writes are 1.25x, 1h cache writes are 2x. The 1M context window is billed at standard rates.
+ *  Source: https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-10-07)
  */
 const ANTHROPIC_PRICING = {
     'claude-fable-5-1':  { input: 10.00 / 1e6, cache_read: 0.25 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
     'claude-mythos-5-1': { input: 10.00 / 1e6, cache_read: 0.25 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
     'claude-fable-5':    { input: 10.00 / 1e6, cache_read: 1.00 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
     'claude-mythos-5':   { input: 10.00 / 1e6, cache_read: 1.00 / 1e6, cache_5m: 12.50 / 1e6, cache_1h: 20.00 / 1e6, output: 50.00 / 1e6 },
+    'claude-opus-5-5':   { input:  4.00 / 1e6, cache_read: 0.20 / 1e6, cache_5m:  5.00 / 1e6, cache_1h:  8.00 / 1e6, output: 20.00 / 1e6 },
     'claude-opus-5':     { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
     'claude-opus-4-8':   { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
     'claude-opus-4-7':   { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
@@ -70,6 +93,7 @@ const ANTHROPIC_PRICING = {
     'claude-opus-4-5':   { input:  5.00 / 1e6, cache_read: 0.50 / 1e6, cache_5m:  6.25 / 1e6, cache_1h: 10.00 / 1e6, output: 25.00 / 1e6 },
     'claude-opus-4-1':   { input: 15.00 / 1e6, cache_read: 1.50 / 1e6, cache_5m: 18.75 / 1e6, cache_1h: 30.00 / 1e6, output: 75.00 / 1e6 },
     'claude-opus-4':     { input: 15.00 / 1e6, cache_read: 1.50 / 1e6, cache_5m: 18.75 / 1e6, cache_1h: 30.00 / 1e6, output: 75.00 / 1e6 },
+    'claude-sonnet-5-5': { input:  2.00 / 1e6, cache_read: 0.20 / 1e6, cache_5m:  2.50 / 1e6, cache_1h:  4.00 / 1e6, output: 10.00 / 1e6 },
     'claude-sonnet-5':   { input:  2.00 / 1e6, cache_read: 0.20 / 1e6, cache_5m:  2.50 / 1e6, cache_1h:  4.00 / 1e6, output: 10.00 / 1e6 },
     'claude-sonnet-4-6': { input:  3.00 / 1e6, cache_read: 0.30 / 1e6, cache_5m:  3.75 / 1e6, cache_1h:  6.00 / 1e6, output: 15.00 / 1e6 },
     'claude-sonnet-4-5': { input:  3.00 / 1e6, cache_read: 0.30 / 1e6, cache_5m:  3.75 / 1e6, cache_1h:  6.00 / 1e6, output: 15.00 / 1e6 },
@@ -117,6 +141,25 @@ function backfillAiCosts(startDate, endDate) {
         throw new Error('startDate and endDate are required (YYYY-MM-DD, endDate exclusive)');
     }
     fetchAiCostsForRange_(startDate, endDate);
+}
+
+/** Throwaway: re-fetch 2026 from 2026-01-01 up to today, one call per month to stay within API bucket limits.
+ *  Completed months are remembered in a script property, so re-running after a timeout resumes. Remove once done. */
+function backfill2026() {
+    const props = getScriptProperties_();
+    const doneProp = PROPERTY_PREFIX + 'backfill2026Done';
+    const endDate = defaultEndDate_();
+    const pad = function(m) { return (m < 10 ? '0' : '') + m; };
+    for (let month = 1; month <= 12; month++) {
+        const start = '2026-' + pad(month) + '-01';
+        if (start >= endDate) break;
+        const done = (props.getProperty(doneProp) || '').split(',').filter(String);
+        if (done.indexOf(String(month)) >= 0) continue;
+        const nextMonth = month === 12 ? '2027-01-01' : '2026-' + pad(month + 1) + '-01';
+        backfillAiCosts(start, nextMonth < endDate ? nextMonth : endDate);
+        props.setProperty(doneProp, done.concat(String(month)).join(','));
+    }
+    Logger.log('Backfill 2026 complete');
 }
 
 function fetchAiCostsForRange_(startDate, endDate) {
@@ -198,11 +241,83 @@ function fetchAiCostsForRange_(startDate, endDate) {
         firstError = firstError || e;
     }
 
+    // Claude Team invoices (seats + extra usage), after the static data rows of the month exist
+    const invoiceMailbox = props.getProperty(INVOICE_MAILBOX_PROP) || '';
+    if (invoiceMailbox) {
+        try {
+            Logger.log('Fetching Claude Team invoices from %s...', invoiceMailbox);
+            fetchClaudeInvoices_(spreadsheet, invoiceMailbox, startDate, endDate);
+        } catch (e) {
+            Logger.log('Failed to fetch Claude Team invoices: %s', e.message);
+            firstError = firstError || e;
+        }
+    } else {
+        Logger.log('Skipping Claude Team invoices: %s not set', INVOICE_MAILBOX_PROP);
+    }
+
     Logger.log('Done. %s total new rows.', rows.length);
 
     if (firstError) {
         throw firstError;
     }
+}
+
+
+/** Import the Claude Team invoices of a date range (e.g. from another mailbox the invoices were sent to before).
+ *
+ * @param {string} startDate First invoice day (YYYY-MM-DD).
+ * @param {string} endDate Day after the last invoice day (YYYY-MM-DD, exclusive).
+ * @param {undefined|string} mailbox Optional mailbox to search instead of the configured AiCost.invoiceMailbox.
+ * @param {undefined|string} searchExpression Optional Gmail search expression replacing the configured one
+ *                                            (e.g. 'filename:Invoice-ABCD1234' for invoices forwarded by someone).
+ */
+function backfillClaudeInvoices(startDate, endDate, mailbox, searchExpression) {
+    if (!startDate || !endDate) {
+        throw new Error('startDate and endDate are required (YYYY-MM-DD, endDate exclusive)');
+    }
+    const effectiveMailbox = mailbox || getScriptProperties_().getProperty(INVOICE_MAILBOX_PROP);
+    if (!effectiveMailbox) {
+        throw new Error('No mailbox given and ' + INVOICE_MAILBOX_PROP + ' not set');
+    }
+    fetchClaudeInvoices_(SpreadsheetApp.getActiveSpreadsheet(), effectiveMailbox, startDate, endDate, searchExpression);
+}
+
+
+/** Throwaway: mailbox the Claude Team invoices were sent to before they went to AiCost.invoiceMailbox.
+ *  Set it only in the deployed copy (Apps Script editor or a local edit followed by `make ai-cost/`), never commit
+ *  the actual address. */
+const INVOICE_BACKFILL_MAILBOX = 'mailbox@example.com';
+
+/** Throwaway: import the 2026 Claude Team invoices of INVOICE_BACKFILL_MAILBOX, one call per month.
+ *
+ *  Only mails matching INVOICE_DEFAULT_SEARCH (Anthropic's invoice sender) are read. Invoices already recorded
+ *  (e.g. also received by AiCost.invoiceMailbox) are skipped by invoice number. Completed months are remembered in a
+ *  script property, so re-running after a timeout resumes. The impersonation token of the mailbox is deleted
+ *  afterwards. Remove once done. */
+function backfillClaudeInvoices2026() {
+    if (!/^[^@\s]+@[^@\s]+$/.test(INVOICE_BACKFILL_MAILBOX) || /@example\.com$/.test(INVOICE_BACKFILL_MAILBOX)) {
+        throw new Error('Set INVOICE_BACKFILL_MAILBOX in the deployed script first');
+    }
+    const props = getScriptProperties_();
+    const doneProp = PROPERTY_PREFIX + 'invoiceBackfill2026Done';
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const pad = function(m) { return (m < 10 ? '0' : '') + m; };
+    try {
+        for (let month = 1; month <= 10; month++) {
+            const done = (props.getProperty(doneProp) || '').split(',').filter(String);
+            if (done.indexOf(String(month)) >= 0) continue;
+            // AiCost.invoiceMailbox has the invoices from 2026-10-14 on, the overlap is skipped by invoice number
+            const end = month === 10 ? '2026-10-16' : '2026-' + pad(month + 1) + '-01';
+            fetchClaudeInvoices_(spreadsheet, INVOICE_BACKFILL_MAILBOX, '2026-' + pad(month) + '-01', end, INVOICE_DEFAULT_SEARCH);
+            props.setProperty(doneProp, done.concat(String(month)).join(','));
+        }
+    } finally {
+        // don't keep an access token to the mailbox in the script properties
+        OAuth2.createService('GmailClientV1-' + INVOICE_BACKFILL_MAILBOX)
+            .setPropertyStore(PropertiesService.getScriptProperties())
+            .reset();
+    }
+    Logger.log('Invoice backfill 2026 complete');
 }
 
 
@@ -408,24 +523,45 @@ function fetchAnthropicUsage_(apiKey, startDate, endDate) {
     );
 }
 
+/** Fetch actual (billed) Anthropic costs, one row per (day, model, cost_type).
+ *
+ * Grouping by description makes the API return one item per model and token type (input, output, cache ...);
+ * these are summed into a single row, keeping the per token type breakdown (EUR) in the metadata column.
+ */
 function fetchAnthropicCosts_(apiKey, startDate, endDate) {
     const url = ANTHROPIC_BASE + '/v1/organizations/cost_report'
         + '?starting_at=' + toIso8601_(startDate)
         + '&ending_at=' + toIso8601_(endDate)
-        + '&bucket_width=1d';
+        + '&bucket_width=1d&limit=31&group_by[]=description';
 
     return fetchAllPages_(url, anthropicHeaders_(apiKey),
         function(json) {
             const rows = [];
             for (const bucket of json.data || []) {
                 const date = (bucket.starting_at || '').slice(0, 10);
+                const byKey = new Map();
                 for (const result of bucket.results || []) {
-                    rows.push(makeRow_({
-                        date: date, source: 'anthropic', record_type: 'cost',
-                        model: result.model || '',
-                        cost_eur: toCostCurrency_(parseFloat(result.amount || '0') / 100, result.currency, date),
-                        cost_type: result.cost_type || '',
-                    }));
+                    const model = result.model || '';
+                    const costType = result.cost_type || '';
+                    const key = model + '|' + costType;
+                    let row = byKey.get(key);
+                    if (!row) {
+                        row = makeRow_({date: date, source: 'anthropic', record_type: 'cost', model: model, cost_type: costType});
+                        row.breakdown = {};
+                        byKey.set(key, row);
+                    }
+                    const eur = toCostCurrency_(parseFloat(result.amount || '0') / 100, result.currency, date);
+                    const detail = result.token_type || result.description || 'other';
+                    row.cost_eur += eur;
+                    row.breakdown[detail] = (row.breakdown[detail] || 0) + eur;
+                }
+                for (const row of byKey.values()) {
+                    for (const detail of Object.keys(row.breakdown)) {
+                        row.breakdown[detail] = SheetUtil.round(row.breakdown[detail], 4);
+                    }
+                    row.metadata = JSON.stringify(row.breakdown);
+                    delete row.breakdown;
+                    rows.push(row);
                 }
             }
             return rows;
@@ -625,7 +761,7 @@ function appendToSheet_(spreadsheet, newRows, fetchedKeys) {
 
 /** Keep the seat cost rows of the current (UTC) month in Static-Data-<year> up to date.
  *
- * - If no rows for (current month, STATIC_PROVIDER) exist, they are created by copying the rows of the most
+ * - If no seat rows for (current month, STATIC_PROVIDER) exist, they are created by copying the seat rows of the most
  *   recent earlier month (falling back to the previous year's sheet in January). Seat counts and EUR prices
  *   are carried forward unchanged; user_count gets a note asking for a manual update from the members export,
  *   because no API exposes the claude.ai Team seat tiers.
@@ -654,7 +790,7 @@ function updateStaticData_(spreadsheet) {
         + ', refreshed daily while the month is current. Informational only, seat prices are EUR.'
         + ' Replace the note to pin a manual value (e.g. the rate implied by the invoice).';
 
-    const current = table.rows.filter(function(r) { return r.provider === STATIC_PROVIDER && r.month === month; });
+    const current = table.rows.filter(function(r) { return isCarriedForward_(r) && r.month === month; });
     if (current.length > 0) {
         let updated = 0;
         for (const r of current) {
@@ -753,10 +889,471 @@ function readStaticTable_(sheet) {
 }
 
 
-/** Rows of STATIC_PROVIDER for the latest month strictly before the given month (empty if none). */
+/** Whether a static data row is a seat row of STATIC_PROVIDER, carried forward into each new month. */
+function isCarriedForward_(row) {
+    const type = String(row.type || '').trim().toLowerCase();
+    return row.provider === STATIC_PROVIDER
+        && !STATIC_INVOICE_TYPES.some(function(t) { return t.toLowerCase() === type; });
+}
+
+
+/** Seat rows of STATIC_PROVIDER for the latest month strictly before the given month (empty if none). */
 function latestMonthRows_(rows, beforeMonth) {
-    const candidates = rows.filter(function(r) { return r.provider === STATIC_PROVIDER && r.month < beforeMonth; });
+    const candidates = rows.filter(function(r) { return isCarriedForward_(r) && r.month < beforeMonth; });
     if (candidates.length === 0) return [];
     const latest = Math.max.apply(null, candidates.map(function(r) { return r.month; }));
     return candidates.filter(function(r) { return r.month === latest; });
+}
+
+
+// --- Section J: Claude Team invoices ---
+
+/** Parse the Claude Team invoices received in a mailbox and update the Static-Data-<year> sheets.
+ *
+ * Anthropic bills the Team plan seats and every auto recharge of extra usage by invoice (several per day,
+ * depending on usage). Each invoice is mailed with a PDF attachment, which is parsed (see parseClaudeInvoice_)
+ * and its line items are appended to the Invoices-<year> sheet. That sheet is the record of the invoices seen,
+ * keyed by invoice number (receipts and repeated mails of an invoice are skipped) and message ID (mails
+ * already handled are not fetched again).
+ *
+ * The Static-Data-<year> rows of each month with new invoices are then recalculated from all invoice line items
+ * of that month (see updateStaticDataFromInvoices_).
+ *
+ * @param {Spreadsheet} spreadsheet The spreadsheet holding the Invoices-<year> and Static-Data-<year> sheets.
+ * @param {string} mailbox The mailbox to search (impersonated using the service account credentials).
+ * @param {string} startDate First invoice day to consider (YYYY-MM-DD).
+ * @param {string} endDate Day after the last invoice day to consider (YYYY-MM-DD, exclusive).
+ * @param {undefined|string} searchExpression Optional Gmail search expression (defaults to the configured one).
+ */
+function fetchClaudeInvoices_(spreadsheet, mailbox, startDate, endDate, searchExpression) {
+    const props = getScriptProperties_();
+    const credentials = props.getProperty(SERVICE_ACCOUNT_CREDENTIALS_PROP);
+    if (!credentials) {
+        throw new Error('No service account credentials at script property ' + SERVICE_ACCOUNT_CREDENTIALS_PROP);
+    }
+    const gmail = GmailClientV1.withImpersonatingService(JSON.parse(credentials), mailbox);
+
+    // mails may be received a day before/after the date of issue (time zones), the invoice date decides
+    const query = (searchExpression || props.getProperty(INVOICE_SEARCH_PROP) || INVOICE_DEFAULT_SEARCH)
+        + ' after:' + (toUnixSeconds_(startDate) - 86400) + ' before:' + (toUnixSeconds_(endDate) + 86400);
+    Logger.log('  Searching %s for: %s', mailbox, query);
+    const messages = gmail.listUserMessages(mailbox, query, null, false);
+
+    const startYear = +startDate.slice(0, 4);
+    const endYear = +endDate.slice(0, 4);
+    const ledger = {};
+    const knownMessages = new Set();
+    const knownInvoices = new Set();
+    for (let year = startYear - 1; year <= endYear; year++) {
+        ledger[year] = readInvoiceLedger_(spreadsheet, year);
+        for (const item of ledger[year]) {
+            knownMessages.add(item.message_id);
+            knownInvoices.add(item.invoice);
+        }
+    }
+
+    const newItems = [];
+    let firstError = null;
+    for (const messageRef of messages) {
+        if (knownMessages.has(messageRef.id)) {
+            continue;
+        }
+        try {
+            for (const invoice of readClaudeInvoices_(gmail, mailbox, messageRef.id)) {
+                if (invoice.date < startDate || invoice.date >= endDate || knownInvoices.has(invoice.number)) {
+                    continue;
+                }
+                knownInvoices.add(invoice.number);
+                for (const item of invoice.items) {
+                    const ratio = invoice.currency === COST_CURRENCY ? 1 : toCostCurrency_(1, invoice.currency, invoice.date);
+                    newItems.push({
+                        date: invoice.date,
+                        invoice: invoice.number,
+                        kind: item.kind,
+                        tier: item.tier,
+                        description: item.description,
+                        quantity: item.quantity,
+                        unit_price: item.unitPrice,
+                        amount: item.amount,
+                        currency: invoice.currency,
+                        amount_eur: SheetUtil.round(item.amount * ratio, 4),
+                        message_id: messageRef.id,
+                    });
+                }
+                Logger.log('  Invoice %s of %s: %s %s (%s line items)', invoice.number, invoice.date,
+                    invoice.total, invoice.currency, invoice.items.length);
+            }
+        } catch (e) {
+            Logger.log('  Failed to read invoice mail %s: %s', messageRef.id, e.message);
+            firstError = firstError || e;
+        }
+    }
+
+    Logger.log('  Claude Team invoices: %s mails, %s new line items', messages.length, newItems.length);
+
+    // append to the ledger and recalculate the static data of the months concerned
+    const months = new Set();
+    newItems.sort(function(a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
+    for (const item of newItems) {
+        const year = +item.date.slice(0, 4);
+        (ledger[year] = ledger[year] || []).push(item);
+        months.add(item.date.slice(0, 7));
+    }
+    for (const year of new Set(newItems.map(function(item) { return +item.date.slice(0, 4); }))) {
+        appendInvoiceLedger_(spreadsheet, year, newItems.filter(function(item) { return +item.date.slice(0, 4) === year; }));
+    }
+    for (const yearMonth of Array.from(months).sort()) {
+        const year = +yearMonth.slice(0, 4);
+        updateStaticDataFromInvoices_(spreadsheet, year, +yearMonth.slice(5, 7), ledger[year]);
+    }
+
+    if (firstError) {
+        throw firstError;
+    }
+}
+
+
+/** Read and parse all invoice PDFs attached to a mail (receipts and other PDFs are ignored). */
+function readClaudeInvoices_(gmail, mailbox, messageId) {
+    const message = gmail.getUserMessage(mailbox, messageId, 'full');
+    const invoices = [];
+    const visit = function(part) {
+        if (!part) return;
+        const body = part.body || {};
+        const isPdf = /\.pdf$/i.test(part.filename || '') || part.mimeType === 'application/pdf';
+        if (isPdf && (body.attachmentId || body.data)) {
+            const bytes = body.attachmentId
+                ? gmail.getUserMessageAttachmentBytes(mailbox, messageId, body.attachmentId)
+                : Utilities.base64DecodeWebSafe(body.data + '='.repeat((4 - (body.data.length % 4)) % 4));
+            const invoice = parseClaudeInvoice_(PdfText.extractLines(bytes));
+            if (invoice) {
+                invoices.push(invoice);
+            }
+        }
+        (part.parts || []).forEach(visit);
+    };
+    visit(message.payload);
+    return invoices;
+}
+
+
+/** Parse the text lines of an Anthropic (Stripe generated) invoice PDF.
+ *
+ * Expected layout (cells of the lines as returned by PdfText.extractLines):
+ *
+ *   Invoice
+ *   Invoice number | ABCD1234-0001
+ *   Date of issue  | September 30, 2026
+ *   ...
+ *   Description                          | Qty | Unit price   | Tax | Amount
+ *   Auto recharge extra usage, Team plan | 1   | €450.8172472 | 0%  | €450.82
+ *   (optional detail lines, like the service period)
+ *   Subtotal | €450.82
+ *   Total    | €450.82
+ *
+ * @param {Array<{cells: Array<string>}|Array<string>>} lines The text lines (or their cells) of the PDF.
+ *
+ * @return {null|Object} The invoice {number, date, currency, total, items: [{description, kind, tier, quantity,
+ *         unitPrice, amount}]}, or null if the document is no Anthropic invoice (for example a receipt).
+ */
+function parseClaudeInvoice_(lines) {
+    const rows = lines.map(function(line) { return Array.isArray(line) ? line : line.cells; });
+    const isTitle = function(title) {
+        return rows.some(function(cells) { return cells.length === 1 && cells[0] === title; });
+    };
+    if (!isTitle('Invoice') || isTitle('Receipt')
+        || !rows.some(function(cells) { return cells.some(function(c) { return /Anthropic/.test(c); }); })) {
+        return null;
+    }
+
+    // older invoices place some values so close to their label that both end up in a single cell
+    const valueOf = function(label) {
+        const row = rows.find(function(cells) { return cells[0] === label && cells.length > 1; });
+        if (row) {
+            return row[row.length - 1];
+        }
+        const merged = rows.find(function(cells) { return cells.length === 1 && cells[0].startsWith(label + ' '); });
+        return merged ? merged[0].slice(label.length + 1) : null;
+    };
+
+    // Stripe invoice numbers are PREFIX-NNNN, the PDF's fonts lack a character mapping for the hyphen
+    const number = (valueOf('Invoice number') || '').replace(/\uFFFD/g, '-');
+    const date = parseInvoiceDate_(valueOf('Date of issue') || '');
+    const total = parseMoney_(valueOf('Total') || '');
+    if (!number || !date || !total) {
+        throw new Error('Invoice without number, date of issue or total: ' + JSON.stringify(rows));
+    }
+
+    const header = rows.findIndex(function(cells) {
+        return cells[0] === 'Description' && cells[cells.length - 1] === 'Amount';
+    });
+    if (header < 0) {
+        throw new Error('Invoice ' + number + ' without line item table: ' + JSON.stringify(rows));
+    }
+
+    // credits (e.g. "Unused time on ...") end with a lone minus sign, their amount wraps into the following line:
+    //   Unused time on 4 × Team plan - Premium after 28 Jan 2026 | 4 | -
+    //   Jan 28 – Feb 27, 2026                                     | €504.93
+    const body = rows.slice(header + 1).map(function(cells) { return cells.slice(); });
+    for (let i = 0; i + 1 < body.length; i++) {
+        const next = body[i + 1];
+        if (/^[-−–\uFFFD]$/.test(body[i][body[i].length - 1]) && next.length > 1 && parseMoney_(next[next.length - 1])) {
+            body[i][body[i].length - 1] = '-' + next.pop();
+        }
+    }
+
+    const items = [];
+    for (const cells of body) {
+        if (/^(Subtotal|Total|Amount due)/.test(cells[0])) {
+            break;
+        }
+        if (cells.every(function(c) { return /^[\[\uFFFD]\d+[\]\uFFFD]$/.test(c); })) {
+            continue;  // footnote marker (e.g. "[1]" above the tax rate)
+        }
+
+        let k = cells.length - 1;
+        const amount = cells.length > 1 ? parseMoney_(cells[k]) : null;
+        if (!amount) {
+            // detail line of the previous item (e.g. the service period)
+            if (items.length) {
+                items[items.length - 1].details.push(cells.join(' '));
+            }
+            continue;
+        }
+        k--;
+        if (k > 0 && /%/.test(cells[k])) k--;  // tax rate
+        const unitPrice = k > 0 ? parseMoney_(cells[k]) : null;
+        if (unitPrice) k--;
+        const quantity = k > 0 && /^\d+$/.test(cells[k]) ? +cells[k--] : 1;
+        const description = cells.slice(0, k + 1).join(' ');
+        const kind = classifyClaudeInvoiceItem_(description);
+        items.push({
+            description: description,
+            details: [],
+            kind: kind.kind,
+            tier: kind.tier,
+            quantity: quantity,
+            unitPrice: unitPrice ? unitPrice.amount : amount.amount / quantity,
+            amount: amount.amount,
+        });
+    }
+
+    // the items must add up to the subtotal (before tax), otherwise the layout wasn't understood
+    const subtotal = parseMoney_(valueOf('Subtotal') || '') || total;
+    const sum = items.reduce(function(acc, item) { return acc + item.amount; }, 0);
+    if (!items.length || Math.abs(sum - subtotal.amount) > 0.005 + 0.005 * items.length) {
+        throw new Error('Invoice ' + number + ': line items sum up to ' + sum + ' instead of the subtotal '
+            + subtotal.amount + ': ' + JSON.stringify(rows.slice(header)));
+    }
+
+    items.forEach(function(item) {
+        if (item.details.length) {
+            item.description += ' (' + item.details.join(', ') + ')';
+        }
+        delete item.details;
+    });
+
+    return {number: number, date: date, currency: total.currency, total: total.amount, items: items};
+}
+
+
+/** Classify an invoice line item by its description.
+ *
+ * @return {{kind: string, tier: string}} kind is one of 'extra_usage', 'seat_adjustment' (prorated seat changes),
+ *         'seats' (with tier 'Standard' or 'Premium') or 'other'.
+ */
+function classifyClaudeInvoiceItem_(description) {
+    const tier = /\bpremium\b/i.test(description) ? 'Premium' : /\bstandard\b/i.test(description) ? 'Standard' : '';
+    if (/extra usage/i.test(description)) {
+        return {kind: 'extra_usage', tier: ''};
+    }
+    if (/remaining time|unused time|prorat/i.test(description)) {
+        return {kind: 'seat_adjustment', tier: tier};
+    }
+    if (tier && /seat|team/i.test(description)) {
+        return {kind: 'seats', tier: tier};
+    }
+    return {kind: 'other', tier: tier};
+}
+
+
+/** Parse an invoice date like "September 30, 2026" (or "30 September 2026") into YYYY-MM-DD (null if invalid). */
+function parseInvoiceDate_(value) {
+    const months = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+    const text = String(value || '').trim();
+    let m = /^([A-Za-z]+)\.? (\d{1,2}), (\d{4})$/.exec(text);
+    let month, day, year;
+    if (m) {
+        month = months.indexOf(m[1].slice(0, 3).toLowerCase());
+        day = +m[2];
+        year = +m[3];
+    } else if ((m = /^(\d{1,2}) ([A-Za-z]+)\.? (\d{4})$/.exec(text)) !== null) {
+        month = months.indexOf(m[2].slice(0, 3).toLowerCase());
+        day = +m[1];
+        year = +m[3];
+    } else {
+        return null;
+    }
+    const d = new Date(Date.UTC(year, month, day));
+    return month >= 0 && d.getUTCDate() === day ? d.toISOString().slice(0, 10) : null;
+}
+
+
+/** Parse an amount like "€450.82", "-€1,234.5" or "$12.00" into {amount, currency} (null if no amount). */
+function parseMoney_(value) {
+    const symbols = {'€': 'EUR', '$': 'USD', '£': 'GBP'};
+    // U+FFFD: some invoice PDFs' fonts lack a character mapping for the minus sign
+    const m = /^([-−–\uFFFD]?)\s*([€$£])\s*([-−–\uFFFD]?)\s*(\d[\d,]*(?:\.\d+)?)$/.exec(String(value || '').trim());
+    if (!m) {
+        return null;
+    }
+    const sign = m[1] || m[3] ? -1 : 1;
+    return {amount: sign * parseFloat(m[4].replace(/,/g, '')), currency: symbols[m[2]]};
+}
+
+
+/** Read the line items of the Invoices-<year> sheet (empty if the sheet doesn't exist). */
+function readInvoiceLedger_(spreadsheet, year) {
+    const sheet = spreadsheet.getSheetByName(INVOICE_SHEET_PREFIX + year);
+    if (!sheet || sheet.getLastRow() < 2) {
+        return [];
+    }
+    const values = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn()).getValues();
+    const header = values[0].map(function(h) { return String(h).trim(); });
+    const tz = spreadsheet.getSpreadsheetTimeZone();
+    return values.slice(1).map(function(r) {
+        const item = {};
+        header.forEach(function(h, i) { item[h] = r[i]; });
+        item.date = item.date instanceof Date ? Utilities.formatDate(item.date, tz, 'yyyy-MM-dd') : String(item.date);
+        item.invoice = String(item.invoice);
+        item.message_id = String(item.message_id);
+        return item;
+    });
+}
+
+
+/** Append line items to the Invoices-<year> sheet (created with a header if missing). */
+function appendInvoiceLedger_(spreadsheet, year, items) {
+    if (!items.length) return;
+    const sheet = SheetUtil.ensureSheet(spreadsheet, INVOICE_SHEET_PREFIX + year);
+    if (sheet.getLastRow() === 0) {
+        sheet.getRange(1, 1, 1, INVOICE_COLUMNS.length).setValues([INVOICE_COLUMNS]);
+    }
+    const header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(h) { return String(h).trim(); });
+    const values = items.map(function(item) {
+        return header.map(function(h) { return item[h] !== undefined ? item[h] : ''; });
+    });
+    const firstRow = sheet.getLastRow() + 1;
+    // keep dates (YYYY-MM-DD) and invoice numbers as text
+    for (const name of ['date', 'invoice']) {
+        if (header.indexOf(name) >= 0) {
+            sheet.getRange(firstRow, header.indexOf(name) + 1, values.length, 1).setNumberFormat('@');
+        }
+    }
+    sheet.getRange(firstRow, 1, values.length, header.length).setValues(values);
+}
+
+
+/** Calculate the static data rows of one month from its invoice line items.
+ *
+ * @param {Array<Object>} items Invoice line items (of any month, as in the Invoices-<year> sheet).
+ * @param {number} month The month (1-12) to calculate.
+ *
+ * @return {Array<{type: string, count: number, cost: number, note: string}>} The rows: one per seat tier
+ *         (quantity and EUR unit price of the latest invoice of the month billing that tier), plus the sums of
+ *         extra usage and of seat adjustments (prorated charges and credits) as user_count 1 rows.
+ */
+function staticRowsFromInvoices_(items, month) {
+    const monthItems = items.filter(function(item) { return +String(item.date).slice(5, 7) === month; });
+    const rows = [];
+
+    const latestByTier = {};
+    for (const item of monthItems) {
+        if (item.kind === 'seats' && item.tier && (!latestByTier[item.tier] || latestByTier[item.tier].date <= item.date)) {
+            latestByTier[item.tier] = item;
+        }
+    }
+    for (const tier of Object.keys(latestByTier).sort()) {
+        const item = latestByTier[tier];
+        const quantity = +item.quantity || 0;
+        rows.push({
+            type: tier,
+            count: quantity,
+            cost: quantity ? SheetUtil.round(+item.amount_eur / quantity, 2) : 0,
+            note: STATIC_AUTO_NOTE_PREFIX + ' from invoice ' + item.invoice + ' of ' + item.date + '.',
+        });
+    }
+
+    const sums = [['extra_usage', STATIC_EXTRA_USAGE_TYPE], ['seat_adjustment', STATIC_SEAT_ADJUSTMENT_TYPE]];
+    for (const [kind, type] of sums) {
+        const matching = monthItems.filter(function(item) { return item.kind === kind; });
+        if (!matching.length) continue;
+        const invoices = Array.from(new Set(matching.map(function(item) { return item.invoice; })));
+        const last = matching[matching.length - 1];
+        rows.push({
+            type: type,
+            count: 1,
+            cost: SheetUtil.round(matching.reduce(function(acc, item) { return acc + (+item.amount_eur || 0); }, 0), 2),
+            note: STATIC_AUTO_NOTE_PREFIX + ' sum of ' + invoices.length + ' invoice(s), the last one ' + last.invoice
+                + ' of ' + last.date + '.',
+        });
+    }
+    return rows;
+}
+
+
+/** Write the static data rows calculated from invoices into Static-Data-<year>.
+ *
+ * Existing rows of the month (matched by provider and type) are updated, missing ones are appended.
+ * Rows whose user_count or cost cell carries a note not starting with STATIC_AUTO_NOTE_PREFIX are manual and left alone.
+ */
+function updateStaticDataFromInvoices_(spreadsheet, year, month, items) {
+    const computed = staticRowsFromInvoices_(items, month);
+    if (!computed.length) return;
+
+    const sheet = SheetUtil.ensureSheet(spreadsheet, STATIC_SHEET_PREFIX + year);
+    if (sheet.getLastRow() === 0) {
+        sheet.getRange(1, 1, 1, STATIC_COLUMNS.length).setValues([STATIC_COLUMNS]);
+    }
+    const table = readStaticTable_(sheet);
+    const monthRows = table.rows.filter(function(r) { return r.provider === STATIC_PROVIDER && r.month === month; });
+    let rate = null;
+
+    for (const c of computed) {
+        const existing = monthRows.find(function(r) { return String(r.type).trim().toLowerCase() === c.type.toLowerCase(); });
+        if (existing) {
+            const countCell = sheet.getRange(existing.rowNumber, table.col.count + 1);
+            const costCell = sheet.getRange(existing.rowNumber, table.col.cost + 1);
+            const isManual = [countCell.getNote(), costCell.getNote()].some(function(note) {
+                return note && note.indexOf(STATIC_AUTO_NOTE_PREFIX) !== 0;
+            });
+            if (isManual) {
+                Logger.log('  Static data %s-%s %s: manual values kept (invoices: %s x %s)', year, month, c.type, c.count, c.cost);
+                continue;
+            }
+            if (+existing.count !== c.count || SheetUtil.round(+existing.cost, 2) !== c.cost || countCell.getNote() !== c.note) {
+                countCell.setValue(c.count).setNote(c.note);
+                costCell.setValue(c.cost).setNote(c.note);
+                Logger.log('  Static data %s-%s %s: %s x %s', year, month, c.type, c.count, c.cost);
+            }
+        } else {
+            if (rate === null) {
+                rate = monthRows.length ? monthRows[0].rate : SheetUtil.round(Currency.convertCurrency('EUR', 'USD', 1), 4);
+            }
+            const row = new Array(table.header.length).fill('');
+            row[table.col.month] = month;
+            row[table.col.provider] = STATIC_PROVIDER;
+            row[table.col.count] = c.count;
+            row[table.col.type] = c.type;
+            row[table.col.cost] = c.cost;
+            row[table.col.rate] = rate;
+            const rowNumber = sheet.getLastRow() + 1;
+            sheet.getRange(rowNumber, 1, 1, row.length).setValues([row]);
+            sheet.getRange(rowNumber, table.col.month + 1).setNumberFormat('0');
+            sheet.getRange(rowNumber, table.col.count + 1).setNumberFormat('0').setNote(c.note);
+            sheet.getRange(rowNumber, table.col.cost + 1).setNumberFormat('#,##0.00"€"').setNote(c.note);
+            sheet.getRange(rowNumber, table.col.rate + 1).setNumberFormat('0.0000');
+            Logger.log('  Static data %s-%s %s: added %s x %s', year, month, c.type, c.count, c.cost);
+        }
+    }
 }
