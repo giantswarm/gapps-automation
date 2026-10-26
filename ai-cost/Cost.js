@@ -1066,9 +1066,14 @@ function parseClaudeInvoice_(lines) {
         return null;
     }
 
+    // older invoices place some values so close to their label that both end up in a single cell
     const valueOf = function(label) {
         const row = rows.find(function(cells) { return cells[0] === label && cells.length > 1; });
-        return row ? row[row.length - 1] : null;
+        if (row) {
+            return row[row.length - 1];
+        }
+        const merged = rows.find(function(cells) { return cells.length === 1 && cells[0].startsWith(label + ' '); });
+        return merged ? merged[0].slice(label.length + 1) : null;
     };
 
     // Stripe invoice numbers are PREFIX-NNNN, the PDF's fonts lack a character mapping for the hyphen
@@ -1076,19 +1081,29 @@ function parseClaudeInvoice_(lines) {
     const date = parseInvoiceDate_(valueOf('Date of issue') || '');
     const total = parseMoney_(valueOf('Total') || '');
     if (!number || !date || !total) {
-        throw new Error('Invoice without number, date of issue or total: ' + JSON.stringify(rows.slice(0, 8)));
+        throw new Error('Invoice without number, date of issue or total: ' + JSON.stringify(rows));
     }
 
     const header = rows.findIndex(function(cells) {
         return cells[0] === 'Description' && cells[cells.length - 1] === 'Amount';
     });
     if (header < 0) {
-        throw new Error('Invoice ' + number + ' without line item table');
+        throw new Error('Invoice ' + number + ' without line item table: ' + JSON.stringify(rows));
+    }
+
+    // credits (e.g. "Unused time on ...") end with a lone minus sign, their amount wraps into the following line:
+    //   Unused time on 4 × Team plan - Premium after 28 Jan 2026 | 4 | -
+    //   Jan 28 – Feb 27, 2026                                     | €504.93
+    const body = rows.slice(header + 1).map(function(cells) { return cells.slice(); });
+    for (let i = 0; i + 1 < body.length; i++) {
+        const next = body[i + 1];
+        if (/^[-−–\uFFFD]$/.test(body[i][body[i].length - 1]) && next.length > 1 && parseMoney_(next[next.length - 1])) {
+            body[i][body[i].length - 1] = '-' + next.pop();
+        }
     }
 
     const items = [];
-    for (let i = header + 1; i < rows.length; i++) {
-        const cells = rows[i];
+    for (const cells of body) {
         if (/^(Subtotal|Total|Amount due)/.test(cells[0])) {
             break;
         }
@@ -1187,7 +1202,8 @@ function parseInvoiceDate_(value) {
 /** Parse an amount like "€450.82", "-€1,234.5" or "$12.00" into {amount, currency} (null if no amount). */
 function parseMoney_(value) {
     const symbols = {'€': 'EUR', '$': 'USD', '£': 'GBP'};
-    const m = /^([-−–]?)\s*([€$£])\s*([-−–]?)\s*(\d[\d,]*(?:\.\d+)?)$/.exec(String(value || '').trim());
+    // U+FFFD: some invoice PDFs' fonts lack a character mapping for the minus sign
+    const m = /^([-−–\uFFFD]?)\s*([€$£])\s*([-−–\uFFFD]?)\s*(\d[\d,]*(?:\.\d+)?)$/.exec(String(value || '').trim());
     if (!m) {
         return null;
     }

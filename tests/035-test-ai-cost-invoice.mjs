@@ -122,6 +122,39 @@ assert.deepEqual(invoice, {
 assert.equal(parseClaudeInvoice_([['Receipt'], ['Invoice'], ['Anthropic, PBC']]), null);
 assert.equal(parseClaudeInvoice_([['Invoice'], ['Other Corp']]), null);
 
+// older invoices: label and value merged into a single cell
+const merged = lines.map(l => l.cells[0] === 'Invoice number' ? ['Invoice number ' + l.cells[1]] : l.cells);
+assert.deepEqual(parseClaudeInvoice_(merged), invoice);
+
+// seat changes: credits end with a lone minus sign, their amount wraps into the following line
+const seatChange = parseClaudeInvoice_([
+    ['Invoice'], ['Invoice number ABCD1234�0004'], ['Date of issue', 'January 27, 2026'], ['Anthropic, PBC'],
+    ['Description', 'Qty', 'Unit price', 'Amount'],
+    ['Remaining time on 2 × Team plan - Premium after 28 Jan 2026', '2', '€253.16'],
+    ['Jan 27 – Feb 27, 2026'],
+    ['Unused time on Team plan - Premium after 28 Jan 2026', '1', '-'],
+    ['Jan 27 – Feb 27, 2026', '€126.58'],
+    ['Subtotal', '€126.58'], ['Total', '€126.58'], ['Amount due', '€126.58'], ['Page 1 of 1'],
+]);
+assert.deepEqual(seatChange.items.map(i => [i.kind, i.tier, i.quantity, i.amount, i.description]), [
+    ['seat_adjustment', 'Premium', 2, 253.16, 'Remaining time on 2 × Team plan - Premium after 28 Jan 2026 (Jan 27 – Feb 27, 2026)'],
+    ['seat_adjustment', 'Premium', 1, -126.58, 'Unused time on Team plan - Premium after 28 Jan 2026 (Jan 27 – Feb 27, 2026)'],
+]);
+assert.equal(seatChange.number, 'ABCD1234-0004');
+
+// later seat changes: the credit's minus sign lacks a character mapping (U+FFFD), but stays in the amount cell
+const seatChange2 = parseClaudeInvoice_([
+    ['Invoice'], ['Invoice number', 'ABCD1234�0036'], ['Date of issue', 'April 1, 2026'], ['Anthropic, PBC'],
+    ['Description', 'Qty', 'Unit price', 'Amount'],
+    ['Remaining time on 12 × Team plan - Premium after 01 Apr 2026', '12', '€1,060.37'], ['Apr 1�Apr 27, 2026'],
+    ['Remaining time on 35 × Team plan - Standard after 01 Apr 2026', '35', '€618.37'], ['Apr 1�Apr 27, 2026'],
+    ['Unused time on 11 × Team plan - Premium after 01 Apr 2026', '11', '�€972.01'], ['Apr 1�Apr 27, 2026'],
+    ['Unused time on 36 × Team plan - Standard after 01 Apr 2026', '36', '�€636.04'], ['Apr 1�Apr 27, 2026'],
+    ['Subtotal', '€70.69'], ['Total', '€70.69'], ['Amount due', '€70.69'], ['Page 1 of 1'],
+]);
+assert.deepEqual(seatChange2.items.map(i => i.amount), [1060.37, 618.37, -972.01, -636.04]);
+assert.deepEqual(parseMoney_('�€972.01'), {amount: -972.01, currency: 'EUR'});
+
 // line items not adding up to the subtotal indicate a changed layout
 const broken = lines.map(l => l.cells).filter(c => !c[0].startsWith('Remaining'));
 assert.throws(() => parseClaudeInvoice_(broken), /line items sum up to/);
