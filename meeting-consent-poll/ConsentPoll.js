@@ -1,25 +1,25 @@
 /**
  * Meeting Recording Consent Poll
  *
- * Posts a recording consent request into the Google Meet meeting conversation (the Google Chat
- * backed in-meeting chat) and collects per-person responses via a small web app.
+ * Remote controls a bot (meet-bot/, signed in as the bot Workspace account) that joins recorded
+ * Google Meet meetings visibly, asks the participants in the meeting chat whether they consent to
+ * being recorded and collects per-person responses via a small web app.
  *
- * Why text only:
- *   Meeting conversations are system generated group DMs. Chat apps cannot be added to them and
- *   cards (cardsV2) can only be posted by Chat apps. Messages posted with user authentication
- *   may only contain text. So we post as the meeting organizer (domain-wide delegation) and put
- *   the consent/decline actions behind links to this script's web app, which identifies the
- *   responding user via Session.getActiveUser() and updates the message text with the tally.
+ * Why a bot:
+ *   Meeting conversations (the Google Chat backed in-meeting chat) are system generated group DMs.
+ *   Chat apps cannot be added to them and there is no API link between them and calendar events, so
+ *   reliably posting into them via the Chat API is not possible. Meet has no API to join a call as a
+ *   participant either, so the bot drives the Meet web UI in a browser (like note taker bots do).
  *
  * Architecture:
- *   - Time-based trigger scans organizer calendars for upcoming meetings with a Meet link
- *   - Finds the meeting conversation via the Chat audit log (Admin SDK Reports API, impersonating an
- *     admin): system generated group DMs show up there before anyone wrote into them, unlike in
- *     spaces.list. Falls back to listing the organizer's group DMs. Candidates are matched by member
- *     overlap (members from the audit log, or users/{id} resolved via the People API directory)
- *     against the event attendees
- *   - Posts a text message as the organizer (chat.messages scope) with consent/decline links
- *   - doGet() records responses and patches the message text in place with the current tally
+ *   - Time-based trigger scans organizer calendars for upcoming meetings with a Meet link that will
+ *     be recorded (automatic recording/transcription/notes enabled, or the opt-in marker in the
+ *     event description)
+ *   - Creates the poll state (keyed by event ID) and tells the bot to join (idempotent PUT, re-sent
+ *     on every run until shortly after the meeting started, so bot restarts are survived)
+ *   - The bot greets the meeting with the consent question and a link to this script's web app
+ *   - doGet() records responses (identifying the user via Session.getActiveUser()) and tells the bot
+ *     about the first objection right away; the tally is posted when the bot leaves
  *
  * Note on async: lib.js is assembled with async/await stripped, so all lib calls are synchronous in
  * Apps Script. This file is written synchronously as well, which doGet() requires anyway.
@@ -59,14 +59,38 @@ const LOOKAHEAD_MINUTES_KEY = PROPERTY_PREFIX + 'lookaheadMinutes';
  */
 const MIN_ATTENDEES_KEY = PROPERTY_PREFIX + 'minAttendees';
 
-/** Admin account to impersonate for reading the Chat audit log (Admin SDK Reports API).
+/** Which meetings the bot joins: 'recorded' or 'all'.
  *
- * Needs the "Reports" admin privilege. If the audit log cannot be read, discovery falls back to
- * listing the organizer's group DMs (which only works once someone wrote into the conversation).
+ * 'recorded': automatic recording, transcription or notes are enabled for the Meet space (Meet REST API,
+ * impersonating the organizer), or the event description contains OPT_IN_MARKER.
+ *
+ * Default: 'recorded'
+ */
+const JOIN_MODE_KEY = PROPERTY_PREFIX + 'joinMode';
+
+/** Base URL of the meet-bot control API (origin only, e.g. https://meet-bot.example.com). */
+const BOT_URL_KEY = PROPERTY_PREFIX + 'botUrl';
+
+/** Shared HMAC secret of the meet-bot control API (MEETBOT_SECRET, at least 32 characters). */
+const BOT_SECRET_KEY = PROPERTY_PREFIX + 'botSecret';
+
+/** Email of the bot account, excluded from the attendees.
  *
  * Default: the account executing the script (Session.getEffectiveUser())
  */
-const REPORTS_USER_KEY = PROPERTY_PREFIX + 'reportsUser';
+const BOT_EMAIL_KEY = PROPERTY_PREFIX + 'botEmail';
+
+/** Minutes the bot stays in the meeting (it leaves earlier if the meeting ends).
+ *
+ * Default: 10 minutes
+ */
+const STAY_MINUTES_KEY = PROPERTY_PREFIX + 'stayMinutes';
+
+/** Optional purpose of recordings, shown in the consent question (e.g. "for AI generated meeting minutes"). */
+const RECORDING_PURPOSE_KEY = PROPERTY_PREFIX + 'recordingPurpose';
+
+/** Optional link to the recording policy, shown in the consent question. */
+const POLICY_URL_KEY = PROPERTY_PREFIX + 'policyUrl';
 
 /** Public URL of this script's web app deployment (the /exec URL).
  *
@@ -80,40 +104,17 @@ const TRIGGER_HANDLER_FUNCTION = 'checkUpcomingMeetings';
 /** Prefix for consent state stored in ScriptProperties (keyed by event ID). */
 const STATE_KEY_PREFIX = 'state.';
 
-/** Prefix for sent dedup markers stored in ScriptProperties (keyed by event ID). */
-const SENT_KEY_PREFIX = 'sent.';
-
 /** Maximum age for state entries before cleanup (48 hours). */
 const STATE_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 
-/** Meeting conversations are created by Google Chat up to 7 days before the meeting. */
-const SPACE_CREATE_WINDOW_BEFORE_MS = 8 * 24 * 60 * 60 * 1000;
+/** Event description marker to request the bot for a meeting without automatic recording. */
+const OPT_IN_MARKER = '#consent-poll';
 
-/** Allow for conversations created late (first message sent during the meeting). */
-const SPACE_CREATE_WINDOW_AFTER_MS = 60 * 60 * 1000;
+/** The bot joins this long before the meeting starts. */
+const JOIN_LEAD_MS = 60 * 1000;
 
-/** Minimum fraction of chat members that must be event attendees. */
-const MIN_MEMBER_OVERLAP = 0.8;
-
-/** Chat API base URL. */
-const CHAT_API_BASE = 'https://chat.googleapis.com/v1';
-
-/** Scopes used via domain-wide delegation (impersonating the organizer). */
-const SCOPE_CHAT_SPACES_READONLY = 'https://www.googleapis.com/auth/chat.spaces.readonly';
-const SCOPE_CHAT_MEMBERSHIPS_READONLY = 'https://www.googleapis.com/auth/chat.memberships.readonly';
-const SCOPE_CHAT_MESSAGES = 'https://www.googleapis.com/auth/chat.messages';
-
-/** Scope used via domain-wide delegation to read the Chat audit log (impersonating the reports user). */
-const SCOPE_REPORTS_AUDIT_READONLY = 'https://www.googleapis.com/auth/admin.reports.audit.readonly';
-
-/** Admin SDK Reports API base URL. */
-const REPORTS_API_BASE = 'https://admin.googleapis.com/admin/reports/v1';
-
-/** Chat audit log conversation_type of group DMs (meeting conversations are group DMs). */
-const AUDIT_GROUP_DM_TYPE = 'GROUP_DIRECT_MESSAGE';
-
-/** Maximum number of attendee names to show in the message before truncating. */
-const MAX_DISPLAY_NAMES = 20;
+/** The bot is still sent to meetings that started up to this long ago (late trigger runs, bot restarts). */
+const JOIN_GRACE_MS = 10 * 60 * 1000;
 
 /** Web app query parameter names. */
 const PARAM_EVENT = 'e';
@@ -140,12 +141,19 @@ function setProperties(properties, deleteAllOthers) {
     TriggerUtil.setProperties(properties, deleteAllOthers);
 }
 
+/** List the bot's sessions (for checking the setup via `clasp run listBotSessions`). */
+function listBotSessions() {
+    const sessions = callBot_('GET', '/v1/sessions');
+    Logger.log(JSON.stringify(sessions, null, 2));
+    return sessions;
+}
+
 
 // ---------------------------------------------------------------------------
 // Core Trigger: checkUpcomingMeetings
 // ---------------------------------------------------------------------------
 
-/** Main entry point: scans organizer calendars for upcoming meetings and posts consent requests. */
+/** Main entry point: scans organizer calendars for upcoming recorded meetings and sends the bot. */
 function checkUpcomingMeetings() {
 
     const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
@@ -159,10 +167,15 @@ function checkUpcomingMeetings() {
 
     const lookaheadMinutes = getLookaheadMinutes_();
     const minAttendees = getMinAttendees_();
+    const joinMode = getJoinMode_();
     const webAppUrl = getWebAppUrl_();
+    if (!webAppUrl) {
+        throw new Error('Web app URL unknown, deploy the web app or set ' + WEB_APP_URL_KEY);
+    }
+    getBotConfig_();   // fail early if the bot is not configured
 
-    Logger.log('Configured to handle accounts %s on domains %s, lookahead %s min, min attendees %s, web app %s',
-        emailWhiteList.length ? emailWhiteList : '(all)', allowedDomains, '' + lookaheadMinutes, '' + minAttendees, webAppUrl);
+    Logger.log('Configured to handle accounts %s on domains %s, lookahead %s min, min attendees %s, join mode %s, web app %s',
+        emailWhiteList.length ? emailWhiteList : '(all)', allowedDomains, '' + lookaheadMinutes, '' + minAttendees, joinMode, webAppUrl);
 
     const personioCreds = getPersonioCreds_();
     const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
@@ -182,9 +195,7 @@ function checkUpcomingMeetings() {
     const context = {
         creds: creds,
         webAppUrl: webAppUrl,
-        directory: null,            // lazily loaded: {idToPerson: {}, emailToPerson: {}}
-        auditRooms: undefined,      // lazily loaded: {roomId: {name, createTime, memberEmails: Set}}, null if unavailable
-        usedSpaces: loadUsedSpaces_()
+        directory: null            // lazily loaded: {idToPerson: {}, emailToPerson: {}}
     };
 
     let firstError = null;
@@ -208,19 +219,18 @@ function checkUpcomingMeetings() {
                     continue;
                 }
 
-                if (!isQualifyingEvent_(event, minAttendees)) {
-                    continue;
-                }
-
-                // Skip if already sent
-                if (getScriptProperties_().getProperty(SENT_KEY_PREFIX + event.id)) {
+                // Ongoing events are listed as well, join those only shortly after they started
+                const eventStart = new Date(event.start?.dateTime || event.start?.date).getTime();
+                if (!isQualifyingEvent_(event, minAttendees) || now.getTime() > eventStart + JOIN_GRACE_MS) {
                     continue;
                 }
 
                 try {
-                    sendConsentPoll_(context, event);
+                    if (joinMode === 'all' || isRecordedMeeting_(context, email, event)) {
+                        sendBot_(context, event);
+                    }
                 } catch (e) {
-                    Logger.log('Failed to send consent poll for event %s (%s): %s', event.id, event.summary, e);
+                    Logger.log('Failed to send the bot to event %s (%s): %s', event.id, event.summary, e);
                     firstError = firstError || e;
                 }
             }
@@ -249,8 +259,8 @@ function checkUpcomingMeetings() {
 
 /** Check if a calendar event qualifies for a consent poll. */
 function isQualifyingEvent_(event, minAttendees) {
-    // Must not be cancelled
-    if (event.status === 'cancelled') {
+    // Must not be cancelled, must have a time (all-day events are no meetings)
+    if (event.status === 'cancelled' || !event.start?.dateTime) {
         return false;
     }
 
@@ -261,20 +271,58 @@ function isQualifyingEvent_(event, minAttendees) {
     }
 
     // Must have a Google Meet video link
-    return (event.conferenceData?.entryPoints || [])
-        .some(ep => ep.entryPointType === 'video' && (ep.uri || '').includes('meet.google.com'));
+    return !!getMeetUri_(event);
+}
+
+
+/** The event's Google Meet link, or null. */
+function getMeetUri_(event) {
+    const entryPoint = (event.conferenceData?.entryPoints || [])
+        .find(ep => ep.entryPointType === 'video' && (ep.uri || '').startsWith('https://meet.google.com/'));
+    return entryPoint ? entryPoint.uri : null;
+}
+
+
+/** Check if a meeting will be recorded: opt-in marker or automatic artifacts enabled for its Meet space.
+ *
+ * Gemini notes and transcripts are included, they process what participants say just like recordings.
+ */
+function isRecordedMeeting_(context, organizerEmail, event) {
+    if ((event.description || '').toLowerCase().includes(OPT_IN_MARKER)) {
+        return true;
+    }
+
+    const meetingCode = event.conferenceData?.conferenceId
+        || getMeetUri_(event).replace(/^https:\/\/meet\.google\.com\//, '').replace(/[?#].*$/, '');
+
+    let artifactConfig;
+    try {
+        const meet = MeetClient.withImpersonatingService(context.creds, organizerEmail);
+        artifactConfig = meet.getSpace('spaces/' + meetingCode)?.config?.artifactConfig || {};
+    } catch (e) {
+        // e.g. a Meet link owned by someone else, nothing we can find out about recording
+        Logger.log('Failed to get Meet space %s of event %s (%s) as %s, assuming no recording: %s',
+            meetingCode, event.id, event.summary, organizerEmail, e);
+        return false;
+    }
+    const automatic = [
+        artifactConfig.recordingConfig?.autoRecordingGeneration,
+        artifactConfig.transcriptionConfig?.autoTranscriptionGeneration,
+        artifactConfig.smartNotesConfig?.autoSmartNotesGeneration
+    ];
+
+    Logger.log('Meet space %s of event %s (%s): automatic recording/transcription/notes %s',
+        meetingCode, event.id, event.summary, automatic.map(v => v || '-').join('/'));
+
+    return automatic.includes('ON');
 }
 
 
 // ---------------------------------------------------------------------------
-// Directory (Chat user ID -> email/name resolution)
+// Directory (email -> name resolution)
 // ---------------------------------------------------------------------------
 
-/** Load the domain directory once per run (impersonating the given user).
- *
- * Chat API memberships only expose users/{id}. The {id} equals the People API person ID
- * (people/{id}), so the directory listing is used to resolve IDs to emails and display names.
- */
+/** Load the domain directory once per run (impersonating the given user). */
 function getDirectory_(context, impersonatedEmail) {
     if (context.directory) {
         return context.directory;
@@ -306,390 +354,18 @@ function getDirectory_(context, impersonatedEmail) {
 
 
 // ---------------------------------------------------------------------------
-// Meeting Conversation Discovery
+// Bot Remote Control
 // ---------------------------------------------------------------------------
 
-/** Find the Chat group DM corresponding to a meeting's conversation.
- *
- * There is no API link between Calendar events and meeting conversations, and spaces.list hides
- * group DMs until the first message was sent into them. Two sources for candidates, in order:
- *   1. Chat audit log (Admin SDK Reports API, impersonating the reports user): room_created events
- *      of GROUP_DIRECT_MESSAGE conversations reveal the system generated meeting conversations
- *      before anyone wrote into them, add_room_member events reveal their members
- *   2. spaces.list as the organizer (only conversations with at least one message)
- *
- * Candidate selection (both sources):
- *   - created within [eventStart - 8 days, eventStart + 1 hour]
- *     (Google Chat creates meeting conversations up to 7 days ahead)
- *   - not already used by another poll
- *   - >= 80% of the members are event attendees (members from the audit log, else resolved via
- *     Chat memberships and the People API directory)
- *   - prefer a displayName containing the event title, then the earliest created candidate
- *     (for recurring meetings the conversation of the next instance may already exist)
- */
-function findMeetingChatSpace_(context, organizerEmail, event) {
-    const eventStart = new Date(event.start.dateTime || event.start.date);
-    const window = {
-        start: eventStart.getTime() - SPACE_CREATE_WINDOW_BEFORE_MS,
-        end: eventStart.getTime() + SPACE_CREATE_WINDOW_AFTER_MS
-    };
-
-    let candidates = [];
-    try {
-        candidates = listAuditCandidateSpaces_(context, organizerEmail, window);
-    } catch (e) {
-        Logger.log('Chat audit log lookup failed, falling back to spaces.list: %s', e);
-    }
-    Logger.log('Found %s candidate chat spaces in the audit log for event %s (%s)',
-        '' + candidates.length, event.id, event.summary);
-
-    const auditSpace = selectMeetingChatSpace_(context, organizerEmail, event, candidates);
-    if (auditSpace) {
-        return auditSpace;
-    }
-
-    candidates = listOrganizerCandidateSpaces_(context, organizerEmail, window);
-    Logger.log('Found %s candidate chat spaces via spaces.list for event %s (%s)',
-        '' + candidates.length, event.id, event.summary);
-
-    return selectMeetingChatSpace_(context, organizerEmail, event, candidates);
-}
-
-
-/** Load all group DM creations (and their member additions) from the Chat audit log, once per run.
- *
- * @returns {Object|null} {roomId: {name, createTime, memberEmails: Set}} or null if the log is unavailable
- */
-function loadAuditRooms_(context) {
-    if (context.auditRooms !== undefined) {
-        return context.auditRooms;
-    }
-    context.auditRooms = null;   // stays null if loading fails, so we fail only once per run
-
-    const reportsUser = getReportsUser_();
-    if (!reportsUser) {
-        Logger.log('No reports user available, skipping Chat audit log lookup');
-        return null;
-    }
-
-    const service = UrlFetchJsonClient.createImpersonatingService(
-        'ConsentPollReports-' + reportsUser, context.creds, reportsUser, SCOPE_REPORTS_AUDIT_READONLY);
-    const reportsClient = new UrlFetchJsonClient(service);
-
-    // Every event we handle starts at or after now, so its window starts at or after now - 8 days
-    const startTime = new Date(Date.now() - SPACE_CREATE_WINDOW_BEFORE_MS).toISOString();
-
-    const rooms = {};
-    for (const activity of listChatAuditActivities_(reportsClient, 'room_created', startTime,
-        'conversation_type==' + AUDIT_GROUP_DM_TYPE)) {
-        const params = auditParameters_(activity);
-        if (!params.room_id) {
-            continue;
-        }
-        const memberEmails = new Set();
-        const actorEmail = (activity.actor?.email || '').toLowerCase();
-        if (actorEmail) {
-            memberEmails.add(actorEmail);
-        }
-        rooms[params.room_id] = {
-            name: 'spaces/' + params.room_id,
-            createTime: activity.id?.time,
-            memberEmails: memberEmails
-        };
-    }
-
-    let memberCount = 0;
-    for (const activity of listChatAuditActivities_(reportsClient, 'add_room_member', startTime)) {
-        const params = auditParameters_(activity);
-        const room = rooms[params.room_id];
-        if (!room) {
-            continue;
-        }
-        for (const target of [].concat(params.target_users || [])) {
-            const email = ('' + target).trim().toLowerCase();
-            if (email) {
-                room.memberEmails.add(email);
-                ++memberCount;
-            }
-        }
-    }
-
-    Logger.log('Loaded %s group DMs (%s member additions) from the Chat audit log since %s as %s',
-        '' + Object.keys(rooms).length, '' + memberCount, startTime, reportsUser);
-
-    context.auditRooms = rooms;
-    return rooms;
-}
-
-
-/** List Chat audit log activities of one event type since startTime (Admin SDK Reports API). */
-function listChatAuditActivities_(reportsClient, eventName, startTime, filters) {
-    const activities = [];
-    let pageToken = undefined;
-    do {
-        const query = UrlFetchJsonClient.buildQuery({
-            eventName: eventName,
-            startTime: startTime,
-            filters: filters,
-            maxResults: 1000,
-            pageToken: pageToken
-        });
-        const response = reportsClient.getJson(REPORTS_API_BASE + '/activity/users/all/applications/chat' + query) || {};
-        for (const activity of (response.items || [])) {
-            activities.push(activity);
-        }
-        pageToken = response.nextPageToken;
-    } while (pageToken);
-
-    return activities;
-}
-
-
-/** Flatten the parameters of an audit activity's first event into {name: value}. */
-function auditParameters_(activity) {
-    const params = {};
-    const event = (activity.events || [])[0] || {};
-    for (const parameter of (event.parameters || [])) {
-        if (parameter.multiValue !== undefined) {
-            params[parameter.name] = parameter.multiValue;
-        } else if (parameter.value !== undefined) {
-            params[parameter.name] = parameter.value;
-        } else if (parameter.intValue !== undefined) {
-            params[parameter.name] = parameter.intValue;
-        } else if (parameter.boolValue !== undefined) {
-            params[parameter.name] = parameter.boolValue;
-        }
-    }
-    return params;
-}
-
-
-/** Candidate spaces from the Chat audit log: group DMs created in the window, not used by another poll.
- *
- * When the audit log knows the members, the organizer must be one of them (the audit log covers the
- * whole domain, not just the organizer's conversations). Otherwise members are resolved later.
- *
- * @returns {Array} [{space: {name, createTime}, memberEmails: Set|null}]
- */
-function listAuditCandidateSpaces_(context, organizerEmail, window) {
-    const rooms = loadAuditRooms_(context) || {};
-    const organizer = organizerEmail.toLowerCase();
-
-    const candidates = [];
-    for (const roomId in rooms) {
-        const room = rooms[roomId];
-        if (context.usedSpaces[room.name] || !room.createTime) {
-            continue;
-        }
-        const createTime = new Date(room.createTime).getTime();
-        if (createTime < window.start || createTime > window.end) {
-            continue;
-        }
-        const memberEmails = room.memberEmails.size ? room.memberEmails : null;
-        if (memberEmails && !memberEmails.has(organizer)) {
-            continue;
-        }
-        candidates.push({space: {name: room.name, createTime: room.createTime}, memberEmails: memberEmails});
-    }
-    return candidates;
-}
-
-
-/** Candidate spaces from spaces.list as the organizer: group DMs created in the window, not used by another poll.
- *
- * @returns {Array} [{space: Space, memberEmails: null}]
- */
-function listOrganizerCandidateSpaces_(context, organizerEmail, window) {
-    const spacesClient = createChatClient_(context.creds, organizerEmail, 'ConsentPollSpaces-', SCOPE_CHAT_SPACES_READONLY);
-
-    const candidates = [];
-    let pageToken = undefined;
-    do {
-        const query = UrlFetchJsonClient.buildQuery({
-            //filter: 'spaceType = "GROUP_CHAT"',
-            pageSize: 100,
-            pageToken: pageToken
-        });
-        const response = spacesClient.getJson(CHAT_API_BASE + '/spaces' + query) || {};
-
-        for (const space of (response.spaces || [])) {
-            if (!space.createTime || context.usedSpaces[space.name]) {
-                continue;
-            }
-            const createTime = new Date(space.createTime).getTime();
-            if (createTime >= window.start && createTime <= window.end) {
-                candidates.push({space: space, memberEmails: null});
-            }
-        }
-
-        pageToken = response.nextPageToken;
-    } while (pageToken);
-
-    return candidates;
-}
-
-
-/** Pick the candidate whose members overlap the event attendees best (see findMeetingChatSpace_()).
- *
- * @param candidates [{space: {name, createTime, displayName?}, memberEmails: Set|null}]
- * @returns {Object|null} The selected space ({name, createTime, displayName?}) or null
- */
-function selectMeetingChatSpace_(context, organizerEmail, event, candidates) {
-    if (candidates.length === 0) {
-        return null;
-    }
-
-    const eventAttendeeEmails = new Set(
-        (event.attendees || []).map(a => (a.email || '').toLowerCase()).filter(e => !!e)
-    );
-
-    const title = (event.summary || '').trim().toLowerCase();
-    const matches = [];
-    let membersClient = null;
-
-    for (const candidate of candidates) {
-        const space = candidate.space;
-        try {
-            let memberCount;
-            let matchCount = 0;
-            if (candidate.memberEmails) {
-                memberCount = candidate.memberEmails.size;
-                for (const email of candidate.memberEmails) {
-                    if (eventAttendeeEmails.has(email)) {
-                        matchCount++;
-                    }
-                }
-            } else {
-                const directory = getDirectory_(context, organizerEmail);
-                membersClient = membersClient
-                    || createChatClient_(context.creds, organizerEmail, 'ConsentPollMembers-', SCOPE_CHAT_MEMBERSHIPS_READONLY);
-                const memberIds = listSpaceMemberIds_(membersClient, space.name);
-                memberCount = memberIds.length;
-                for (const memberId of memberIds) {
-                    const person = directory.idToPerson[memberId];
-                    if (person && eventAttendeeEmails.has(person.email)) {
-                        matchCount++;
-                    }
-                }
-            }
-
-            if (memberCount === 0) {
-                continue;
-            }
-
-            const overlap = matchCount / memberCount;
-            Logger.log('Space %s: %s members, %s match event attendees (%s%% overlap)',
-                space.name, '' + memberCount, '' + matchCount, '' + Math.round(overlap * 100));
-
-            if (overlap >= MIN_MEMBER_OVERLAP) {
-                if (space.displayName === undefined) {
-                    space.displayName = lookupSpaceDisplayName_(context, organizerEmail, space.name);
-                }
-                const titleMatch = !!title && (space.displayName || '').toLowerCase().includes(title);
-                matches.push({space: space, titleMatch: titleMatch, createTime: new Date(space.createTime).getTime()});
-            }
-        } catch (e) {
-            Logger.log('Failed to check members of space %s: %s', space.name, e);
-        }
-    }
-
-    if (matches.length === 0) {
-        return null;
-    }
-
-    matches.sort((a, b) => (b.titleMatch - a.titleMatch) || (a.createTime - b.createTime));
-    return matches[0].space;
-}
-
-
-/** Fetch a space's displayName as the organizer (spaces.get), null if unavailable. */
-function lookupSpaceDisplayName_(context, organizerEmail, spaceName) {
-    try {
-        const spacesClient = createChatClient_(context.creds, organizerEmail, 'ConsentPollSpaces-', SCOPE_CHAT_SPACES_READONLY);
-        const space = spacesClient.getJson(CHAT_API_BASE + '/' + spaceName) || {};
-        return space.displayName || null;
-    } catch (e) {
-        Logger.log('Failed to get space %s as %s: %s', spaceName, organizerEmail, e);
-        return null;
-    }
-}
-
-
-/** List the Chat user IDs (users/{id} -> {id}) of all human members of a space. */
-function listSpaceMemberIds_(membersClient, spaceName) {
-    const ids = [];
-    let pageToken = undefined;
-    do {
-        const query = UrlFetchJsonClient.buildQuery({
-            pageSize: 100,
-            pageToken: pageToken
-        });
-        const response = membersClient.getJson(CHAT_API_BASE + '/' + spaceName + '/members' + query) || {};
-
-        for (const membership of (response.memberships || [])) {
-            const member = membership.member || {};
-            if (member.type === 'BOT') {
-                continue;
-            }
-            const name = member.name || '';
-            if (name.startsWith('users/')) {
-                ids.push(name.substring('users/'.length));
-            }
-        }
-
-        pageToken = response.nextPageToken;
-    } while (pageToken);
-
-    return ids;
-}
-
-
-/** Collect the space names already used by existing polls (avoid double posting into one conversation). */
-function loadUsedSpaces_() {
-    const used = {};
-    const properties = getScriptProperties_().getProperties() || {};
-    for (const key in properties) {
-        if (!key.startsWith(STATE_KEY_PREFIX)) {
-            continue;
-        }
-        try {
-            const state = JSON.parse(properties[key]);
-            if (state.spaceName) {
-                used[state.spaceName] = state.eventId;
-            }
-        } catch (e) {
-            // ignore, cleanupOldState_() removes malformed entries
-        }
-    }
-    return used;
-}
-
-
-// ---------------------------------------------------------------------------
-// Consent Poll Sending
-// ---------------------------------------------------------------------------
-
-/** Post the consent request into the meeting conversation as the organizer. */
-function sendConsentPoll_(context, event) {
-    const organizerEmail = event.organizer?.email;
-    if (!organizerEmail) {
-        Logger.log('No organizer email for event %s, skipping', event.id);
-        return;
-    }
-
-    const space = findMeetingChatSpace_(context, organizerEmail, event);
-    if (!space) {
-        Logger.log('No matching meeting conversation found for event %s (%s), will retry on next trigger run',
-            event.id, event.summary);
-        return;
-    }
-
-    Logger.log('Found meeting conversation %s for event %s (%s)', space.name, event.id, event.summary);
-
+/** Create or refresh the poll state of an event and tell the bot to join (idempotent). */
+function sendBot_(context, event) {
+    const organizerEmail = event.organizer.email;
     const directory = getDirectory_(context, organizerEmail);
+    const botEmail = getBotEmail_();
+
     const attendees = (event.attendees || [])
         .map(a => (a.email || '').toLowerCase())
-        .filter(e => !!e && !e.endsWith('calendar.google.com'));   // drop rooms/resources
+        .filter(e => !!e && !e.endsWith('calendar.google.com') && e !== botEmail);   // drop rooms/resources and the bot
 
     const names = {};
     for (const email of attendees) {
@@ -697,127 +373,166 @@ function sendConsentPoll_(context, event) {
         names[email] = person ? person.name : email;
     }
 
-    const state = {
+    const state = updateState_(event.id, state => Object.assign(state || {
         eventId: event.id,
         token: Util.generateUUIDv4(),
-        meetingTitle: event.summary || '(No title)',
-        meetingTime: event.start.dateTime || event.start.date,
         organizerEmail: organizerEmail,
-        spaceName: space.name,
-        attendees: attendees,
-        names: names,
         responses: {},
-        pollSentAt: Date.now()
+        createdAt: Date.now()
+    }, {
+        meetingTitle: event.summary || '(No title)',
+        meetingTime: event.start.dateTime,
+        meetingUri: getMeetUri_(event),
+        attendees: attendees,
+        names: names
+    }));
+
+    const start = new Date(event.start.dateTime).getTime();
+    const end = new Date(event.end?.dateTime || start + 60 * 60 * 1000).getTime();
+    const joinAt = Math.max(Date.now(), start - JOIN_LEAD_MS);
+    const leaveAt = Math.max(Math.min(joinAt + getStayMinutes_() * 60 * 1000, end), joinAt + 60 * 1000);
+
+    const session = callBot_('PUT', botSessionPath_(event.id), {
+        meetingUri: state.meetingUri,
+        title: state.meetingTitle,
+        joinAt: new Date(joinAt).toISOString(),
+        leaveAt: new Date(leaveAt).toISOString(),
+        greeting: buildGreetingText_(state, context.webAppUrl),
+        farewell: buildTallyText_(state, context.webAppUrl)
+    });
+
+    Logger.log('Bot session for event %s (%s) by %s: %s, joining at %s',
+        event.id, event.summary, organizerEmail, session.state, session.joinAt);
+}
+
+
+/** Tell the bot about a new response: announce the first objection or full consent, update the tally. */
+function notifyBot_(previousState, state) {
+    const webAppUrl = getWebAppUrl_();
+    const before = countResponses_(previousState);
+    const after = countResponses_(state);
+
+    let say = undefined;
+    if (after.declined > 0 && before.declined === 0) {
+        say = '❌ A participant does not consent to being recorded. Please do not record this meeting.';
+    } else if (after.declined === 0 && after.allConsented && !before.allConsented) {
+        say = '✅ All ' + after.invited + ' invited participants consented to being recorded.';
+    }
+
+    callBot_('PATCH', botSessionPath_(state.eventId), {
+        say: say,
+        farewell: buildTallyText_(state, webAppUrl)
+    });
+}
+
+
+function botSessionPath_(eventId) {
+    return '/v1/sessions/' + encodeURIComponent(eventId);
+}
+
+
+/** Call the meet-bot control API with a signed request (see meet-bot/src/auth.mjs), returns the parsed response. */
+function callBot_(method, path, payload) {
+    const bot = getBotConfig_();
+    const body = payload === undefined ? '' : JSON.stringify(payload);
+    const timestamp = '' + Math.floor(Date.now() / 1000);
+    const signature = Utilities.computeHmacSha256Signature([timestamp, method, path, body].join('\n'), bot.secret,
+        Utilities.Charset.UTF_8)
+        .map(b => ('0' + (b & 0xff).toString(16)).slice(-2))
+        .join('');
+
+    const options = {
+        method: method.toLowerCase(),
+        headers: {
+            'X-MeetBot-Timestamp': timestamp,
+            'X-MeetBot-Signature': 'sha256=' + signature
+        },
+        muteHttpExceptions: true
     };
-
-    const messagesClient = createMessagesClient_(context.creds, organizerEmail);
-    const message = messagesClient.postJson(CHAT_API_BASE + '/' + space.name + '/messages', {
-        text: buildPollText_(state, context.webAppUrl)
-    });
-
-    state.messageName = message.name;
-    saveState_(event.id, state);
-    context.usedSpaces[space.name] = event.id;
-
-    // Mark as sent (dedup)
-    getScriptProperties_().setProperty(SENT_KEY_PREFIX + event.id, '' + Date.now());
-
-    Logger.log('Posted consent request for event %s (%s) as %s in %s', event.id, event.summary, organizerEmail, space.name);
-}
-
-
-/** Create a Chat client impersonating the given user with the chat.messages scope. */
-function createMessagesClient_(creds, userEmail) {
-    return createChatClient_(creds, userEmail, 'ConsentPollMessages-', SCOPE_CHAT_MESSAGES);
-}
-
-
-/** Create a JSON client impersonating the given user with one scope (serviceNamePrefix + userEmail names the token cache). */
-function createChatClient_(creds, userEmail, serviceNamePrefix, scope) {
-    const service = UrlFetchJsonClient.createImpersonatingService(serviceNamePrefix + userEmail, creds, userEmail, scope);
-    return new UrlFetchJsonClient(service);
-}
-
-
-/** Update the poll message text in place (as the organizer, who authored it). */
-function updatePollMessage_(state) {
-    if (!state.messageName) {
-        return;
+    if (body) {
+        options.contentType = 'application/json';
+        options.payload = body;
     }
-    const messagesClient = createMessagesClient_(getServiceAccountCredentials_(), state.organizerEmail);
-    messagesClient.patchJson(CHAT_API_BASE + '/' + state.messageName + '?updateMask=text', {
-        text: buildPollText_(state, getWebAppUrl_())
-    });
+
+    const response = UrlFetchApp.fetch(bot.url + path, options);
+    const code = response.getResponseCode();
+    const text = response.getContentText();
+    if (code < 200 || code >= 300) {
+        throw new Error('meet-bot ' + method + ' ' + path + ' failed with HTTP ' + code + ': ' + text);
+    }
+    return text ? JSON.parse(text) : null;
 }
 
 
 // ---------------------------------------------------------------------------
-// Message Text
+// Message Text (plain text, Meet's chat links URLs automatically)
 // ---------------------------------------------------------------------------
 
-/** Build the consent request text (Google Chat text formatting: *bold*, _italic_, <url|label>). */
-function buildPollText_(state, webAppUrl) {
+/** The consent question the bot posts after joining. */
+function buildGreetingText_(state, webAppUrl) {
+    const domain = state.organizerEmail.split('@')[1];
+    const purpose = (getScriptProperties_().getProperty(RECORDING_PURPOSE_KEY) || '').trim();
+    const policyUrl = (getScriptProperties_().getProperty(POLICY_URL_KEY) || '').trim();
+
     const lines = [];
-
-    lines.push('🎥 *Recording consent: ' + state.meetingTitle + '*');
-    lines.push('Scheduled: ' + formatMeetingTime_(state.meetingTime));
-    lines.push('This meeting may be recorded. Please confirm whether you consent to being recorded:');
-
-    if (webAppUrl) {
-        const consentUrl = buildResponseUrl_(webAppUrl, state, true);
-        const declineUrl = buildResponseUrl_(webAppUrl, state, false);
-        lines.push('✅ <' + consentUrl + '|I consent>    ❌ <' + declineUrl + '|I do not consent>');
-    } else {
-        lines.push('_(Web app URL not configured, responses cannot be collected.)_');
+    lines.push('👋 Hi, I am the recording consent bot. I do not record or listen to anything.');
+    lines.push('🎥 "' + state.meetingTitle + '" may be recorded' + (purpose ? ' ' + purpose : '') + '.');
+    lines.push('Do you consent to being recorded? Please answer here: ' + buildPollUrl_(webAppUrl, state));
+    lines.push('Saying no has no disadvantages for you. External guests: the link only works for ' + domain
+        + ' accounts, please answer in this chat.');
+    if (policyUrl) {
+        lines.push('Recording policy: ' + policyUrl);
     }
-    lines.push('_External guests: please state your consent verbally, the links only work for ' +
-        state.organizerEmail.split('@')[1] + ' accounts._');
-
-    const responses = state.responses || {};
-    const attendees = state.attendees || [];
-    const responseCount = Object.keys(responses).length;
-
-    if (responseCount > 0) {
-        const consented = [];
-        const declined = [];
-        const pending = [];
-
-        for (const email of Object.keys(responses)) {
-            (responses[email].consent ? consented : declined).push(displayName_(state, email));
-        }
-        for (const email of attendees) {
-            if (!responses[email]) {
-                pending.push(displayName_(state, email));
-            }
-        }
-
-        // Responders that were not on the invite (e.g. forwarded invitation) count towards total
-        const total = attendees.length + Object.keys(responses).filter(e => !attendees.includes(e)).length;
-
-        lines.push('');
-        lines.push(buildProgressBar_(responseCount, total) + ' *' + responseCount + '/' + total + ' responded*');
-        if (consented.length > 0) {
-            lines.push('✅ Consented: ' + truncateNameList_(consented));
-        }
-        if (declined.length > 0) {
-            lines.push('❌ Declined: ' + truncateNameList_(declined));
-        }
-        if (pending.length > 0) {
-            lines.push('⏳ Pending: ' + truncateNameList_(pending));
-        }
-    }
-
     return lines.join('\n');
 }
 
 
-/** Build a response link for the web app. */
-function buildResponseUrl_(webAppUrl, state, consent) {
-    return webAppUrl + UrlFetchJsonClient.buildQuery({
+/** The summary the bot posts before leaving (kept up to date on every response). */
+function buildTallyText_(state, webAppUrl) {
+    const counts = countResponses_(state);
+    const lines = [];
+    lines.push('📋 Recording consent for "' + state.meetingTitle + '": ' + counts.responded + '/' + counts.invited
+        + ' responded, ' + counts.consented + ' consented, ' + counts.declined + ' declined.');
+    if (counts.declined > 0) {
+        lines.push('❌ At least one participant does not consent. Please do not record this meeting.');
+    } else if (counts.allConsented) {
+        lines.push('✅ All invited participants consented.');
+    } else {
+        lines.push('⏳ Not everyone answered yet: please only record with everyone\'s consent.');
+    }
+    lines.push('You can still answer or change your answer: ' + buildPollUrl_(webAppUrl, state));
+    lines.push('👋 Bye!');
+    return lines.join('\n');
+}
+
+
+/** Count responses (responders not on the invite, e.g. forwarded invitations, count towards the total). */
+function countResponses_(state) {
+    const responses = state?.responses || {};
+    const attendees = state?.attendees || [];
+    const emails = Object.keys(responses);
+    const consented = emails.filter(email => responses[email].consent).length;
+    const invited = attendees.length + emails.filter(email => !attendees.includes(email)).length;
+    return {
+        invited: invited,
+        responded: emails.length,
+        consented: consented,
+        declined: emails.length - consented,
+        allConsented: invited > 0 && attendees.every(email => responses[email]?.consent) && consented === emails.length
+    };
+}
+
+
+/** Build the link to the poll page, with consent = true/false a link that records the answer. */
+function buildPollUrl_(webAppUrl, state, consent) {
+    const params = {
         [PARAM_EVENT]: state.eventId,
-        [PARAM_TOKEN]: state.token,
-        [PARAM_CONSENT]: consent ? '1' : '0'
-    });
+        [PARAM_TOKEN]: state.token
+    };
+    if (consent !== undefined) {
+        params[PARAM_CONSENT] = consent ? '1' : '0';
+    }
+    return webAppUrl + UrlFetchJsonClient.buildQuery(params);
 }
 
 
@@ -836,7 +551,7 @@ function displayName_(state, email) {
  * Deployment: execute as the deploying user, access restricted to the domain, so that
  * Session.getActiveUser().getEmail() identifies the responding person.
  *
- * Query parameters: e=<eventId>, t=<token>, c=1|0 (omit c to just show the status).
+ * Query parameters: e=<eventId>, t=<token>, c=1|0 (omit c to show the question and status).
  */
 function doGet(e) {
     const params = (e && e.parameter) || {};
@@ -860,8 +575,10 @@ function doGet(e) {
         return renderPage_('Recording Consent', '<p>This consent poll is no longer active or the link is invalid.</p>');
     }
 
+    const webAppUrl = getWebAppUrl_();
+
     if (consentParam === undefined) {
-        return renderPage_('Recording Consent', buildStatusHtml_(state, null));
+        return renderPage_('Recording Consent', buildQuestionHtml_(state, webAppUrl) + buildStatusHtml_(state, userEmail));
     }
 
     if (!userEmail) {
@@ -871,49 +588,64 @@ function doGet(e) {
     }
 
     const consent = consentParam === '1';
-    const updatedState = recordResponse_(eventId, userEmail, consent);
-    if (!updatedState) {
+    const updated = recordResponse_(eventId, userEmail, consent);
+    if (!updated) {
         return renderPage_('Recording Consent', '<p>This consent poll is no longer active.</p>');
     }
 
     let notice = '';
     try {
-        updatePollMessage_(updatedState);
+        notifyBot_(updated.previous, updated.state);
     } catch (err) {
-        Logger.log('Failed to update poll message for event %s: %s', eventId, err);
-        notice = '<p class="muted">Your response was recorded, but the chat message could not be updated.</p>';
+        Logger.log('Failed to notify the bot about a response for event %s: %s', eventId, err);
+        notice = consent ? '' : '<p class="muted">Your response was recorded, but the bot could not inform the meeting. '
+            + 'Please tell the organizer.</p>';
     }
 
     const headline = consent
         ? '<p class="ok">✅ Thank you, your consent has been recorded.</p>'
-        : '<p class="no">❌ Thank you, your objection has been recorded. The organizer has been informed via the meeting chat.</p>';
+        : '<p class="no">❌ Thank you, your objection has been recorded. The meeting has been informed (without your name).</p>';
 
-    return renderPage_('Recording Consent', headline + notice + buildStatusHtml_(updatedState, userEmail));
+    return renderPage_('Recording Consent', headline + notice + buildQuestionHtml_(updated.state, webAppUrl)
+        + buildStatusHtml_(updated.state, userEmail));
 }
 
 
-/** Record a response under a script lock, returns the updated state or null if the poll is gone. */
+/** Record a response under a script lock, returns {previous, state} or null if the poll is gone. */
 function recordResponse_(eventId, userEmail, consent) {
-    const lock = LockService.getScriptLock();
-    lock.waitLock(15000);
-    try {
-        const state = loadState_(eventId);
+    let previous = null;
+    const state = updateState_(eventId, state => {
         if (!state) {
             return null;
         }
-
+        previous = JSON.parse(JSON.stringify(state));
         state.responses = state.responses || {};
         state.responses[userEmail] = {
             consent: consent,
             name: state.names?.[userEmail] || userEmail,
             respondedAt: Date.now()
         };
-
-        saveState_(eventId, state);
         return state;
-    } finally {
-        lock.releaseLock();
-    }
+    });
+    return state ? {previous: previous, state: state} : null;
+}
+
+
+/** Render the question with the answer buttons. */
+function buildQuestionHtml_(state, webAppUrl) {
+    const purpose = (getScriptProperties_().getProperty(RECORDING_PURPOSE_KEY) || '').trim();
+    const policyUrl = (getScriptProperties_().getProperty(POLICY_URL_KEY) || '').trim();
+
+    // HtmlService pages run in an iframe, links must navigate the top window
+    return '<h2>' + escapeHtml_(state.meetingTitle) + '</h2>'
+        + '<p class="muted">' + escapeHtml_(formatMeetingTime_(state.meetingTime)) + '</p>'
+        + '<p>This meeting may be recorded' + (purpose ? ' ' + escapeHtml_(purpose) : '') + '. '
+        + 'Do you consent to being recorded? Saying no has no disadvantages for you.'
+        + (policyUrl ? ' See the <a target="_top" href="' + escapeHtml_(policyUrl) + '">recording policy</a>.' : '')
+        + '</p><p>'
+        + '<a class="button ok" target="_top" href="' + escapeHtml_(buildPollUrl_(webAppUrl, state, true)) + '">✅ I consent</a> '
+        + '<a class="button no" target="_top" href="' + escapeHtml_(buildPollUrl_(webAppUrl, state, false)) + '">❌ I do not consent</a>'
+        + '</p>';
 }
 
 
@@ -937,9 +669,7 @@ function buildStatusHtml_(state, userEmail) {
         rows.push('<tr><td>' + escapeHtml_(displayName_(state, email)) + me + '</td><td>' + status + '</td></tr>');
     }
 
-    return '<h2>' + escapeHtml_(state.meetingTitle) + '</h2>'
-        + '<p class="muted">' + escapeHtml_(formatMeetingTime_(state.meetingTime)) + '</p>'
-        + '<p>' + Object.keys(responses).length + '/' + all.length + ' responded</p>'
+    return '<p>' + Object.keys(responses).length + '/' + all.length + ' responded</p>'
         + '<table>' + rows.join('') + '</table>';
 }
 
@@ -950,7 +680,8 @@ function renderPage_(title, bodyHtml) {
         + '<title>' + escapeHtml_(title) + '</title>'
         + '<style>body{font-family:system-ui,sans-serif;max-width:40em;margin:2em auto;padding:0 1em;color:#222}'
         + 'table{border-collapse:collapse}td{padding:.25em .75em .25em 0}.ok{color:#1b7f3b;font-weight:bold}'
-        + '.no{color:#b3261e;font-weight:bold}.muted{color:#666}</style></head>'
+        + '.no{color:#b3261e;font-weight:bold}.muted{color:#666}'
+        + '.button{display:inline-block;padding:.5em 1em;margin:0 .5em .5em 0;border:2px solid;border-radius:.5em;text-decoration:none}</style></head>'
         + '<body><h1>' + escapeHtml_(title) + '</h1>' + bodyHtml + '</body></html>';
     return HtmlService.createHtmlOutput(html).setTitle(title);
 }
@@ -985,9 +716,19 @@ function loadState_(eventId) {
     }
 }
 
-/** Save consent poll state to ScriptProperties. */
-function saveState_(eventId, state) {
-    getScriptProperties_().setProperty(STATE_KEY_PREFIX + eventId, JSON.stringify(state));
+/** Update consent poll state under a script lock: updater(state or null) returns the new state (null: no change). */
+function updateState_(eventId, updater) {
+    const lock = LockService.getScriptLock();
+    lock.waitLock(15000);
+    try {
+        const state = updater(loadState_(eventId));
+        if (state) {
+            getScriptProperties_().setProperty(STATE_KEY_PREFIX + eventId, JSON.stringify(state));
+        }
+        return state;
+    } finally {
+        lock.releaseLock();
+    }
 }
 
 /** Clean up state entries older than STATE_MAX_AGE_MS. */
@@ -999,19 +740,14 @@ function cleanupOldState_() {
         if (key.startsWith(STATE_KEY_PREFIX)) {
             try {
                 const state = JSON.parse(properties[key]);
-                if (state.pollSentAt && (now - state.pollSentAt) > STATE_MAX_AGE_MS) {
+                const createdAt = state.createdAt || state.pollSentAt;
+                if (!createdAt || (now - createdAt) > STATE_MAX_AGE_MS) {
                     getScriptProperties_().deleteProperty(key);
                     Logger.log('Cleaned up old state: %s', key);
                 }
             } catch (e) {
                 // Malformed state, clean it up
                 getScriptProperties_().deleteProperty(key);
-            }
-        } else if (key.startsWith(SENT_KEY_PREFIX)) {
-            const sentAt = +properties[key];
-            if (sentAt && (now - sentAt) > STATE_MAX_AGE_MS) {
-                getScriptProperties_().deleteProperty(key);
-                Logger.log('Cleaned up old sent marker: %s', key);
             }
         }
     }
@@ -1056,35 +792,56 @@ function getEmailWhiteList_() {
 
 /** Get the lookahead minutes or the default (15 minutes). */
 function getLookaheadMinutes_() {
-    const raw = (getScriptProperties_().getProperty(LOOKAHEAD_MINUTES_KEY) || '').trim();
-    const minutes = Math.abs(Math.round(+raw));
-    if (!minutes || Number.isNaN(minutes)) {
-        return 15;
-    }
-    return minutes;
+    return getPositiveIntProperty_(LOOKAHEAD_MINUTES_KEY, 15);
 }
 
 /** Get the minimum number of attendees or the default (2). */
 function getMinAttendees_() {
-    const raw = (getScriptProperties_().getProperty(MIN_ATTENDEES_KEY) || '').trim();
-    const count = Math.abs(Math.round(+raw));
-    if (!count || Number.isNaN(count)) {
-        return 2;
-    }
-    return count;
+    return getPositiveIntProperty_(MIN_ATTENDEES_KEY, 2);
 }
 
-/** Get the admin account to impersonate for the Chat audit log (property override, else the executing account, else null). */
-function getReportsUser_() {
-    const configured = (getScriptProperties_().getProperty(REPORTS_USER_KEY) || '').trim();
+/** Get the minutes the bot stays in a meeting or the default (10 minutes). */
+function getStayMinutes_() {
+    return getPositiveIntProperty_(STAY_MINUTES_KEY, 10);
+}
+
+/** Read a positive integer property, else the default. */
+function getPositiveIntProperty_(key, defaultValue) {
+    const raw = (getScriptProperties_().getProperty(key) || '').trim();
+    const value = Math.abs(Math.round(+raw));
+    if (!value || Number.isNaN(value)) {
+        return defaultValue;
+    }
+    return value;
+}
+
+/** Get the join mode ('recorded' or 'all', default 'recorded'). */
+function getJoinMode_() {
+    const mode = (getScriptProperties_().getProperty(JOIN_MODE_KEY) || '').trim().toLowerCase();
+    return mode === 'all' ? 'all' : 'recorded';
+}
+
+/** Get the bot control API base URL and secret, throws if not configured. */
+function getBotConfig_() {
+    const url = (getScriptProperties_().getProperty(BOT_URL_KEY) || '').trim().replace(/\/+$/, '');
+    const secret = (getScriptProperties_().getProperty(BOT_SECRET_KEY) || '').trim();
+    if (!url.startsWith('https://') || secret.length < 32) {
+        throw new Error('Bot not configured, set ' + BOT_URL_KEY + ' (https://...) and ' + BOT_SECRET_KEY + ' (32+ characters)');
+    }
+    return {url: url, secret: secret};
+}
+
+/** Get the bot account email (property override, else the executing account). */
+function getBotEmail_() {
+    const configured = (getScriptProperties_().getProperty(BOT_EMAIL_KEY) || '').trim().toLowerCase();
     if (configured) {
         return configured;
     }
     try {
-        return (Session.getEffectiveUser().getEmail() || '').trim() || null;
+        return (Session.getEffectiveUser().getEmail() || '').trim().toLowerCase();
     } catch (e) {
         Logger.log('Failed to determine the executing account: %s', e);
-        return null;
+        return '';
     }
 }
 
@@ -1113,23 +870,4 @@ function formatMeetingTime_(isoTime) {
     } catch (e) {
         return isoTime;
     }
-}
-
-/** Build a Unicode progress bar. */
-function buildProgressBar_(current, total) {
-    if (total <= 0) {
-        return '';
-    }
-    const filled = Math.min(10, Math.round((current / total) * 10));
-    return '█'.repeat(filled) + '░'.repeat(10 - filled);
-}
-
-/** Truncate a list of names for display, adding "and N more" if needed. */
-function truncateNameList_(names) {
-    if (names.length <= MAX_DISPLAY_NAMES) {
-        return names.join(', ');
-    }
-    const shown = names.slice(0, MAX_DISPLAY_NAMES);
-    const remaining = names.length - MAX_DISPLAY_NAMES;
-    return shown.join(', ') + ' and ' + remaining + ' more';
 }

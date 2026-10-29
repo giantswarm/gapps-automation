@@ -1,19 +1,19 @@
 # Meeting Recording Consent Poll
 
-Posts a recording consent request into the Google Meet **meeting conversation** (the Google Chat backed
-in-meeting chat, see [Continue your conversations in Google Chat](https://workspaceupdates.googleblog.com/2025/11/continue-conversations-google-chat-google-meet.html))
-and collects per-person responses.
+Asks the participants of recorded Google Meet meetings whether they consent to being recorded and
+collects per-person responses. The question is asked by a bot ([meet-bot](../meet-bot/README.md),
+signed in as a Workspace bot account like `automation@giantswarm.io`) that joins the meeting
+visibly and writes into the meeting chat, remote controlled by this script.
 
-## Why text only
+## Why a bot
 
-- Meeting conversations are system generated Chat group DMs. Chat apps cannot be added to them.
-- Cards (`cardsV2`) can only be posted by a Chat app. Messages posted with user authentication may
-  [only contain text](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create).
-
-So the script posts a **text message as the meeting organizer** (domain-wide delegation) containing
-"I consent" / "I do not consent" links. The links open this script's web app, which identifies the
-responding person via `Session.getActiveUser()`, stores the response and patches the message text in
-place with the current tally. External guests cannot open the web app and are asked to respond verbally.
+- Meeting conversations (the Google Chat backed in-meeting chat) are system generated Chat group
+  DMs. Chat apps cannot be added to them, there is no API link between them and calendar events and
+  they only show up in `spaces.list` once someone wrote into them. Posting into them reliably via the
+  Chat API turned out to be impossible (see the history of
+  [#368](https://github.com/giantswarm/gapps-automation/pull/368)).
+- Meet has no API to join a call as a participant. So the bot drives the Meet web UI, like note
+  taker bots do: everyone sees it in the participant list and its messages in the chat.
 
 ## Files
 
@@ -24,87 +24,80 @@ place with the current tally. External guests cannot open the web app and are as
 ## How it works
 
 1. `checkUpcomingMeetings()` (time trigger) loads active employees from Personio and scans each
-   employee's primary calendar for events starting within `lookaheadMinutes` that they organize,
-   have at least `minAttendees` attendees and a Google Meet link.
-2. `findMeetingChatSpace_()` looks for group DMs created between 8 days before and 1 hour after the
-   meeting start (meeting conversations are [created up to 7 days ahead](https://knowledge.workspace.google.com/admin/chat/managing-meeting-conversations-for-chat)),
-   from two sources:
-   - the **Chat audit log** (Admin SDK Reports API, impersonating `reportsUser`): `room_created`
-     events with `conversation_type == GROUP_DIRECT_MESSAGE` list the system generated conversations
-     before anyone wrote into them, `add_room_member` events list their members. Loaded once per run.
-   - fallback: `spaces.list` as the organizer, which only returns group DMs that already contain a
-     message. Member IDs (`users/{id}`) are resolved to emails via the People API directory.
-
-   A candidate qualifies when at least 80% of its members are event attendees. Spaces already used by
-   another poll are skipped, a `displayName` containing the event title wins, then the oldest.
-3. The consent text is posted as the organizer with the `chat.messages` scope. State (attendees,
-   names, responses, message name, random token) is stored in ScriptProperties keyed by event ID.
-4. `doGet()` records a response under a script lock and updates the message text via
-   `spaces.messages.patch` as the organizer.
-5. State and dedup markers are cleaned up after 48 hours.
-
-If no meeting conversation is found yet, the event is retried on every trigger run until it ends.
-Without audit log access this only succeeds once someone has written into the conversation, because
-`spaces.list` hides empty group DMs.
+   employee's primary calendar for events starting within `lookaheadMinutes` (or started less than
+   10 minutes ago) that they organize, with at least `minAttendees` attendees and a Google Meet link.
+2. With `joinMode` `recorded` (default) only meetings that will be recorded qualify: automatic
+   recording, transcription or Gemini notes are enabled for the Meet space (Meet REST API
+   `spaces.get`, impersonating the organizer), or the event description contains `#consent-poll`.
+3. The poll state (attendees, names, responses, random token) is stored in ScriptProperties keyed by
+   event ID and the bot is told to join (`PUT /v1/sessions/{eventId}`, signed with `botSecret`).
+   This is repeated on every run, the bot ignores sessions it already knows.
+4. The bot joins one minute before the meeting starts and posts the question with a link to this
+   script's web app. External guests are asked to answer in the chat.
+5. `doGet()` shows the question with "I consent" / "I do not consent" buttons, identifies the person
+   via `Session.getActiveUser()`, records the answer (it can be changed later) and updates the bot:
+   the first objection is announced in the meeting right away (without the name), as is consent of
+   all invited participants. The tally is posted when the bot leaves (after `stayMinutes`).
+6. State is cleaned up after 48 hours.
 
 ## Deployment
 
-1. Build and push:
+1. Deploy the [meet-bot](../meet-bot/README.md) and note its URL and shared secret.
+
+2. Build and push:
    ```bash
    make meeting-consent-poll/
    ```
 
-2. Add Domain-Wide Delegation scopes to the service account (Admin Console > Security > API controls):
+3. Add Domain-Wide Delegation scopes to the service account (Admin Console > Security > API controls):
    - `https://www.googleapis.com/auth/calendar` (used by the shared `CalendarClient`)
    - `https://www.googleapis.com/auth/directory.readonly`
-   - `https://www.googleapis.com/auth/chat.spaces.readonly`
-   - `https://www.googleapis.com/auth/chat.memberships.readonly`
-   - `https://www.googleapis.com/auth/chat.messages`
-   - `https://www.googleapis.com/auth/admin.reports.audit.readonly` (Chat audit log)
+   - `https://www.googleapis.com/auth/meetings.space.readonly` (automatic recording settings)
 
-   Make sure the Google Chat API, People API and Admin SDK API are enabled in the service account's
-   GCP project. The account impersonated for the audit log (`ConsentPoll.reportsUser`, default: the
-   account running the script) needs the **Reports** admin privilege in the Admin Console.
+   Make sure the Google Calendar API, People API and Google Meet REST API are enabled in the
+   service account's GCP project.
 
-3. Deploy the web app (execute as you, access: anyone within the domain) and note the `/exec` URL:
+4. Deploy the web app (execute as you, access: anyone within the domain) and note the `/exec` URL:
    ```bash
    cd meeting-consent-poll && clasp deploy --description "consent web app"
    ```
 
-4. Set properties:
+5. Set properties:
    ```bash
    clasp run 'setProperties' --params '[{
      "ConsentPoll.personioToken": "CLIENT_ID|CLIENT_SECRET",
      "ConsentPoll.serviceAccountCredentials": "{...JSON...}",
      "ConsentPoll.allowedDomains": "example.com",
      "ConsentPoll.emailWhiteList": "tester@example.com",
-     "ConsentPoll.webAppUrl": "https://script.google.com/a/macros/example.com/s/.../exec"
+     "ConsentPoll.webAppUrl": "https://script.google.com/a/macros/example.com/s/.../exec",
+     "ConsentPoll.botUrl": "https://meet-bot.example.com",
+     "ConsentPoll.botSecret": "SAME AS MEETBOT_SECRET"
    }, false]'
    ```
-   Optional: `ConsentPoll.lookaheadMinutes` (default 15), `ConsentPoll.minAttendees` (default 2),
-   `ConsentPoll.reportsUser` (default: the account running the script).
+   Optional:
+   - `ConsentPoll.joinMode`: `recorded` (default) or `all`
+   - `ConsentPoll.recordingPurpose`: completes "... may be recorded", e.g. `for AI generated meeting minutes`
+   - `ConsentPoll.policyUrl`: link to the recording policy
+   - `ConsentPoll.stayMinutes` (default 10), `ConsentPoll.lookaheadMinutes` (default 15),
+     `ConsentPoll.minAttendees` (default 2)
+   - `ConsentPoll.botEmail`: the bot account, excluded from the attendees (default: the account
+     running the script)
 
-5. Test manually: create a meeting with a Meet link starting in a few minutes (without writing into
-   its meeting chat, to exercise the audit log path; write one message to test the fallback), then run
+6. Test: `clasp run 'listBotSessions'` checks the connection to the bot. Then create a meeting
+   with a Meet link and `#consent-poll` in the description, starting in a few minutes, and run
    ```bash
    clasp run 'checkUpcomingMeetings'
    ```
-   and check the execution log. Click both links, verify the message text updates.
+   Join the meeting, the bot should show up a minute before the start and ask. Answer via the link.
 
-6. Install the trigger:
+7. Install the trigger (the interval must be shorter than `lookaheadMinutes`):
    ```bash
    clasp run 'install' --params '[5]'
    ```
 
 ## Known limitations
 
-- Depends on the meeting conversation existing; meetings where the host disabled continuous chat
-  get no poll.
-- The audit log path assumes the `room_id` of the Chat audit log equals the `spaces/{id}` resource
-  name and that posting via the API into a not yet used conversation makes it visible to the
-  participants. Both have to be confirmed with the first real run (check the execution log).
-- Chat audit log data lags a couple of minutes behind; conversations created right before the
-  meeting are picked up by a later trigger run.
-- Matching by member overlap is a heuristic; recurring meetings with identical attendees are
-  disambiguated by title and creation time only.
 - Only meetings organized by active employees on `allowedDomains` are handled.
+- Meetings whose automatic recording is switched on during the meeting, or recorded manually, are
+  only covered with the `#consent-poll` marker or `joinMode` `all`.
+- The bot automates the Meet web UI, see the [bot's limitations](../meet-bot/README.md#known-limitations).

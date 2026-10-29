@@ -58,3 +58,22 @@ jobs:
         uses: ./.github/actions/run-js-tests
         with:
           test_name: ${{ matrix.test }}
+  test_meet_bot:
+    name: Test meet-bot
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: meet-bot
+    steps:
+      - name: Checkout Sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup NodeJS
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: meet-bot/package-lock.json
+      - name: Install Dependencies
+        run: npm ci
+      - name: Run Tests
+        run: npm test
