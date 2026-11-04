@@ -1,7 +1,8 @@
 /**
  * Fetch AI usage and cost statistics from LLM provider APIs and write to a Google Sheet.
  *
- * Supported sources: anthropic, claude-code, openai, Claude Team invoices (PDF attachments in a Gmail mailbox)
+ * Supported sources: anthropic, claude-code, openai, chatgpt (ChatGPT workspace usage),
+ *                    Claude Team invoices (PDF attachments in a Gmail mailbox)
  *
  * All costs are written in EUR (we are billed in EUR). Provider APIs report USD, which is
  * converted using the ECB reference rate of the usage day (see Currency.convertCurrency).
@@ -11,11 +12,16 @@
  * from the previous month) and fills in the informational EUR->USD reference rate. Seat tiers of
  * the claude.ai Team plan are not exposed by any API. They, and the extra usage of the Team plan, are
  * taken from the invoices Anthropic sends by mail (see fetchClaudeInvoices_). Without invoices,
- * user_count must be corrected by hand from the claude.ai members export.
+ * user_count must be corrected by hand from the claude.ai members export. ChatGPT workspace seats (provider chatgpt)
+ * are maintained by hand as well and carried forward the same way.
  *
  * Script Properties:
  *   AiCost.anthropicAdminKey          Anthropic admin API key (for anthropic + claude-code sources)
  *   AiCost.openaiAdminKey             OpenAI admin API key (for openai source)
+ *   AiCost.chatgptAdminKey            ChatGPT workspace Admin key (for chatgpt source, created in the Admin Console under
+ *                                     Credentials > Admin keys, permission "Enterprise analytics API" Read, i.e. scope
+ *                                     enterprise.analytics.usage.read; API Platform admin keys don't work)
+ *   AiCost.chatgptWorkspaceId         ChatGPT workspace ID (UUID, shown on chatgpt.com/admin)
  *   AiCost.invoiceMailbox             Mailbox receiving the Claude Team invoices (e.g. automation@example.com)
  *   AiCost.serviceAccountCredentials  Service account credentials JSON (domain-wide delegation, scope
  *                                     https://mail.google.com/), for reading invoiceMailbox
@@ -33,6 +39,8 @@ const TRIGGER_HANDLER_FUNCTION = 'fetchAiCosts';
 
 const ANTHROPIC_ADMIN_KEY_PROP = PROPERTY_PREFIX + 'anthropicAdminKey';
 const OPENAI_ADMIN_KEY_PROP = PROPERTY_PREFIX + 'openaiAdminKey';
+const CHATGPT_ADMIN_KEY_PROP = PROPERTY_PREFIX + 'chatgptAdminKey';
+const CHATGPT_WORKSPACE_ID_PROP = PROPERTY_PREFIX + 'chatgptWorkspaceId';
 
 const COLUMNS = [
     'date', 'source', 'record_type', 'model', 'actor',
@@ -49,8 +57,13 @@ const PROVIDER_DEFAULT_CURRENCY = 'USD';
 const STATIC_SHEET_PREFIX = 'Static-Data-';
 /** Header of the static data sheet (created if the sheet is missing). */
 const STATIC_COLUMNS = ['month', 'provider', 'user_count', 'type', 'cost_cost_per_seat', 'eur-to-usd'];
-/** Provider whose seat rows are maintained by the script. */
+/** Provider whose seat rows are maintained from the Claude Team invoices. */
 const STATIC_PROVIDER = 'claude-code';
+/** Providers whose seat rows are carried forward into each new month, with the source to update user_count from. */
+const STATIC_CARRY_FORWARD_PROVIDERS = {
+    'claude-code': 'the claude.ai members export (Seat Tier column)',
+    'chatgpt': 'the ChatGPT workspace members (chatgpt.com/admin)',
+};
 /** Prefix of cell notes written by the script (cells with other, manual notes are never overwritten). */
 const STATIC_AUTO_NOTE_PREFIX = 'Auto:';
 /** Static data type of the Team plan extra usage (monthly sum of the invoices, user_count 1). */
@@ -73,6 +86,8 @@ const INVOICE_COLUMNS = ['date', 'invoice', 'kind', 'tier', 'description', 'quan
 
 const ANTHROPIC_BASE = 'https://api.anthropic.com';
 const OPENAI_BASE = 'https://api.openai.com';
+/** ChatGPT workspace Admin API (separate from the API Platform at OPENAI_BASE). */
+const CHATGPT_BASE = 'https://api.chatgpt.com';
 
 /** Anthropic standard-tier pricing per token (USD). Used to estimate per-model costs from the usage
  *  report (record_type usage, cost_type estimated), as a cross-check of the billed cost report rows.
@@ -220,6 +235,23 @@ function fetchAiCostsForRange_(startDate, endDate) {
         }
     } else {
         Logger.log('Skipping openai: %s not set', OPENAI_ADMIN_KEY_PROP);
+    }
+
+    // ChatGPT workspace usage (ChatGPT, Codex and Work, billed via the ChatGPT subscription)
+    const chatgptKey = props.getProperty(CHATGPT_ADMIN_KEY_PROP) || '';
+    const chatgptWorkspaceId = props.getProperty(CHATGPT_WORKSPACE_ID_PROP) || '';
+    if (chatgptKey && chatgptWorkspaceId) {
+        try {
+            Logger.log('Fetching chatgpt...');
+            const chatgptRows = fetchChatgptUsage_(chatgptKey, chatgptWorkspaceId, startDate, endDate);
+            rows.push(...chatgptRows);
+            Logger.log('  chatgpt: %s rows', chatgptRows.length);
+        } catch (e) {
+            Logger.log('Failed to fetch chatgpt: %s', e.message);
+            firstError = firstError || e;
+        }
+    } else {
+        Logger.log('Skipping chatgpt: %s or %s not set', CHATGPT_ADMIN_KEY_PROP, CHATGPT_WORKSPACE_ID_PROP);
     }
 
     // Collect (date, source) keys present in fetched data for targeted dedup
@@ -702,6 +734,62 @@ function fetchOpenaiCosts_(apiKey, startDate, endDate) {
 }
 
 
+// --- Section G2: ChatGPT workspace source ---
+
+/** Fetch the daily ChatGPT workspace usage (ChatGPT, Codex and Work), one row per (day, user).
+ *
+ * Uses the Daily Usage Analytics API of the ChatGPT Admin API. Its totals carry the consumed credits (credit based
+ * plans) or the billed cost_usd (USD billed plans), plus estimated_cost_usd (list price value of the credits).
+ * cost_eur is the billed cost_usd if present (cost_type usd), otherwise estimated_cost_usd (cost_type credits).
+ * The remaining totals and the per client breakdown are kept in the metadata column. Days without any activity
+ * are skipped.
+ *
+ * Reference: https://chatgpt.com/public/admin/api-reference (Daily Usage), see also
+ * https://learn.chatgpt.com/docs/enterprise/analytics-api
+ */
+function fetchChatgptUsage_(apiKey, workspaceId, startDate, endDate) {
+    const url = CHATGPT_BASE + '/v1/analytics/workspaces/' + encodeURIComponent(workspaceId) + '/usage'
+        + '?start_time=' + toUnixSeconds_(startDate)
+        + '&end_time=' + toUnixSeconds_(endDate)
+        + '&limit=1000';
+
+    return fetchAllPages_(url,
+        {'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json'},
+        function(json) {
+            const rows = [];
+            for (const result of json.data || []) {
+                const totals = result.totals || {};
+                const costUsd = totals.cost_usd != null ? parseFloat(totals.cost_usd) || 0 : null;
+                const estimatedUsd = parseFloat(totals.estimated_cost_usd) || 0;
+                if (!Object.keys(totals).some(function(k) { return +totals[k]; })) {
+                    continue;  // no activity
+                }
+                const date = new Date((result.start_time || 0) * 1000).toISOString().slice(0, 10);
+                const meta = {...totals};
+                delete meta.cost_usd;
+                delete meta.estimated_cost_usd;
+                if (result.clients && result.clients.length) {
+                    meta.clients = result.clients;
+                }
+                rows.push(makeRow_({
+                    date: date, source: 'chatgpt', record_type: 'usage',
+                    actor: result.actor?.email || result.email || result.actor?.user_id || result.user_id || '',
+                    input_tokens: +totals.input_tokens || 0,
+                    output_tokens: +totals.output_tokens || 0,
+                    cache_read_tokens: +(totals.cached_input_tokens || totals.input_cached_tokens) || 0,
+                    num_requests: +totals.messages || 0,
+                    cost_eur: toCostCurrency_(costUsd !== null ? costUsd : estimatedUsd, 'USD', date),
+                    cost_type: costUsd !== null ? 'usd' : 'credits',
+                    metadata: JSON.stringify(meta),
+                }));
+            }
+            return rows;
+        },
+        function(json) { return json.has_more && json.next_page ? url + '&page=' + encodeURIComponent(json.next_page) : null; }
+    );
+}
+
+
 // --- Section H: Sheet operations ---
 
 /** Write fetched rows to the target sheet.
@@ -761,10 +849,10 @@ function appendToSheet_(spreadsheet, newRows, fetchedKeys) {
 
 /** Keep the seat cost rows of the current (UTC) month in Static-Data-<year> up to date.
  *
- * - If no seat rows for (current month, STATIC_PROVIDER) exist, they are created by copying the seat rows of the most
- *   recent earlier month (falling back to the previous year's sheet in January). Seat counts and EUR prices
- *   are carried forward unchanged; user_count gets a note asking for a manual update from the members export,
- *   because no API exposes the claude.ai Team seat tiers.
+ * - For each provider of STATIC_CARRY_FORWARD_PROVIDERS without seat rows for the current month, they are created by
+ *   copying its seat rows of the most recent earlier month (falling back to the previous year's sheet in January).
+ *   Seat counts and EUR prices are carried forward unchanged; user_count gets a note asking for a manual update from
+ *   the members export, because no API exposes the claude.ai Team seat tiers.
  * - The eur-to-usd column of the current month's rows is set to the latest EUR->USD reference rate (4 decimals).
  *   It is informational only (seat prices are EUR) and refreshed on every run until the month is over.
  *   Cells carrying a note that does not start with STATIC_AUTO_NOTE_PREFIX are treated as manual and left alone.
@@ -791,62 +879,66 @@ function updateStaticData_(spreadsheet) {
         + ' Replace the note to pin a manual value (e.g. the rate implied by the invoice).';
 
     const current = table.rows.filter(function(r) { return isCarriedForward_(r) && r.month === month; });
-    if (current.length > 0) {
-        let updated = 0;
-        for (const r of current) {
-            const cell = sheet.getRange(r.rowNumber, table.col.rate + 1);
-            const note = cell.getNote() || '';
-            if (note && note.indexOf(STATIC_AUTO_NOTE_PREFIX) !== 0) {
-                continue; // manual value, leave alone
-            }
-            if (r.rate !== rate || note !== rateNote) {
-                cell.setValue(rate).setNote(rateNote);
-                updated++;
-            }
+    let updated = 0;
+    for (const r of current) {
+        const cell = sheet.getRange(r.rowNumber, table.col.rate + 1);
+        const note = cell.getNote() || '';
+        if (note && note.indexOf(STATIC_AUTO_NOTE_PREFIX) !== 0) {
+            continue; // manual value, leave alone
         }
+        if (r.rate !== rate || note !== rateNote) {
+            cell.setValue(rate).setNote(rateNote);
+            updated++;
+        }
+    }
+    if (current.length > 0) {
         Logger.log('Static data: %s/%s rows for %s-%s refreshed (EUR->USD %s)', updated, current.length, year, month, rate);
-        return;
     }
 
-    // No rows for the current month yet: carry the most recent earlier month forward
-    let template = latestMonthRows_(table.rows, month);
-    let templateSource = STATIC_SHEET_PREFIX + year;
-    if (template.length === 0) {
-        const previousSheet = spreadsheet.getSheetByName(STATIC_SHEET_PREFIX + (year - 1));
-        if (previousSheet && previousSheet.getLastRow() > 1) {
-            template = latestMonthRows_(readStaticTable_(previousSheet).rows, 13);
+    // Providers without rows for the current month yet: carry their most recent earlier month forward
+    const previousSheet = spreadsheet.getSheetByName(STATIC_SHEET_PREFIX + (year - 1));
+    let previousRows = null;
+    for (const provider of Object.keys(STATIC_CARRY_FORWARD_PROVIDERS)) {
+        if (current.some(function(r) { return r.provider === provider; })) {
+            continue;
+        }
+        let template = latestMonthRows_(table.rows, month, provider);
+        let templateSource = STATIC_SHEET_PREFIX + year;
+        if (template.length === 0 && previousSheet && previousSheet.getLastRow() > 1) {
+            previousRows = previousRows || readStaticTable_(previousSheet).rows;
+            template = latestMonthRows_(previousRows, 13, provider);
             templateSource = STATIC_SHEET_PREFIX + (year - 1);
         }
+        if (template.length === 0) {
+            Logger.log('Static data: no earlier %s rows to carry forward into %s-%s, add them manually', provider, year, month);
+            continue;
+        }
+
+        const countNote = STATIC_AUTO_NOTE_PREFIX + ' carried forward from ' + templateSource + ' month ' + template[0].month
+            + ' on ' + today + '. Update from ' + STATIC_CARRY_FORWARD_PROVIDERS[provider] + ' and remove this note.';
+        const width = table.header.length;
+        const values = template.map(function(t) {
+            const row = new Array(width).fill('');
+            row[table.col.month] = month;
+            row[table.col.provider] = t.provider;
+            row[table.col.count] = t.count;
+            row[table.col.type] = t.type;
+            row[table.col.cost] = t.cost;
+            row[table.col.rate] = rate;
+            return row;
+        });
+
+        const firstRow = sheet.getLastRow() + 1;
+        const range = sheet.getRange(firstRow, 1, values.length, width);
+        range.setValues(values);
+        sheet.getRange(firstRow, table.col.month + 1, values.length, 1).setNumberFormat('0');
+        sheet.getRange(firstRow, table.col.count + 1, values.length, 1).setNumberFormat('0').setNote(countNote);
+        sheet.getRange(firstRow, table.col.cost + 1, values.length, 1).setNumberFormat('#,##0.00"\u20ac"');
+        sheet.getRange(firstRow, table.col.rate + 1, values.length, 1).setNumberFormat('0.0000').setNote(rateNote);
+
+        Logger.log('Static data: added %s %s rows for %s-%s (carried forward from %s month %s, EUR->USD %s)',
+            values.length, provider, year, month, templateSource, template[0].month, rate);
     }
-    if (template.length === 0) {
-        Logger.log('Static data: no earlier %s rows to carry forward into %s-%s, add them manually', STATIC_PROVIDER, year, month);
-        return;
-    }
-
-    const countNote = STATIC_AUTO_NOTE_PREFIX + ' carried forward from ' + templateSource + ' month ' + template[0].month
-        + ' on ' + today + '. Update from the claude.ai members export (Seat Tier column) and remove this note.';
-    const width = table.header.length;
-    const values = template.map(function(t) {
-        const row = new Array(width).fill('');
-        row[table.col.month] = month;
-        row[table.col.provider] = t.provider;
-        row[table.col.count] = t.count;
-        row[table.col.type] = t.type;
-        row[table.col.cost] = t.cost;
-        row[table.col.rate] = rate;
-        return row;
-    });
-
-    const firstRow = sheet.getLastRow() + 1;
-    const range = sheet.getRange(firstRow, 1, values.length, width);
-    range.setValues(values);
-    sheet.getRange(firstRow, table.col.month + 1, values.length, 1).setNumberFormat('0');
-    sheet.getRange(firstRow, table.col.count + 1, values.length, 1).setNumberFormat('0').setNote(countNote);
-    sheet.getRange(firstRow, table.col.cost + 1, values.length, 1).setNumberFormat('#,##0.00"\u20ac"');
-    sheet.getRange(firstRow, table.col.rate + 1, values.length, 1).setNumberFormat('0.0000').setNote(rateNote);
-
-    Logger.log('Static data: added %s %s rows for %s-%s (carried forward from %s month %s, EUR->USD %s)',
-        values.length, STATIC_PROVIDER, year, month, templateSource, template[0].month, rate);
 }
 
 
@@ -889,17 +981,17 @@ function readStaticTable_(sheet) {
 }
 
 
-/** Whether a static data row is a seat row of STATIC_PROVIDER, carried forward into each new month. */
+/** Whether a static data row is a seat row of STATIC_CARRY_FORWARD_PROVIDERS, carried forward into each new month. */
 function isCarriedForward_(row) {
     const type = String(row.type || '').trim().toLowerCase();
-    return row.provider === STATIC_PROVIDER
+    return Object.prototype.hasOwnProperty.call(STATIC_CARRY_FORWARD_PROVIDERS, row.provider)
         && !STATIC_INVOICE_TYPES.some(function(t) { return t.toLowerCase() === type; });
 }
 
 
-/** Seat rows of STATIC_PROVIDER for the latest month strictly before the given month (empty if none). */
-function latestMonthRows_(rows, beforeMonth) {
-    const candidates = rows.filter(function(r) { return isCarriedForward_(r) && r.month < beforeMonth; });
+/** Seat rows of a provider for the latest month strictly before the given month (empty if none). */
+function latestMonthRows_(rows, beforeMonth, provider) {
+    const candidates = rows.filter(function(r) { return isCarriedForward_(r) && r.provider === provider && r.month < beforeMonth; });
     if (candidates.length === 0) return [];
     const latest = Math.max.apply(null, candidates.map(function(r) { return r.month; }));
     return candidates.filter(function(r) { return r.month === latest; });
