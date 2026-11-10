@@ -2,7 +2,7 @@
  * Fetch AI usage and cost statistics from LLM provider APIs and write to a Google Sheet.
  *
  * Supported sources: anthropic, claude-code, openai, chatgpt (ChatGPT workspace usage),
- *                    Claude Team invoices (PDF attachments in a Gmail mailbox)
+ *                    Claude Team and ChatGPT Business invoices (PDF attachments in a Gmail mailbox)
  *
  * All costs are written in EUR (we are billed in EUR). Provider APIs report USD, which is
  * converted using the ECB reference rate of the usage day (see Currency.convertCurrency).
@@ -11,9 +11,9 @@
  * The script keeps the current month's rows present (carrying seat counts and EUR prices forward
  * from the previous month) and fills in the informational EUR->USD reference rate. Seat tiers of
  * the claude.ai Team plan are not exposed by any API. They, and the extra usage of the Team plan, are
- * taken from the invoices Anthropic sends by mail (see fetchClaudeInvoices_). Without invoices,
+ * taken from the invoices Anthropic sends by mail (see fetchInvoices_). Without invoices,
  * user_count must be corrected by hand from the claude.ai members export. ChatGPT workspace seats (provider chatgpt)
- * are maintained by hand as well and carried forward the same way.
+ * are carried forward the same way and taken from the ChatGPT Business invoices OpenAI sends by mail.
  *
  * Script Properties:
  *   AiCost.anthropicAdminKey          Anthropic admin API key (for anthropic + claude-code sources)
@@ -22,10 +22,13 @@
  *                                     Credentials > Admin keys, permission "Enterprise analytics API" Read, i.e. scope
  *                                     enterprise.analytics.usage.read; API Platform admin keys don't work)
  *   AiCost.chatgptWorkspaceId         ChatGPT workspace ID (UUID, shown on chatgpt.com/admin)
- *   AiCost.invoiceMailbox             Mailbox receiving the Claude Team invoices (e.g. automation@example.com)
+ *   AiCost.invoiceMailbox             Mailbox receiving the Claude Team invoices (e.g. automation@example.com), also
+ *                                     searched for ChatGPT Business invoices unless chatgptInvoiceMailbox is set
  *   AiCost.serviceAccountCredentials  Service account credentials JSON (domain-wide delegation, scope
- *                                     https://mail.google.com/), for reading invoiceMailbox
+ *                                     https://mail.google.com/), for reading the invoice mailboxes
  *   AiCost.invoiceSearchExpression    Optional, overrides INVOICE_DEFAULT_SEARCH (the date range is always added)
+ *   AiCost.chatgptInvoiceMailbox      Optional mailbox receiving the ChatGPT Business invoices (defaults to invoiceMailbox)
+ *   AiCost.chatgptInvoiceSearchExpression  Optional, overrides CHATGPT_INVOICE_DEFAULT_SEARCH
  *
  * Managed via: https://github.com/giantswarm/gapps-automation
  */
@@ -57,8 +60,6 @@ const PROVIDER_DEFAULT_CURRENCY = 'USD';
 const STATIC_SHEET_PREFIX = 'Static-Data-';
 /** Header of the static data sheet (created if the sheet is missing). */
 const STATIC_COLUMNS = ['month', 'provider', 'user_count', 'type', 'cost_cost_per_seat', 'eur-to-usd'];
-/** Provider whose seat rows are maintained from the Claude Team invoices. */
-const STATIC_PROVIDER = 'claude-code';
 /** Providers whose seat rows are carried forward into each new month, with the source to update user_count from. */
 const STATIC_CARRY_FORWARD_PROVIDERS = {
     'claude-code': 'the claude.ai members export (Seat Tier column)',
@@ -79,10 +80,43 @@ const INVOICE_SEARCH_PROP = PROPERTY_PREFIX + 'invoiceSearchExpression';
 /** Gmail search expression selecting candidate invoice mails (sent by Stripe on behalf of Anthropic, each with
  *  an Invoice-<number>.pdf and a Receipt-<number>.pdf attachment). */
 const INVOICE_DEFAULT_SEARCH = 'from:invoice+statements@mail.anthropic.com has:attachment filename:pdf';
+const CHATGPT_INVOICE_MAILBOX_PROP = PROPERTY_PREFIX + 'chatgptInvoiceMailbox';
+const CHATGPT_INVOICE_SEARCH_PROP = PROPERTY_PREFIX + 'chatgptInvoiceSearchExpression';
+/** Gmail search expression selecting candidate ChatGPT Business invoice mails (sent by Stripe on behalf of OpenAI,
+ *  with an Invoice-<number>.pdf attachment). Broad on purpose, parseInvoice_ ignores PDFs not issued by OpenAI. */
+const CHATGPT_INVOICE_DEFAULT_SEARCH = 'from:openai.com has:attachment filename:pdf';
 /** Name prefix of the sheets listing every parsed invoice line item (one sheet per invoice year). */
 const INVOICE_SHEET_PREFIX = 'Invoices-';
+/** Columns of the Invoices-<year> sheets. provider was added later, rows without one are claude-code. */
 const INVOICE_COLUMNS = ['date', 'invoice', 'kind', 'tier', 'description', 'quantity', 'unit_price', 'amount',
-    'currency', 'amount_eur', 'message_id'];
+    'currency', 'amount_eur', 'message_id', 'provider'];
+/** Provider of Invoices-<year> rows written before the provider column existed. */
+const INVOICE_LEGACY_PROVIDER = 'claude-code';
+
+/** Subscriptions billed by invoice mails (Stripe generated PDFs), keyed by the Static-Data provider of their seat rows.
+ *
+ *  issuer:        Pattern a cell of the invoice must match (the PDFs of other vendors are ignored).
+ *  mailboxProps:  Script properties naming the mailbox to search, the first one set wins.
+ *  classify:      Maps a line item description to {kind, tier}, see classifyClaudeInvoiceItem_.
+ */
+const INVOICE_SOURCES = {
+    'claude-code': {
+        name: 'Claude Team',
+        issuer: /Anthropic/,
+        mailboxProps: [INVOICE_MAILBOX_PROP],
+        searchProp: INVOICE_SEARCH_PROP,
+        defaultSearch: INVOICE_DEFAULT_SEARCH,
+        classify: classifyClaudeInvoiceItem_,
+    },
+    'chatgpt': {
+        name: 'ChatGPT Business',
+        issuer: /OpenAI/,
+        mailboxProps: [CHATGPT_INVOICE_MAILBOX_PROP, INVOICE_MAILBOX_PROP],
+        searchProp: CHATGPT_INVOICE_SEARCH_PROP,
+        defaultSearch: CHATGPT_INVOICE_DEFAULT_SEARCH,
+        classify: classifyChatgptInvoiceItem_,
+    },
+};
 
 const ANTHROPIC_BASE = 'https://api.anthropic.com';
 const OPENAI_BASE = 'https://api.openai.com';
@@ -273,18 +307,21 @@ function fetchAiCostsForRange_(startDate, endDate) {
         firstError = firstError || e;
     }
 
-    // Claude Team invoices (seats + extra usage), after the static data rows of the month exist
-    const invoiceMailbox = props.getProperty(INVOICE_MAILBOX_PROP) || '';
-    if (invoiceMailbox) {
+    // Claude Team and ChatGPT Business invoices (seats + extra usage), after the static data rows of the month exist
+    for (const provider of Object.keys(INVOICE_SOURCES)) {
+        const source = INVOICE_SOURCES[provider];
+        const invoiceMailbox = invoiceMailbox_(props, provider);
+        if (!invoiceMailbox) {
+            Logger.log('Skipping %s invoices: %s not set', source.name, source.mailboxProps.join(' or '));
+            continue;
+        }
         try {
-            Logger.log('Fetching Claude Team invoices from %s...', invoiceMailbox);
-            fetchClaudeInvoices_(spreadsheet, invoiceMailbox, startDate, endDate);
+            Logger.log('Fetching %s invoices from %s...', source.name, invoiceMailbox);
+            fetchInvoices_(spreadsheet, provider, invoiceMailbox, startDate, endDate);
         } catch (e) {
-            Logger.log('Failed to fetch Claude Team invoices: %s', e.message);
+            Logger.log('Failed to fetch %s invoices: %s', source.name, e.message);
             firstError = firstError || e;
         }
-    } else {
-        Logger.log('Skipping Claude Team invoices: %s not set', INVOICE_MAILBOX_PROP);
     }
 
     Logger.log('Done. %s total new rows.', rows.length);
@@ -304,14 +341,41 @@ function fetchAiCostsForRange_(startDate, endDate) {
  *                                            (e.g. 'filename:Invoice-ABCD1234' for invoices forwarded by someone).
  */
 function backfillClaudeInvoices(startDate, endDate, mailbox, searchExpression) {
+    backfillInvoices_('claude-code', startDate, endDate, mailbox, searchExpression);
+}
+
+
+/** Import the ChatGPT Business invoices of a date range, see backfillClaudeInvoices.
+ *
+ * @param {undefined|string} mailbox Optional mailbox to search instead of the configured AiCost.chatgptInvoiceMailbox
+ *                                   (or AiCost.invoiceMailbox).
+ */
+function backfillChatgptInvoices(startDate, endDate, mailbox, searchExpression) {
+    backfillInvoices_('chatgpt', startDate, endDate, mailbox, searchExpression);
+}
+
+
+function backfillInvoices_(provider, startDate, endDate, mailbox, searchExpression) {
     if (!startDate || !endDate) {
         throw new Error('startDate and endDate are required (YYYY-MM-DD, endDate exclusive)');
     }
-    const effectiveMailbox = mailbox || getScriptProperties_().getProperty(INVOICE_MAILBOX_PROP);
+    const effectiveMailbox = mailbox || invoiceMailbox_(getScriptProperties_(), provider);
     if (!effectiveMailbox) {
-        throw new Error('No mailbox given and ' + INVOICE_MAILBOX_PROP + ' not set');
+        throw new Error('No mailbox given and ' + INVOICE_SOURCES[provider].mailboxProps.join(' or ') + ' not set');
     }
-    fetchClaudeInvoices_(SpreadsheetApp.getActiveSpreadsheet(), effectiveMailbox, startDate, endDate, searchExpression);
+    fetchInvoices_(SpreadsheetApp.getActiveSpreadsheet(), provider, effectiveMailbox, startDate, endDate, searchExpression);
+}
+
+
+/** The configured mailbox receiving the invoices of a provider ('' if none). */
+function invoiceMailbox_(props, provider) {
+    for (const prop of INVOICE_SOURCES[provider].mailboxProps) {
+        const mailbox = props.getProperty(prop);
+        if (mailbox) {
+            return mailbox;
+        }
+    }
+    return '';
 }
 
 
@@ -340,7 +404,7 @@ function backfillClaudeInvoices2026() {
             if (done.indexOf(String(month)) >= 0) continue;
             // AiCost.invoiceMailbox has the invoices from 2026-10-14 on, the overlap is skipped by invoice number
             const end = month === 10 ? '2026-10-16' : '2026-' + pad(month + 1) + '-01';
-            fetchClaudeInvoices_(spreadsheet, INVOICE_BACKFILL_MAILBOX, '2026-' + pad(month) + '-01', end, INVOICE_DEFAULT_SEARCH);
+            fetchInvoices_(spreadsheet, 'claude-code', INVOICE_BACKFILL_MAILBOX, '2026-' + pad(month) + '-01', end, INVOICE_DEFAULT_SEARCH);
             props.setProperty(doneProp, done.concat(String(month)).join(','));
         }
     } finally {
@@ -998,13 +1062,15 @@ function latestMonthRows_(rows, beforeMonth, provider) {
 }
 
 
-// --- Section J: Claude Team invoices ---
+// --- Section J: Claude Team and ChatGPT Business invoices ---
 
-/** Parse the Claude Team invoices received in a mailbox and update the Static-Data-<year> sheets.
+/** Parse the invoices of a subscription (see INVOICE_SOURCES) received in a mailbox and update the
+ * Static-Data-<year> sheets.
  *
  * Anthropic bills the Team plan seats and every auto recharge of extra usage by invoice (several per day,
- * depending on usage). Each invoice is mailed with a PDF attachment, which is parsed (see parseClaudeInvoice_)
- * and its line items are appended to the Invoices-<year> sheet. That sheet is the record of the invoices seen,
+ * depending on usage), OpenAI the ChatGPT Business seats monthly plus every seat change (prorated).
+ * Each invoice is mailed with a PDF attachment, which is parsed (see parseInvoice_)
+ * and its line items are appended to the Invoices-<year> sheet (shared by all providers). That sheet is the record of the invoices seen,
  * keyed by invoice number (receipts and repeated mails of an invoice are skipped) and message ID (mails
  * already handled are not fetched again).
  *
@@ -1012,12 +1078,14 @@ function latestMonthRows_(rows, beforeMonth, provider) {
  * of that month (see updateStaticDataFromInvoices_).
  *
  * @param {Spreadsheet} spreadsheet The spreadsheet holding the Invoices-<year> and Static-Data-<year> sheets.
+ * @param {string} provider The subscription's key in INVOICE_SOURCES (its Static-Data provider).
  * @param {string} mailbox The mailbox to search (impersonated using the service account credentials).
  * @param {string} startDate First invoice day to consider (YYYY-MM-DD).
  * @param {string} endDate Day after the last invoice day to consider (YYYY-MM-DD, exclusive).
  * @param {undefined|string} searchExpression Optional Gmail search expression (defaults to the configured one).
  */
-function fetchClaudeInvoices_(spreadsheet, mailbox, startDate, endDate, searchExpression) {
+function fetchInvoices_(spreadsheet, provider, mailbox, startDate, endDate, searchExpression) {
+    const source = INVOICE_SOURCES[provider];
     const props = getScriptProperties_();
     const credentials = props.getProperty(SERVICE_ACCOUNT_CREDENTIALS_PROP);
     if (!credentials) {
@@ -1026,7 +1094,7 @@ function fetchClaudeInvoices_(spreadsheet, mailbox, startDate, endDate, searchEx
     const gmail = GmailClientV1.withImpersonatingService(JSON.parse(credentials), mailbox);
 
     // mails may be received a day before/after the date of issue (time zones), the invoice date decides
-    const query = (searchExpression || props.getProperty(INVOICE_SEARCH_PROP) || INVOICE_DEFAULT_SEARCH)
+    const query = (searchExpression || props.getProperty(source.searchProp) || source.defaultSearch)
         + ' after:' + (toUnixSeconds_(startDate) - 86400) + ' before:' + (toUnixSeconds_(endDate) + 86400);
     Logger.log('  Searching %s for: %s', mailbox, query);
     const messages = gmail.listUserMessages(mailbox, query, null, false);
@@ -1040,7 +1108,7 @@ function fetchClaudeInvoices_(spreadsheet, mailbox, startDate, endDate, searchEx
         ledger[year] = readInvoiceLedger_(spreadsheet, year);
         for (const item of ledger[year]) {
             knownMessages.add(item.message_id);
-            knownInvoices.add(item.invoice);
+            knownInvoices.add(item.provider + '|' + item.invoice);
         }
     }
 
@@ -1051,11 +1119,12 @@ function fetchClaudeInvoices_(spreadsheet, mailbox, startDate, endDate, searchEx
             continue;
         }
         try {
-            for (const invoice of readClaudeInvoices_(gmail, mailbox, messageRef.id)) {
-                if (invoice.date < startDate || invoice.date >= endDate || knownInvoices.has(invoice.number)) {
+            for (const invoice of readInvoices_(gmail, mailbox, messageRef.id, source)) {
+                const key = provider + '|' + invoice.number;
+                if (invoice.date < startDate || invoice.date >= endDate || knownInvoices.has(key)) {
                     continue;
                 }
-                knownInvoices.add(invoice.number);
+                knownInvoices.add(key);
                 for (const item of invoice.items) {
                     const ratio = invoice.currency === COST_CURRENCY ? 1 : toCostCurrency_(1, invoice.currency, invoice.date);
                     newItems.push({
@@ -1070,6 +1139,7 @@ function fetchClaudeInvoices_(spreadsheet, mailbox, startDate, endDate, searchEx
                         currency: invoice.currency,
                         amount_eur: SheetUtil.round(item.amount * ratio, 4),
                         message_id: messageRef.id,
+                        provider: provider,
                     });
                 }
                 Logger.log('  Invoice %s of %s: %s %s (%s line items)', invoice.number, invoice.date,
@@ -1081,7 +1151,7 @@ function fetchClaudeInvoices_(spreadsheet, mailbox, startDate, endDate, searchEx
         }
     }
 
-    Logger.log('  Claude Team invoices: %s mails, %s new line items', messages.length, newItems.length);
+    Logger.log('  %s invoices: %s mails, %s new line items', source.name, messages.length, newItems.length);
 
     // append to the ledger and recalculate the static data of the months concerned
     const months = new Set();
@@ -1096,7 +1166,7 @@ function fetchClaudeInvoices_(spreadsheet, mailbox, startDate, endDate, searchEx
     }
     for (const yearMonth of Array.from(months).sort()) {
         const year = +yearMonth.slice(0, 4);
-        updateStaticDataFromInvoices_(spreadsheet, year, +yearMonth.slice(5, 7), ledger[year]);
+        updateStaticDataFromInvoices_(spreadsheet, provider, year, +yearMonth.slice(5, 7), ledger[year]);
     }
 
     if (firstError) {
@@ -1105,8 +1175,8 @@ function fetchClaudeInvoices_(spreadsheet, mailbox, startDate, endDate, searchEx
 }
 
 
-/** Read and parse all invoice PDFs attached to a mail (receipts and other PDFs are ignored). */
-function readClaudeInvoices_(gmail, mailbox, messageId) {
+/** Read and parse all invoice PDFs of a source attached to a mail (receipts and other PDFs are ignored). */
+function readInvoices_(gmail, mailbox, messageId, source) {
     const message = gmail.getUserMessage(mailbox, messageId, 'full');
     const invoices = [];
     const visit = function(part) {
@@ -1117,7 +1187,7 @@ function readClaudeInvoices_(gmail, mailbox, messageId) {
             const bytes = body.attachmentId
                 ? gmail.getUserMessageAttachmentBytes(mailbox, messageId, body.attachmentId)
                 : Utilities.base64DecodeWebSafe(body.data + '='.repeat((4 - (body.data.length % 4)) % 4));
-            const invoice = parseClaudeInvoice_(PdfText.extractLines(bytes));
+            const invoice = parseInvoice_(PdfText.extractLines(bytes), source);
             if (invoice) {
                 invoices.push(invoice);
             }
@@ -1129,7 +1199,7 @@ function readClaudeInvoices_(gmail, mailbox, messageId) {
 }
 
 
-/** Parse the text lines of an Anthropic (Stripe generated) invoice PDF.
+/** Parse the text lines of a Stripe generated invoice PDF (Anthropic and OpenAI use the same layout).
  *
  * Expected layout (cells of the lines as returned by PdfText.extractLines):
  *
@@ -1141,20 +1211,24 @@ function readClaudeInvoices_(gmail, mailbox, messageId) {
  *   Auto recharge extra usage, Team plan | 1   | €450.8172472 | 0%  | €450.82
  *   (optional detail lines, like the service period)
  *   Subtotal | €450.82
+ *   (optional "Total excluding tax" and VAT lines)
  *   Total    | €450.82
  *
+ * Line item amounts are before tax: the ChatGPT invoices charge German VAT, which is deductible input tax.
+ *
  * @param {Array<{cells: Array<string>}|Array<string>>} lines The text lines (or their cells) of the PDF.
+ * @param {Object} source The issuer's entry of INVOICE_SOURCES.
  *
  * @return {null|Object} The invoice {number, date, currency, total, items: [{description, kind, tier, quantity,
- *         unitPrice, amount}]}, or null if the document is no Anthropic invoice (for example a receipt).
+ *         unitPrice, amount}]}, or null if the document is no invoice of that issuer (for example a receipt).
  */
-function parseClaudeInvoice_(lines) {
+function parseInvoice_(lines, source) {
     const rows = lines.map(function(line) { return Array.isArray(line) ? line : line.cells; });
     const isTitle = function(title) {
         return rows.some(function(cells) { return cells.length === 1 && cells[0] === title; });
     };
     if (!isTitle('Invoice') || isTitle('Receipt')
-        || !rows.some(function(cells) { return cells.some(function(c) { return /Anthropic/.test(c); }); })) {
+        || !rows.some(function(cells) { return cells.some(function(c) { return source.issuer.test(c); }); })) {
         return null;
     }
 
@@ -1218,7 +1292,7 @@ function parseClaudeInvoice_(lines) {
         if (unitPrice) k--;
         const quantity = k > 0 && /^\d+$/.test(cells[k]) ? +cells[k--] : 1;
         const description = cells.slice(0, k + 1).join(' ');
-        const kind = classifyClaudeInvoiceItem_(description);
+        const kind = source.classify(description);
         items.push({
             description: description,
             details: [],
@@ -1249,7 +1323,7 @@ function parseClaudeInvoice_(lines) {
 }
 
 
-/** Classify an invoice line item by its description.
+/** Classify a Claude Team invoice line item by its description.
  *
  * @return {{kind: string, tier: string}} kind is one of 'extra_usage', 'seat_adjustment' (prorated seat changes),
  *         'seats' (with tier 'Standard' or 'Premium') or 'other'.
@@ -1266,6 +1340,27 @@ function classifyClaudeInvoiceItem_(description) {
         return {kind: 'seats', tier: tier};
     }
     return {kind: 'other', tier: tier};
+}
+
+
+/** Classify a ChatGPT Business invoice line item by its description, like classifyClaudeInvoiceItem_.
+ *
+ * Seats are "ChatGPT Business Subscription (per seat)" (tier Standard) and "ChatGPT Business Premium
+ * Subscription (per seat)" (tier Premium), seat changes "Remaining time on ..." and "Unused time on ...".
+ * Purchased credits count as extra usage.
+ */
+function classifyChatgptInvoiceItem_(description) {
+    const tier = /\bpremium\b/i.test(description) ? 'Premium' : 'Standard';
+    if (/remaining time|unused time|prorat/i.test(description)) {
+        return {kind: 'seat_adjustment', tier: tier};
+    }
+    if (/\bcredits?\b/i.test(description)) {
+        return {kind: 'extra_usage', tier: ''};
+    }
+    if (/subscription|seat/i.test(description)) {
+        return {kind: 'seats', tier: tier};
+    }
+    return {kind: 'other', tier: ''};
 }
 
 
@@ -1319,6 +1414,7 @@ function readInvoiceLedger_(spreadsheet, year) {
         item.date = item.date instanceof Date ? Utilities.formatDate(item.date, tz, 'yyyy-MM-dd') : String(item.date);
         item.invoice = String(item.invoice);
         item.message_id = String(item.message_id);
+        item.provider = String(item.provider || '') || INVOICE_LEGACY_PROVIDER;
         return item;
     });
 }
@@ -1331,7 +1427,13 @@ function appendInvoiceLedger_(spreadsheet, year, items) {
     if (sheet.getLastRow() === 0) {
         sheet.getRange(1, 1, 1, INVOICE_COLUMNS.length).setValues([INVOICE_COLUMNS]);
     }
-    const header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(h) { return String(h).trim(); });
+    let header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(function(h) { return String(h).trim(); });
+    // sheets created before a column was added (e.g. provider) get it appended to their header
+    const missing = INVOICE_COLUMNS.filter(function(name) { return header.indexOf(name) < 0; });
+    if (missing.length) {
+        sheet.getRange(1, header.length + 1, 1, missing.length).setValues([missing]);
+        header = header.concat(missing);
+    }
     const values = items.map(function(item) {
         return header.map(function(h) { return item[h] !== undefined ? item[h] : ''; });
     });
@@ -1394,13 +1496,13 @@ function staticRowsFromInvoices_(items, month) {
 }
 
 
-/** Write the static data rows calculated from invoices into Static-Data-<year>.
+/** Write the static data rows of a provider calculated from its invoices into Static-Data-<year>.
  *
  * Existing rows of the month (matched by provider and type) are updated, missing ones are appended.
  * Rows whose user_count or cost cell carries a note not starting with STATIC_AUTO_NOTE_PREFIX are manual and left alone.
  */
-function updateStaticDataFromInvoices_(spreadsheet, year, month, items) {
-    const computed = staticRowsFromInvoices_(items, month);
+function updateStaticDataFromInvoices_(spreadsheet, provider, year, month, items) {
+    const computed = staticRowsFromInvoices_(items.filter(function(item) { return item.provider === provider; }), month);
     if (!computed.length) return;
 
     const sheet = SheetUtil.ensureSheet(spreadsheet, STATIC_SHEET_PREFIX + year);
@@ -1408,7 +1510,7 @@ function updateStaticDataFromInvoices_(spreadsheet, year, month, items) {
         sheet.getRange(1, 1, 1, STATIC_COLUMNS.length).setValues([STATIC_COLUMNS]);
     }
     const table = readStaticTable_(sheet);
-    const monthRows = table.rows.filter(function(r) { return r.provider === STATIC_PROVIDER && r.month === month; });
+    const monthRows = table.rows.filter(function(r) { return r.provider === provider && r.month === month; });
     let rate = null;
 
     for (const c of computed) {
@@ -1434,7 +1536,7 @@ function updateStaticDataFromInvoices_(spreadsheet, year, month, items) {
             }
             const row = new Array(table.header.length).fill('');
             row[table.col.month] = month;
-            row[table.col.provider] = STATIC_PROVIDER;
+            row[table.col.provider] = provider;
             row[table.col.count] = c.count;
             row[table.col.type] = c.type;
             row[table.col.cost] = c.cost;
