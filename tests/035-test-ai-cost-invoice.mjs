@@ -233,5 +233,7 @@ assert.deepEqual(staticRowsFromInvoices_(items, 8), []);
 // the backfill mailbox must only be set in the deployed script, never in the (public) repository
 assert.match(fs.readFileSync(COST, 'utf8'), /^const INVOICE_BACKFILL_MAILBOX = 'mailbox@example\.com';$/m,
     'INVOICE_BACKFILL_MAILBOX must stay the placeholder in the repository');
+assert.match(fs.readFileSync(COST, 'utf8'), /^const CHATGPT_INVOICE_BACKFILL_SEARCH = CHATGPT_INVOICE_SEARCH;$/m,
+    'CHATGPT_INVOICE_BACKFILL_SEARCH must stay the default in the repository');
 
 console.log('AI cost invoice tests passed');
