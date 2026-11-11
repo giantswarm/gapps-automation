@@ -12,7 +12,10 @@ function createTestFunctionWrapper(fileName, functionName) {
 globalThis.SheetUtil = SheetUtil;
 
 const COST = 'ai-cost/Cost.js';
-const parseClaudeInvoice_ = createTestFunctionWrapper(COST, 'parseClaudeInvoice_');
+const parseInvoice_ = createTestFunctionWrapper(COST, 'parseInvoice_');
+const INVOICE_SOURCES = Function(`"use strict"; ${fs.readFileSync(COST)}; return INVOICE_SOURCES;`)();
+const parseClaudeInvoice_ = lines => parseInvoice_(lines, INVOICE_SOURCES['claude-code']);
+const parseChatgptInvoice_ = lines => parseInvoice_(lines, INVOICE_SOURCES['chatgpt']);
 const staticRowsFromInvoices_ = createTestFunctionWrapper(COST, 'staticRowsFromInvoices_');
 const parseInvoiceDate_ = createTestFunctionWrapper(COST, 'parseInvoiceDate_');
 const parseMoney_ = createTestFunctionWrapper(COST, 'parseMoney_');
@@ -121,6 +124,7 @@ assert.deepEqual(invoice, {
 // receipts (attached to the same mails) and foreign documents are ignored
 assert.equal(parseClaudeInvoice_([['Receipt'], ['Invoice'], ['Anthropic, PBC']]), null);
 assert.equal(parseClaudeInvoice_([['Invoice'], ['Other Corp']]), null);
+assert.equal(parseChatgptInvoice_(lines), null, 'Anthropic invoices must not be taken for ChatGPT ones');
 
 // older invoices: label and value merged into a single cell
 const merged = lines.map(l => l.cells[0] === 'Invoice number' ? ['Invoice number ' + l.cells[1]] : l.cells);
@@ -158,6 +162,47 @@ assert.deepEqual(parseMoney_('�€972.01'), {amount: -972.01, currency: 'EUR'}
 // line items not adding up to the subtotal indicate a changed layout
 const broken = lines.map(l => l.cells).filter(c => !c[0].startsWith('Remaining'));
 assert.throws(() => parseClaudeInvoice_(broken), /line items sum up to/);
+
+
+// ChatGPT Business invoices: same Stripe layout, German VAT, line items before tax
+const chatgptHead = [
+    ['Invoice'], ['Invoice number WXYZ5678�0001'], ['Date of issue', 'October 13, 2026'], ['Date due', 'October 13, 2026'],
+    ['OpenAI Ireland Limited', 'Bill to'], ['€493.99 due October 13, 2026'], ['Pay online'],
+    ['Description', 'Qty', 'Unit price', 'Tax', 'Amount'],
+];
+const chatgptSeats = parseChatgptInvoice_(chatgptHead.concat([
+    ['ChatGPT Business Premium Subscription (per seat)', '3', '€109.24', '19%', '€327.72'], ['Oct 13�Nov 13, 2026'],
+    ['ChatGPT Business Subscription (per seat)', '4', '€21.85', '19%', '€87.40'], ['Oct 13�Nov 13, 2026'],
+    ['Subtotal', '€415.12'], ['Total excluding tax', '€415.12'], ['VAT - Germany �19% on €415.12�', '€78.87'],
+    ['Total', '€493.99'], ['Amount due', '€493.99'], ['WXYZ5678�0001 · €493.99 due October 13, 2026', 'Page 1 of 1'],
+]));
+assert.deepEqual(chatgptSeats, {
+    number: 'WXYZ5678-0001', date: '2026-10-13', currency: 'EUR', total: 493.99, items: [
+        {description: 'ChatGPT Business Premium Subscription (per seat) (Oct 13�Nov 13, 2026)', kind: 'seats',
+            tier: 'Premium', quantity: 3, unitPrice: 109.24, amount: 327.72},
+        {description: 'ChatGPT Business Subscription (per seat) (Oct 13�Nov 13, 2026)', kind: 'seats',
+            tier: 'Standard', quantity: 4, unitPrice: 21.85, amount: 87.4},
+    ]
+});
+assert.equal(parseClaudeInvoice_(chatgptHead.concat([['Subtotal', '€0.00'], ['Total', '€0.00']])), null,
+    'ChatGPT invoices must not be taken for Anthropic ones');
+
+// ChatGPT seat changes: no unit price, the credit's minus sign either lacks a mapping or wraps with the amount
+const chatgptChange = parseChatgptInvoice_(chatgptHead.concat([
+    ['Remaining time on 3 × ChatGPT Business Subscription after 25 Oct 2026', '3', '19%', '€40.50'], ['Oct 25�Nov 13, 2026'],
+    ['Unused time on 2 × ChatGPT Business Subscription after 25 Oct 2026', '2', '19%', '-'], ['Oct 25�Nov 13, 2026', '€27.00'],
+    ['Remaining time on 2 × ChatGPT Business Premium Subscription after 25 Oct 2026', '2', '19%', '€110.00'], ['Oct 25�Nov 13, 2026'],
+    ['Unused time on ChatGPT Business Premium Subscription after 25 Oct 2026', '1', '19%', '�€55.00'], ['Oct 25�Nov 13, 2026'],
+    ['Subtotal', '€68.50'], ['Total excluding tax', '€68.50'], ['VAT - Germany �19% on €68.50�', '€13.02'],
+    ['Total', '€81.52'], ['Amount due', '€81.52'],
+]));
+assert.deepEqual(chatgptChange.items.map(i => [i.kind, i.tier, i.quantity, i.amount]), [
+    ['seat_adjustment', 'Standard', 3, 40.5],
+    ['seat_adjustment', 'Standard', 2, -27],
+    ['seat_adjustment', 'Premium', 2, 110],
+    ['seat_adjustment', 'Premium', 1, -55],
+]);
+assert.equal(chatgptChange.total, 81.52);
 
 assert.equal(parseInvoiceDate_('September 30, 2026'), '2026-09-30');
 assert.equal(parseInvoiceDate_('1 Oct 2026'), '2026-10-01');
