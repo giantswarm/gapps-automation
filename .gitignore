@@ -10,3 +10,17 @@ lib-output
 Invoice-*.pdf
 Receipt-*.pdf
 invoices/
+# local secrets, credentials and data exports (public repository)
+.env
+.env.*
+.secrets
+.*client_secret*.json
+*.bak
+*.csv
+/*.json
+!/package.json
+!/package-lock.json
+/test/
+node_modules
+.claude/settings.local.json
+.claude/*.lock
