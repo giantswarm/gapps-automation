@@ -394,6 +394,33 @@ function backfillClaudeInvoices2026() {
 }
 
 
+/** Throwaway: import the 2026 ChatGPT Business invoices of AiCost.invoiceMailbox up to today, one call per month.
+ *
+ *  Invoices already recorded are skipped by invoice number. Completed months are remembered in a script property, so
+ *  re-running after a timeout resumes. Remove once done. */
+function backfillChatGptInvoices2026() {
+    const props = getScriptProperties_();
+    const mailbox = props.getProperty(INVOICE_MAILBOX_PROP);
+    if (!mailbox) {
+        throw new Error(INVOICE_MAILBOX_PROP + ' not set');
+    }
+    const doneProp = PROPERTY_PREFIX + 'chatgptInvoiceBackfill2026Done';
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const endDate = defaultEndDate_();
+    const pad = function(m) { return (m < 10 ? '0' : '') + m; };
+    for (let month = 1; month <= 12; month++) {
+        const start = '2026-' + pad(month) + '-01';
+        if (start >= endDate) break;
+        const done = (props.getProperty(doneProp) || '').split(',').filter(String);
+        if (done.indexOf(String(month)) >= 0) continue;
+        const nextMonth = month === 12 ? '2027-01-01' : '2026-' + pad(month + 1) + '-01';
+        fetchInvoices_(spreadsheet, 'chatgpt', mailbox, start, nextMonth < endDate ? nextMonth : endDate);
+        props.setProperty(doneProp, done.concat(String(month)).join(','));
+    }
+    Logger.log('ChatGPT invoice backfill 2026 complete');
+}
+
+
 /** Ensure the current month's seat rows exist in Static-Data-<year> and refresh their exchange rate. */
 function updateStaticData() {
     updateStaticData_(SpreadsheetApp.getActiveSpreadsheet());
