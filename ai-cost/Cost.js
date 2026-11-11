@@ -26,9 +26,7 @@
  *                                     searched for ChatGPT Business invoices unless chatgptInvoiceMailbox is set
  *   AiCost.serviceAccountCredentials  Service account credentials JSON (domain-wide delegation, scope
  *                                     https://mail.google.com/), for reading the invoice mailboxes
- *   AiCost.invoiceSearchExpression    Optional, overrides INVOICE_DEFAULT_SEARCH (the date range is always added)
- *   AiCost.chatgptInvoiceMailbox      Optional mailbox receiving the ChatGPT Business invoices (defaults to invoiceMailbox)
- *   AiCost.chatgptInvoiceSearchExpression  Optional, overrides CHATGPT_INVOICE_DEFAULT_SEARCH
+ *   AiCost.chatgptInvoiceMailbox      Optional mailbox receiving the ChatGPT Business invoices (default: invoiceMailbox)
  *
  * Managed via: https://github.com/giantswarm/gapps-automation
  */
@@ -76,15 +74,13 @@ const STATIC_INVOICE_TYPES = [STATIC_EXTRA_USAGE_TYPE, STATIC_SEAT_ADJUSTMENT_TY
 
 const INVOICE_MAILBOX_PROP = PROPERTY_PREFIX + 'invoiceMailbox';
 const SERVICE_ACCOUNT_CREDENTIALS_PROP = PROPERTY_PREFIX + 'serviceAccountCredentials';
-const INVOICE_SEARCH_PROP = PROPERTY_PREFIX + 'invoiceSearchExpression';
 /** Gmail search expression selecting candidate invoice mails (sent by Stripe on behalf of Anthropic, each with
  *  an Invoice-<number>.pdf and a Receipt-<number>.pdf attachment). */
-const INVOICE_DEFAULT_SEARCH = 'from:invoice+statements@mail.anthropic.com has:attachment filename:pdf';
+const CLAUDE_INVOICE_SEARCH = 'from:invoice+statements@mail.anthropic.com has:attachment filename:pdf';
 const CHATGPT_INVOICE_MAILBOX_PROP = PROPERTY_PREFIX + 'chatgptInvoiceMailbox';
-const CHATGPT_INVOICE_SEARCH_PROP = PROPERTY_PREFIX + 'chatgptInvoiceSearchExpression';
 /** Gmail search expression selecting candidate ChatGPT Business invoice mails (sent by Stripe on behalf of OpenAI,
  *  with an Invoice-<number>.pdf attachment). Broad on purpose, parseInvoice_ ignores PDFs not issued by OpenAI. */
-const CHATGPT_INVOICE_DEFAULT_SEARCH = 'from:openai.com has:attachment filename:pdf';
+const CHATGPT_INVOICE_SEARCH = 'from:openai.com has:attachment filename:pdf';
 /** Name prefix of the sheets listing every parsed invoice line item (one sheet per invoice year). */
 const INVOICE_SHEET_PREFIX = 'Invoices-';
 /** Columns of the Invoices-<year> sheets. provider was added later, rows without one are claude-code. */
@@ -97,6 +93,7 @@ const INVOICE_LEGACY_PROVIDER = 'claude-code';
  *
  *  issuer:        Pattern a cell of the invoice must match (the PDFs of other vendors are ignored).
  *  mailboxProps:  Script properties naming the mailbox to search, the first one set wins.
+ *  search:        Gmail search expression selecting candidate mails (the date range is added).
  *  classify:      Maps a line item description to {kind, tier}, see classifyClaudeInvoiceItem_.
  */
 const INVOICE_SOURCES = {
@@ -104,16 +101,14 @@ const INVOICE_SOURCES = {
         name: 'Claude Team',
         issuer: /Anthropic/,
         mailboxProps: [INVOICE_MAILBOX_PROP],
-        searchProp: INVOICE_SEARCH_PROP,
-        defaultSearch: INVOICE_DEFAULT_SEARCH,
+        search: CLAUDE_INVOICE_SEARCH,
         classify: classifyClaudeInvoiceItem_,
     },
     'chatgpt': {
         name: 'ChatGPT Business',
         issuer: /OpenAI/,
         mailboxProps: [CHATGPT_INVOICE_MAILBOX_PROP, INVOICE_MAILBOX_PROP],
-        searchProp: CHATGPT_INVOICE_SEARCH_PROP,
-        defaultSearch: CHATGPT_INVOICE_DEFAULT_SEARCH,
+        search: CHATGPT_INVOICE_SEARCH,
         classify: classifyChatgptInvoiceItem_,
     },
 };
@@ -337,7 +332,7 @@ function fetchAiCostsForRange_(startDate, endDate) {
  * @param {string} startDate First invoice day (YYYY-MM-DD).
  * @param {string} endDate Day after the last invoice day (YYYY-MM-DD, exclusive).
  * @param {undefined|string} mailbox Optional mailbox to search instead of the configured AiCost.invoiceMailbox.
- * @param {undefined|string} searchExpression Optional Gmail search expression replacing the configured one
+ * @param {undefined|string} searchExpression Optional Gmail search expression replacing the source's one
  *                                            (e.g. 'filename:Invoice-ABCD1234' for invoices forwarded by someone).
  */
 function backfillClaudeInvoices(startDate, endDate, mailbox, searchExpression) {
@@ -386,7 +381,7 @@ const INVOICE_BACKFILL_MAILBOX = 'mailbox@example.com';
 
 /** Throwaway: import the 2026 Claude Team invoices of INVOICE_BACKFILL_MAILBOX, one call per month.
  *
- *  Only mails matching INVOICE_DEFAULT_SEARCH (Anthropic's invoice sender) are read. Invoices already recorded
+ *  Only mails matching CLAUDE_INVOICE_SEARCH (Anthropic's invoice sender) are read. Invoices already recorded
  *  (e.g. also received by AiCost.invoiceMailbox) are skipped by invoice number. Completed months are remembered in a
  *  script property, so re-running after a timeout resumes. The impersonation token of the mailbox is deleted
  *  afterwards. Remove once done. */
@@ -404,7 +399,7 @@ function backfillClaudeInvoices2026() {
             if (done.indexOf(String(month)) >= 0) continue;
             // AiCost.invoiceMailbox has the invoices from 2026-10-14 on, the overlap is skipped by invoice number
             const end = month === 10 ? '2026-10-16' : '2026-' + pad(month + 1) + '-01';
-            fetchInvoices_(spreadsheet, 'claude-code', INVOICE_BACKFILL_MAILBOX, '2026-' + pad(month) + '-01', end, INVOICE_DEFAULT_SEARCH);
+            fetchInvoices_(spreadsheet, 'claude-code', INVOICE_BACKFILL_MAILBOX, '2026-' + pad(month) + '-01', end);
             props.setProperty(doneProp, done.concat(String(month)).join(','));
         }
     } finally {
@@ -1069,9 +1064,9 @@ function latestMonthRows_(rows, beforeMonth, provider) {
  *
  * Anthropic bills the Team plan seats and every auto recharge of extra usage by invoice (several per day,
  * depending on usage), OpenAI the ChatGPT Business seats monthly plus every seat change (prorated).
- * Each invoice is mailed with a PDF attachment, which is parsed (see parseInvoice_)
- * and its line items are appended to the Invoices-<year> sheet (shared by all providers). That sheet is the record of the invoices seen,
- * keyed by invoice number (receipts and repeated mails of an invoice are skipped) and message ID (mails
+ * Each invoice is mailed with a PDF attachment, which is parsed (see parseInvoice_) and its line items are
+ * appended to the Invoices-<year> sheet (shared by all providers). That sheet is the record of the invoices seen,
+ * keyed by provider and invoice number (receipts and repeated mails of an invoice are skipped) and message ID (mails
  * already handled are not fetched again).
  *
  * The Static-Data-<year> rows of each month with new invoices are then recalculated from all invoice line items
@@ -1082,7 +1077,7 @@ function latestMonthRows_(rows, beforeMonth, provider) {
  * @param {string} mailbox The mailbox to search (impersonated using the service account credentials).
  * @param {string} startDate First invoice day to consider (YYYY-MM-DD).
  * @param {string} endDate Day after the last invoice day to consider (YYYY-MM-DD, exclusive).
- * @param {undefined|string} searchExpression Optional Gmail search expression (defaults to the configured one).
+ * @param {undefined|string} searchExpression Optional Gmail search expression (defaults to the source's one).
  */
 function fetchInvoices_(spreadsheet, provider, mailbox, startDate, endDate, searchExpression) {
     const source = INVOICE_SOURCES[provider];
@@ -1094,7 +1089,7 @@ function fetchInvoices_(spreadsheet, provider, mailbox, startDate, endDate, sear
     const gmail = GmailClientV1.withImpersonatingService(JSON.parse(credentials), mailbox);
 
     // mails may be received a day before/after the date of issue (time zones), the invoice date decides
-    const query = (searchExpression || props.getProperty(source.searchProp) || source.defaultSearch)
+    const query = (searchExpression || source.search)
         + ' after:' + (toUnixSeconds_(startDate) - 86400) + ' before:' + (toUnixSeconds_(endDate) + 86400);
     Logger.log('  Searching %s for: %s', mailbox, query);
     const messages = gmail.listUserMessages(mailbox, query, null, false);
