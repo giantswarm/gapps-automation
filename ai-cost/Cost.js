@@ -22,11 +22,10 @@
  *                                     Credentials > Admin keys, permission "Enterprise analytics API" Read, i.e. scope
  *                                     enterprise.analytics.usage.read; API Platform admin keys don't work)
  *   AiCost.chatgptWorkspaceId         ChatGPT workspace ID (UUID, shown on chatgpt.com/admin)
- *   AiCost.invoiceMailbox             Mailbox receiving the Claude Team invoices (e.g. automation@example.com), also
- *                                     searched for ChatGPT Business invoices unless chatgptInvoiceMailbox is set
+ *   AiCost.invoiceMailbox             Mailbox receiving the Claude Team and ChatGPT Business invoices
+ *                                     (e.g. automation@example.com, a provider specific alias of it works as well)
  *   AiCost.serviceAccountCredentials  Service account credentials JSON (domain-wide delegation, scope
  *                                     https://mail.google.com/), for reading the invoice mailboxes
- *   AiCost.chatgptInvoiceMailbox      Optional mailbox receiving the ChatGPT Business invoices (default: invoiceMailbox)
  *
  * Managed via: https://github.com/giantswarm/gapps-automation
  */
@@ -77,7 +76,6 @@ const SERVICE_ACCOUNT_CREDENTIALS_PROP = PROPERTY_PREFIX + 'serviceAccountCreden
 /** Gmail search expression selecting candidate invoice mails (sent by Stripe on behalf of Anthropic, each with
  *  an Invoice-<number>.pdf and a Receipt-<number>.pdf attachment). */
 const CLAUDE_INVOICE_SEARCH = 'from:invoice+statements@mail.anthropic.com has:attachment filename:pdf';
-const CHATGPT_INVOICE_MAILBOX_PROP = PROPERTY_PREFIX + 'chatgptInvoiceMailbox';
 /** Gmail search expression selecting candidate ChatGPT Business invoice mails (sent by Stripe on behalf of OpenAI,
  *  with an Invoice-<number>.pdf attachment). Broad on purpose, parseInvoice_ ignores PDFs not issued by OpenAI. */
 const CHATGPT_INVOICE_SEARCH = 'from:openai.com has:attachment filename:pdf';
@@ -92,7 +90,6 @@ const INVOICE_LEGACY_PROVIDER = 'claude-code';
 /** Subscriptions billed by invoice mails (Stripe generated PDFs), keyed by the Static-Data provider of their seat rows.
  *
  *  issuer:        Pattern a cell of the invoice must match (the PDFs of other vendors are ignored).
- *  mailboxProps:  Script properties naming the mailbox to search, the first one set wins.
  *  search:        Gmail search expression selecting candidate mails (the date range is added).
  *  classify:      Maps a line item description to {kind, tier}, see classifyClaudeInvoiceItem_.
  */
@@ -100,14 +97,12 @@ const INVOICE_SOURCES = {
     'claude-code': {
         name: 'Claude Team',
         issuer: /Anthropic/,
-        mailboxProps: [INVOICE_MAILBOX_PROP],
         search: CLAUDE_INVOICE_SEARCH,
         classify: classifyClaudeInvoiceItem_,
     },
     'chatgpt': {
         name: 'ChatGPT Business',
         issuer: /OpenAI/,
-        mailboxProps: [CHATGPT_INVOICE_MAILBOX_PROP, INVOICE_MAILBOX_PROP],
         search: CHATGPT_INVOICE_SEARCH,
         classify: classifyChatgptInvoiceItem_,
     },
@@ -303,13 +298,12 @@ function fetchAiCostsForRange_(startDate, endDate) {
     }
 
     // Claude Team and ChatGPT Business invoices (seats + extra usage), after the static data rows of the month exist
-    for (const provider of Object.keys(INVOICE_SOURCES)) {
+    const invoiceMailbox = props.getProperty(INVOICE_MAILBOX_PROP) || '';
+    if (!invoiceMailbox) {
+        Logger.log('Skipping invoices: %s not set', INVOICE_MAILBOX_PROP);
+    }
+    for (const provider of invoiceMailbox ? Object.keys(INVOICE_SOURCES) : []) {
         const source = INVOICE_SOURCES[provider];
-        const invoiceMailbox = invoiceMailbox_(props, provider);
-        if (!invoiceMailbox) {
-            Logger.log('Skipping %s invoices: %s not set', source.name, source.mailboxProps.join(' or '));
-            continue;
-        }
         try {
             Logger.log('Fetching %s invoices from %s...', source.name, invoiceMailbox);
             fetchInvoices_(spreadsheet, provider, invoiceMailbox, startDate, endDate);
@@ -342,8 +336,6 @@ function backfillClaudeInvoices(startDate, endDate, mailbox, searchExpression) {
 
 /** Import the ChatGPT Business invoices of a date range, see backfillClaudeInvoices.
  *
- * @param {undefined|string} mailbox Optional mailbox to search instead of the configured AiCost.chatgptInvoiceMailbox
- *                                   (or AiCost.invoiceMailbox).
  */
 function backfillChatgptInvoices(startDate, endDate, mailbox, searchExpression) {
     backfillInvoices_('chatgpt', startDate, endDate, mailbox, searchExpression);
@@ -354,23 +346,11 @@ function backfillInvoices_(provider, startDate, endDate, mailbox, searchExpressi
     if (!startDate || !endDate) {
         throw new Error('startDate and endDate are required (YYYY-MM-DD, endDate exclusive)');
     }
-    const effectiveMailbox = mailbox || invoiceMailbox_(getScriptProperties_(), provider);
+    const effectiveMailbox = mailbox || getScriptProperties_().getProperty(INVOICE_MAILBOX_PROP);
     if (!effectiveMailbox) {
-        throw new Error('No mailbox given and ' + INVOICE_SOURCES[provider].mailboxProps.join(' or ') + ' not set');
+        throw new Error('No mailbox given and ' + INVOICE_MAILBOX_PROP + ' not set');
     }
     fetchInvoices_(SpreadsheetApp.getActiveSpreadsheet(), provider, effectiveMailbox, startDate, endDate, searchExpression);
-}
-
-
-/** The configured mailbox receiving the invoices of a provider ('' if none). */
-function invoiceMailbox_(props, provider) {
-    for (const prop of INVOICE_SOURCES[provider].mailboxProps) {
-        const mailbox = props.getProperty(prop);
-        if (mailbox) {
-            return mailbox;
-        }
-    }
-    return '';
 }
 
 
