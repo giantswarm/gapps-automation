@@ -20,7 +20,9 @@
  *   AiCost.openaiAdminKey             OpenAI admin API key (for openai source)
  *   AiCost.chatgptAdminKey            ChatGPT workspace Admin key (for chatgpt source, created in the Admin Console under
  *                                     Credentials > Admin keys, permission "Enterprise analytics API" Read, i.e. scope
- *                                     enterprise.analytics.usage.read; API Platform admin keys don't work)
+ *                                     enterprise.analytics.usage.read; API Platform admin keys don't work). Only
+ *                                     Enterprise workspaces can create Admin keys, on Business the source stays off
+ *                                     and ChatGPT costs come from the invoices alone.
  *   AiCost.chatgptWorkspaceId         ChatGPT workspace ID (UUID, shown on chatgpt.com/admin)
  *   AiCost.invoiceMailbox             Mailbox receiving the Claude Team and ChatGPT Business invoices
  *                                     (e.g. automation@example.com, a provider specific alias of it works as well)
@@ -389,6 +391,46 @@ function backfillClaudeInvoices2026() {
             .reset();
     }
     Logger.log('Invoice backfill 2026 complete');
+}
+
+
+/** Throwaway: Gmail search expression selecting the ChatGPT Business invoice mails in INVOICE_BACKFILL_MAILBOX.
+ *  Forwarded invoices aren't sent by OpenAI, so CHATGPT_INVOICE_SEARCH may miss them; set a narrower expression
+ *  (e.g. 'Invoice-ABCD1234 has:attachment filename:pdf') only in the deployed copy, like INVOICE_BACKFILL_MAILBOX. */
+const CHATGPT_INVOICE_BACKFILL_SEARCH = CHATGPT_INVOICE_SEARCH;
+
+/** Throwaway: import the 2026 ChatGPT Business invoices of INVOICE_BACKFILL_MAILBOX up to today, one call per month.
+ *
+ *  Only mails matching CHATGPT_INVOICE_BACKFILL_SEARCH are read. Invoices already recorded are skipped by invoice
+ *  number. Completed months are remembered in a script property, so re-running after a timeout resumes. The
+ *  impersonation token of the mailbox is deleted afterwards. Remove once done. */
+function backfillChatGptInvoices2026() {
+    if (!/^[^@\s]+@[^@\s]+$/.test(INVOICE_BACKFILL_MAILBOX) || /@example\.com$/.test(INVOICE_BACKFILL_MAILBOX)) {
+        throw new Error('Set INVOICE_BACKFILL_MAILBOX in the deployed script first');
+    }
+    const props = getScriptProperties_();
+    const doneProp = PROPERTY_PREFIX + 'chatgptInvoiceBackfill2026Done';
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const endDate = defaultEndDate_();
+    const pad = function(m) { return (m < 10 ? '0' : '') + m; };
+    try {
+        for (let month = 1; month <= 12; month++) {
+            const start = '2026-' + pad(month) + '-01';
+            if (start >= endDate) break;
+            const done = (props.getProperty(doneProp) || '').split(',').filter(String);
+            if (done.indexOf(String(month)) >= 0) continue;
+            const nextMonth = month === 12 ? '2027-01-01' : '2026-' + pad(month + 1) + '-01';
+            fetchInvoices_(spreadsheet, 'chatgpt', INVOICE_BACKFILL_MAILBOX, start, nextMonth < endDate ? nextMonth : endDate,
+                CHATGPT_INVOICE_BACKFILL_SEARCH);
+            props.setProperty(doneProp, done.concat(String(month)).join(','));
+        }
+    } finally {
+        // don't keep an access token to the mailbox in the script properties
+        OAuth2.createService('GmailClientV1-' + INVOICE_BACKFILL_MAILBOX)
+            .setPropertyStore(PropertiesService.getScriptProperties())
+            .reset();
+    }
+    Logger.log('ChatGPT invoice backfill 2026 complete');
 }
 
 
@@ -1055,8 +1097,9 @@ function latestMonthRows_(rows, beforeMonth, provider) {
  * @param {Spreadsheet} spreadsheet The spreadsheet holding the Invoices-<year> and Static-Data-<year> sheets.
  * @param {string} provider The subscription's key in INVOICE_SOURCES (its Static-Data provider).
  * @param {string} mailbox The mailbox to search (impersonated using the service account credentials).
- * @param {string} startDate First invoice day to consider (YYYY-MM-DD).
- * @param {string} endDate Day after the last invoice day to consider (YYYY-MM-DD, exclusive).
+ * @param {string} startDate First day of the mails to read (YYYY-MM-DD). Their invoices are recorded whatever their
+ *                           date of issue (e.g. invoices forwarded weeks later).
+ * @param {string} endDate Day after the last day of the mails to read (YYYY-MM-DD, exclusive).
  * @param {undefined|string} searchExpression Optional Gmail search expression (defaults to the source's one).
  */
 function fetchInvoices_(spreadsheet, provider, mailbox, startDate, endDate, searchExpression) {
@@ -1068,23 +1111,26 @@ function fetchInvoices_(spreadsheet, provider, mailbox, startDate, endDate, sear
     }
     const gmail = GmailClientV1.withImpersonatingService(JSON.parse(credentials), mailbox);
 
-    // mails may be received a day before/after the date of issue (time zones), the invoice date decides
+    // one more day on each side (time zones), mails and invoices read twice are skipped below
     const query = (searchExpression || source.search)
         + ' after:' + (toUnixSeconds_(startDate) - 86400) + ' before:' + (toUnixSeconds_(endDate) + 86400);
     Logger.log('  Searching %s for: %s', mailbox, query);
     const messages = gmail.listUserMessages(mailbox, query, null, false);
 
-    const startYear = +startDate.slice(0, 4);
-    const endYear = +endDate.slice(0, 4);
     const ledger = {};
     const knownMessages = new Set();
     const knownInvoices = new Set();
-    for (let year = startYear - 1; year <= endYear; year++) {
-        ledger[year] = readInvoiceLedger_(spreadsheet, year);
-        for (const item of ledger[year]) {
-            knownMessages.add(item.message_id);
-            knownInvoices.add(item.provider + '|' + item.invoice);
+    const loadLedger = function(year) {
+        if (!ledger[year]) {
+            ledger[year] = readInvoiceLedger_(spreadsheet, year);
+            for (const item of ledger[year]) {
+                knownMessages.add(item.message_id);
+                knownInvoices.add(item.provider + '|' + item.invoice);
+            }
         }
+    };
+    for (let year = +startDate.slice(0, 4) - 1; year <= +endDate.slice(0, 4); year++) {
+        loadLedger(year);
     }
 
     const newItems = [];
@@ -1095,8 +1141,9 @@ function fetchInvoices_(spreadsheet, provider, mailbox, startDate, endDate, sear
         }
         try {
             for (const invoice of readInvoices_(gmail, mailbox, messageRef.id, source)) {
+                loadLedger(+invoice.date.slice(0, 4));  // issued long before the mail, e.g. forwarded much later
                 const key = provider + '|' + invoice.number;
-                if (invoice.date < startDate || invoice.date >= endDate || knownInvoices.has(key)) {
+                if (knownInvoices.has(key)) {
                     continue;
                 }
                 knownInvoices.add(key);
