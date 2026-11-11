@@ -20,7 +20,9 @@
  *   AiCost.openaiAdminKey             OpenAI admin API key (for openai source)
  *   AiCost.chatgptAdminKey            ChatGPT workspace Admin key (for chatgpt source, created in the Admin Console under
  *                                     Credentials > Admin keys, permission "Enterprise analytics API" Read, i.e. scope
- *                                     enterprise.analytics.usage.read; API Platform admin keys don't work)
+ *                                     enterprise.analytics.usage.read; API Platform admin keys don't work). Only
+ *                                     Enterprise workspaces can create Admin keys, on Business the source stays off
+ *                                     and ChatGPT costs come from the invoices alone.
  *   AiCost.chatgptWorkspaceId         ChatGPT workspace ID (UUID, shown on chatgpt.com/admin)
  *   AiCost.invoiceMailbox             Mailbox receiving the Claude Team and ChatGPT Business invoices
  *                                     (e.g. automation@example.com, a provider specific alias of it works as well)
