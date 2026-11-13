@@ -1,0 +1,3 @@
+node_modules
+# live Google session cookies of the bot account, see README.md
+storage-state*.json
