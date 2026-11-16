@@ -1,27 +1,25 @@
 /**
  * Meeting Recording Consent Poll
  *
- * Remote controls a bot (meet-bot/, signed in as the bot Workspace account) that joins recorded
- * Google Meet meetings visibly, asks the participants in the meeting chat whether they consent to
- * being recorded and collects per-person responses via a small web app.
+ * Asks every attendee of Google Meet meetings that may be recorded (automatic recording, transcription
+ * or Gemini notes enabled, or opted in via a marker in the event description) for consent before the
+ * meeting, by email with a personal link to this script's web app, and documents every answer.
  *
- * Why a bot:
- *   Meeting conversations (the Google Chat backed in-meeting chat) are system generated group DMs.
- *   Chat apps cannot be added to them and there is no API link between them and calendar events, so
- *   reliably posting into them via the Chat API is not possible. Meet has no API to join a call as a
- *   participant either, so the bot drives the Meet web UI in a browser (like note taker bots do).
+ * Runs entirely in Apps Script:
+ *   - checkUpcomingMeetings() (time trigger) scans the primary calendars of the organizers for qualifying
+ *     meetings starting within the lookahead window, creates the poll state (keyed by event ID), adds a
+ *     generic notice to the event description, emails every attendee (internal and external) a personal
+ *     link once, sends the organizer a summary shortly before the meeting (and updates after that), and
+ *     handles moved and cancelled meetings
+ *   - doGet() shows the question for the attendee identified by the personal link (token), the buttons
+ *     call submitConsent(), which appends the answer to the consent log spreadsheet (the documentation of
+ *     consent, the answer is rejected if that fails) before it counts
+ *   - On an objection the organizer is emailed right away and automatic recording/transcription/notes are
+ *     switched off via the Meet REST API (spaces.patch, impersonating the organizer)
  *
- * Architecture:
- *   - Time-based trigger scans organizer calendars for upcoming meetings with a Meet link that will
- *     be recorded (automatic recording/transcription/notes enabled, or the opt-in marker in the
- *     event description)
- *   - Creates the poll state (keyed by event ID) and tells the bot to join (idempotent PUT, re-sent
- *     on every run until shortly after the meeting started, so bot restarts are survived)
- *   - The bot greets the meeting with the consent question and a link to this script's web app
- *   - doGet() shows the question, the answer buttons call submitConsent() (identifying the user via
- *     Session.getActiveUser()), which records the response, appends it to the consent log spreadsheet
- *     (the durable documentation of consent) and tells the bot about the first objection right away;
- *     the tally is posted when the bot leaves
+ * Why not a bot in the meeting: Apps Script can not join a Meet call and posting into the meeting chat via
+ * the Chat API is not reliably possible (meeting chats are system generated group DMs). Asking by email
+ * before the meeting is also the better fit for consent "before recording".
  *
  * Note on async: lib.js is assembled with async/await stripped, so all lib calls are synchronous in
  * Apps Script. This file is written synchronously as well, which doGet() requires anyway.
@@ -49,11 +47,17 @@ const ALLOWED_DOMAINS_KEY = PROPERTY_PREFIX + 'allowedDomains';
  */
 const EMAIL_WHITELIST_KEY = PROPERTY_PREFIX + 'emailWhiteList';
 
-/** Lookahead minutes for upcoming meeting detection.
+/** Invitations are sent for meetings starting within this many hours.
+ *
+ * Default: 24 hours
+ */
+const LOOKAHEAD_HOURS_KEY = PROPERTY_PREFIX + 'lookaheadHours';
+
+/** The organizer summary is sent this many minutes before the meeting starts (by the first run after that).
  *
  * Default: 15 minutes
  */
-const LOOKAHEAD_MINUTES_KEY = PROPERTY_PREFIX + 'lookaheadMinutes';
+const SUMMARY_MINUTES_KEY = PROPERTY_PREFIX + 'summaryMinutes';
 
 /** Minimum number of attendees for a qualifying meeting.
  *
@@ -61,7 +65,7 @@ const LOOKAHEAD_MINUTES_KEY = PROPERTY_PREFIX + 'lookaheadMinutes';
  */
 const MIN_ATTENDEES_KEY = PROPERTY_PREFIX + 'minAttendees';
 
-/** Which meetings the bot joins: 'recorded' or 'all'.
+/** Which meetings get a consent poll: 'recorded' or 'all'.
  *
  * 'recorded': automatic recording, transcription or notes are enabled for the Meet space (Meet REST API,
  * impersonating the organizer), or the event description contains OPT_IN_MARKER.
@@ -70,28 +74,30 @@ const MIN_ATTENDEES_KEY = PROPERTY_PREFIX + 'minAttendees';
  */
 const JOIN_MODE_KEY = PROPERTY_PREFIX + 'joinMode';
 
-/** Base URL of the meet-bot control API (origin only, e.g. https://meet-bot.example.com). */
-const BOT_URL_KEY = PROPERTY_PREFIX + 'botUrl';
-
-/** Shared HMAC secret of the meet-bot control API (MEETBOT_SECRET, at least 32 characters). */
-const BOT_SECRET_KEY = PROPERTY_PREFIX + 'botSecret';
-
-/** Email of the bot account, excluded from the attendees (in case it is invited).
+/** The account the emails are sent from (Gmail API, impersonated via domain-wide delegation). Required.
  *
- * Default: none
+ * Excluded from the attendees in case it is invited.
  */
-const BOT_EMAIL_KEY = PROPERTY_PREFIX + 'botEmail';
+const SENDER_EMAIL_KEY = PROPERTY_PREFIX + 'senderEmail';
 
-/** Minutes the bot stays in the meeting (it leaves earlier if the meeting ends).
+/** Whether a generic notice is added to the event description ('true' or 'false').
  *
- * Default: 10 minutes
+ * Default: true
  */
-const STAY_MINUTES_KEY = PROPERTY_PREFIX + 'stayMinutes';
+const CALENDAR_NOTICE_KEY = PROPERTY_PREFIX + 'calendarNotice';
 
-/** Optional purpose of recordings, shown in the consent question (e.g. "for AI generated meeting minutes"). */
+/** Whether automatic recording/transcription/notes are switched off when an attendee objects ('true' or 'false').
+ *
+ * Requires the 'meetings.space.settings' scope (instead of 'meetings.space.readonly').
+ *
+ * Default: true
+ */
+const DISABLE_RECORDING_KEY = PROPERTY_PREFIX + 'disableRecordingOnObjection';
+
+/** Optional purpose of recordings, completes "... may be recorded" (e.g. "for AI generated meeting minutes"). */
 const RECORDING_PURPOSE_KEY = PROPERTY_PREFIX + 'recordingPurpose';
 
-/** Optional link to the recording policy, shown in the consent question. */
+/** Optional link to the recording policy, shown in the emails and on the poll page. */
 const POLICY_URL_KEY = PROPERTY_PREFIX + 'policyUrl';
 
 /** Public URL of this script's web app deployment (the /exec URL).
@@ -100,9 +106,9 @@ const POLICY_URL_KEY = PROPERTY_PREFIX + 'policyUrl';
  */
 const WEB_APP_URL_KEY = PROPERTY_PREFIX + 'webAppUrl';
 
-/** ID of the spreadsheet every response is appended to (the durable documentation of consent).
+/** ID of the spreadsheet every response is appended to (the durable documentation of consent). Required.
  *
- * The poll state in ScriptProperties is deleted after 48 hours, this log is kept. Required.
+ * The poll state in ScriptProperties is deleted a day after the meeting, this log is kept.
  */
 const CONSENT_LOG_SPREADSHEET_ID_KEY = PROPERTY_PREFIX + 'consentLogSpreadsheetId';
 
@@ -111,25 +117,54 @@ const CONSENT_LOG_SHEET_NAME = 'Consent Log';
 
 /** Columns of the consent log. */
 const CONSENT_LOG_HEADER = ['Responded At', 'Respondent Email', 'Respondent Name', 'Consent', 'Meeting Title',
-    'Meeting Start', 'Meeting Link', 'Organizer', 'Event ID', 'Previous Answer'];
+    'Meeting Start', 'Meeting Link', 'Organizer', 'Event ID', 'Previous Answer', 'Identified By', 'Signed In As'];
 
 /** The trigger handler function to call in time based triggers. */
 const TRIGGER_HANDLER_FUNCTION = 'checkUpcomingMeetings';
 
-/** Prefix for consent state stored in ScriptProperties (keyed by event ID). */
+/** Prefix for poll state stored in ScriptProperties (keyed by event ID). */
 const STATE_KEY_PREFIX = 'state.';
 
-/** Maximum age for state entries before cleanup (48 hours). */
-const STATE_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+/** Version of the poll state format, states of other versions are deleted. */
+const STATE_VERSION = 2;
 
-/** Event description marker to request the bot for a meeting without automatic recording. */
+/** Poll state is kept this long after the meeting ended (so the poll page can say it is closed). */
+const STATE_RETENTION_AFTER_END_MS = 24 * 60 * 60 * 1000;
+
+/** Maximum size of a serialized poll state per property (ScriptProperties allow 9 KB per value), larger states are split. */
+const MAX_STATE_BYTES = 8500;
+
+/** Prefix for the parts of large poll states ('chunk.<eventId>.<n>'). */
+const CHUNK_KEY_PREFIX = 'chunk.';
+
+/** Value of the 'state.<eventId>' property of a split state, followed by the number of parts. */
+const CHUNKED_MARKER = '#chunks:';
+
+/** Maximum number of parts of a poll state (about 100 KB, several hundred attendees). */
+const MAX_STATE_CHUNKS = 12;
+
+/** Log a warning when the script properties grow beyond this size (ScriptProperties allow 500 KB in total). */
+const PROPERTIES_WARN_BYTES = 400 * 1024;
+
+/** Event description marker to request a poll for a meeting without automatic recording. */
 const OPT_IN_MARKER = '#consent-poll';
 
-/** The bot joins this long before the meeting starts. */
-const JOIN_LEAD_MS = 60 * 1000;
+/** Start of the notice added to event descriptions, also used to detect it. */
+const NOTICE_MARKER = 'Recording consent notice:';
 
-/** The bot is still sent to meetings that started up to this long ago (late trigger runs, bot restarts). */
-const JOIN_GRACE_MS = 10 * 60 * 1000;
+/** Display name of the sender of all emails. */
+const SENDER_NAME = 'Meeting Recording Consent';
+
+/** OAuth scopes used via domain-wide delegation (besides the ones of the lib clients). */
+const GMAIL_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
+const MEET_SETTINGS_SCOPE = 'https://www.googleapis.com/auth/meetings.space.settings';
+
+/** Automatic artifacts of a Meet space (SpaceConfig.artifactConfig). */
+const ARTIFACTS = [
+    {config: 'recordingConfig', field: 'autoRecordingGeneration', label: 'recording'},
+    {config: 'transcriptionConfig', field: 'autoTranscriptionGeneration', label: 'transcription'},
+    {config: 'smartNotesConfig', field: 'autoSmartNotesGeneration', label: 'Gemini notes'}
+];
 
 /** Web app query parameter names. */
 const PARAM_EVENT = 'e';
@@ -145,8 +180,9 @@ function uninstall() {
     TriggerUtil.uninstall(TRIGGER_HANDLER_FUNCTION);
 }
 
-/** Install periodic execution trigger. */
+/** Install periodic execution trigger (replacing an existing one). */
 function install(delayMinutes) {
+    uninstall();
     TriggerUtil.install(TRIGGER_HANDLER_FUNCTION, delayMinutes);
 }
 
@@ -155,42 +191,42 @@ function setProperties(properties, deleteAllOthers) {
     TriggerUtil.setProperties(properties, deleteAllOthers);
 }
 
-/** List the bot's sessions (for checking the setup via `clasp run listBotSessions`). */
-function listBotSessions() {
-    const sessions = callBot_('GET', '/v1/sessions');
-    Logger.log(JSON.stringify(sessions, null, 2));
-    return sessions;
-}
-
 
 // ---------------------------------------------------------------------------
 // Core Trigger: checkUpcomingMeetings
 // ---------------------------------------------------------------------------
 
-/** Main entry point: scans organizer calendars for upcoming recorded meetings and sends the bot. */
+/** Main entry point: scans organizer calendars for upcoming recorded meetings and runs their polls. */
 function checkUpcomingMeetings() {
+    // runs overlapping each other (a slow run) would send invitations twice
+    const runLock = LockService.getUserLock();
+    if (!runLock.tryLock(1000)) {
+        Logger.log('Another run is still in progress, skipping this one');
+        return;
+    }
+    try {
+        checkUpcomingMeetings_();
+    } finally {
+        runLock.releaseLock();
+    }
+}
 
-    const allowedDomains = (getScriptProperties_().getProperty(ALLOWED_DOMAINS_KEY) || '')
-        .split(',')
-        .map(d => d.trim())
-        .filter(d => !!d);
 
-    const emailWhiteList = getEmailWhiteList_();
-    const isEmailAllowed = email => (!emailWhiteList.length || emailWhiteList.includes(email))
-        && allowedDomains.some(domain => email.endsWith('@' + domain));
-
-    const lookaheadMinutes = getLookaheadMinutes_();
-    const minAttendees = getMinAttendees_();
-    const joinMode = getJoinMode_();
-    const webAppUrl = getWebAppUrl_();
-    if (!webAppUrl) {
+function checkUpcomingMeetings_() {
+    const config = loadConfig_();
+    if (!config.webAppUrl) {
         throw new Error('Web app URL unknown, deploy the web app or set ' + WEB_APP_URL_KEY);
     }
-    getBotConfig_();   // fail early if the bot is not configured
     getConsentLogSheet_();   // fail early if responses can not be documented
 
-    Logger.log('Configured to handle accounts %s on domains %s, lookahead %s min, min attendees %s, join mode %s, web app %s',
-        emailWhiteList.length ? emailWhiteList : '(all)', allowedDomains, '' + lookaheadMinutes, '' + minAttendees, joinMode, webAppUrl);
+    const isEmailAllowed = email => (!config.emailWhiteList.length || config.emailWhiteList.includes(email))
+        && config.allowedDomains.some(domain => email.endsWith('@' + domain));
+
+    Logger.log('Configured to handle accounts %s on domains %s, lookahead %s h, summary %s min before, min attendees %s, '
+        + 'join mode %s, sender %s, calendar notice %s, disable recording on objection %s, web app %s',
+        config.emailWhiteList.length ? config.emailWhiteList : '(all)', config.allowedDomains, '' + config.lookaheadHours,
+        '' + config.summaryMinutes, '' + config.minAttendees, config.joinMode, config.senderEmail, '' + config.calendarNotice,
+        '' + config.disableRecording, config.webAppUrl);
 
     const personioCreds = getPersonioCreds_();
     const personio = PersonioClientV1.withApiCredentials(personioCreds.clientId, personioCreds.clientSecret);
@@ -201,28 +237,21 @@ function checkUpcomingMeetings() {
 
     Logger.log('Processing %s active employees', '' + activeEmployees.length);
 
-    const creds = getServiceAccountCredentials_();
-    const now = new Date();
-    const timeMin = now.toISOString();
-    const timeMax = Util.addDateMillies(new Date(now), lookaheadMinutes * 60 * 1000).toISOString();
+    const context = createContext_(config);
+    const now = context.now;
+    const timeMin = new Date(now).toISOString();
+    const timeMax = new Date(now + config.lookaheadHours * 60 * 60 * 1000).toISOString();
 
-    // Per-run caches
-    const context = {
-        creds: creds,
-        webAppUrl: webAppUrl,
-        directory: null            // lazily loaded: {idToPerson: {}, emailToPerson: {}}
-    };
-
-    let firstError = null;
-    let processedCount = 0;
-    const sentEventIds = new Set();
+    const seenEventIds = new Set();
+    const scannedOrganizers = new Set();
     const failedOrganizers = new Set();
+    const fail = (e) => context.firstError = context.firstError || e;
 
     for (const employee of activeEmployees) {
-        const email = employee.attributes.email.value;
-
+        const email = employee.attributes.email.value.toLowerCase();
         try {
-            const calendar = CalendarClient.withImpersonatingService(creds, email);
+            const calendar = CalendarClient.withImpersonatingService(context.creds, email);
+            // lists events ending after timeMin, so ongoing meetings are included
             const events = calendar.list('primary', {
                 singleEvents: true,
                 showDeleted: false,
@@ -232,53 +261,61 @@ function checkUpcomingMeetings() {
 
             for (const event of events) {
                 // Only process events where this employee is the organizer (dedup across calendars)
-                if ((event.organizer?.email || '').toLowerCase() !== email.toLowerCase()) {
-                    continue;
-                }
-
-                // Ongoing events are listed as well, join those only shortly after they started
-                const eventStart = new Date(event.start?.dateTime || event.start?.date).getTime();
-                if (!isQualifyingEvent_(event, minAttendees) || now.getTime() > eventStart + JOIN_GRACE_MS) {
+                if ((event.organizer?.email || '').toLowerCase() !== email) {
                     continue;
                 }
 
                 try {
-                    if (joinMode === 'all' || isRecordedMeeting_(context, email, event)) {
-                        sendBot_(context, event);
-                        sentEventIds.add(event.id);
+                    if (isQualifyingEvent_(event, config.minAttendees)) {
+                        processEvent_(context, calendar, event);
+                        seenEventIds.add(event.id);
+                    } else if (loadState_(event.id)) {
+                        // e.g. the Meet link or attendees were removed
+                        deactivatePoll_(event.id, 'no longer a qualifying meeting');
+                        seenEventIds.add(event.id);
                     }
                 } catch (e) {
-                    Logger.log('Failed to send the bot to event %s (%s): %s', event.id, event.summary, e);
-                    sentEventIds.add(event.id);   // unknown, leave the bot session alone
-                    firstError = firstError || e;
+                    Logger.log('Failed to process event %s (%s): %s', event.id, event.summary, e);
+                    seenEventIds.add(event.id);   // unknown, leave the poll alone
+                    fail(e);
                 }
             }
+            scannedOrganizers.add(email);
         } catch (e) {
             Logger.log('Failed to process calendar for user %s: %s', email, e);
-            failedOrganizers.add(email.toLowerCase());
-            firstError = firstError || e;
+            failedOrganizers.add(email);
+            fail(e);
         }
-
-        ++processedCount;
     }
 
-    Logger.log('Completed scanning %s of %s accounts', '' + processedCount, '' + activeEmployees.length);
+    Logger.log('Completed scanning %s of %s accounts', '' + scannedOrganizers.size, '' + activeEmployees.length);
 
-    // Meetings that were cancelled, moved or no longer qualify must not be joined
+    // Meetings that were cancelled, moved out of the window or whose objection was not handled yet
     try {
-        cancelVanishedSessions_(now, sentEventIds, failedOrganizers, new Set(activeEmployees
-            .map(employee => employee.attributes.email.value.toLowerCase())));
+        reconcileUnseenPolls_(context, seenEventIds, scannedOrganizers, failedOrganizers);
     } catch (e) {
-        Logger.log('Failed to cancel bot sessions of vanished meetings: %s', e);
-        firstError = firstError || e;
+        Logger.log('Failed to reconcile polls of meetings not seen in this run: %s', e);
+        fail(e);
     }
 
-    // Cleanup old state entries
-    cleanupOldState_();
+    cleanupOldState_(now);
 
-    if (firstError) {
-        throw firstError;
+    if (context.firstError) {
+        throw context.firstError;
     }
+}
+
+
+/** Per-run (or per-request) context: configuration, credentials and caches. */
+function createContext_(config) {
+    return {
+        config: config,
+        creds: getServiceAccountCredentials_(),
+        now: Date.now(),
+        directory: undefined,   // lazily loaded: {emailToName: {}}, null if loading failed
+        gmail: null,
+        firstError: null
+    };
 }
 
 
@@ -312,38 +349,489 @@ function getMeetUri_(event) {
 }
 
 
-/** Check if a meeting will be recorded: opt-in marker or automatic artifacts enabled for its Meet space.
+/** The event's Meet meeting code (e.g. 'abc-mnop-xyz'). */
+function getMeetingCode_(event) {
+    return event.conferenceData?.conferenceId
+        || (getMeetUri_(event) || '').replace(/^https:\/\/meet\.google\.com\//, '').replace(/[?#].*$/, '');
+}
+
+
+/** Whether the event description contains the opt-in marker. */
+function hasOptInMarker_(event) {
+    return (event.description || '').toLowerCase().includes(OPT_IN_MARKER);
+}
+
+
+/** The labels of the automatic artifacts switched on for a Meet space (e.g. ['recording', 'Gemini notes']). */
+function getAutoArtifacts_(space) {
+    const artifactConfig = space?.config?.artifactConfig || {};
+    return ARTIFACTS.filter(a => artifactConfig[a.config]?.[a.field] === 'ON').map(a => a.label);
+}
+
+
+/** Get the Meet space of a meeting as its organizer, or null if that fails (e.g. a Meet link owned by someone else).
  *
- * Gemini notes and transcripts are included, they process what participants say just like recordings.
+ * With disableRecordingOnObjection the settings scope is used, which allows reading and updating.
  */
-function isRecordedMeeting_(context, organizerEmail, event) {
-    if ((event.description || '').toLowerCase().includes(OPT_IN_MARKER)) {
-        return true;
-    }
-
-    const meetingCode = event.conferenceData?.conferenceId
-        || getMeetUri_(event).replace(/^https:\/\/meet\.google\.com\//, '').replace(/[?#].*$/, '');
-
-    let artifactConfig;
+function getSpace_(context, organizerEmail, spaceOrCode) {
     try {
-        const meet = MeetClient.withImpersonatingService(context.creds, organizerEmail);
-        artifactConfig = meet.getSpace('spaces/' + meetingCode)?.config?.artifactConfig || {};
+        return getMeetClient_(context, organizerEmail).getSpace(spaceOrCode.startsWith('spaces/') ? spaceOrCode : 'spaces/' + spaceOrCode);
     } catch (e) {
-        // e.g. a Meet link owned by someone else, nothing we can find out about recording
-        Logger.log('Failed to get Meet space %s of event %s (%s) as %s, assuming no recording: %s',
-            meetingCode, event.id, event.summary, organizerEmail, e);
-        return false;
+        Logger.log('Failed to get Meet space %s as %s: %s', spaceOrCode, organizerEmail, e);
+        return null;
     }
-    const automatic = [
-        artifactConfig.recordingConfig?.autoRecordingGeneration,
-        artifactConfig.transcriptionConfig?.autoTranscriptionGeneration,
-        artifactConfig.smartNotesConfig?.autoSmartNotesGeneration
-    ];
+}
 
-    Logger.log('Meet space %s of event %s (%s): automatic recording/transcription/notes %s',
-        meetingCode, event.id, event.summary, automatic.map(v => v || '-').join('/'));
 
-    return automatic.includes('ON');
+function getMeetClient_(context, organizerEmail) {
+    return context.config.disableRecording
+        ? MeetClient.withImpersonatingService(context.creds, organizerEmail, MEET_SETTINGS_SCOPE)
+        : MeetClient.withImpersonatingService(context.creds, organizerEmail);
+}
+
+
+// ---------------------------------------------------------------------------
+// Poll Processing
+// ---------------------------------------------------------------------------
+
+/** Run the poll of a qualifying event: create/update state, enforce objections, notice, invitations, summary. */
+function processEvent_(context, calendar, event) {
+    const config = context.config;
+    const organizerEmail = event.organizer.email.toLowerCase();
+    const existing = loadState_(event.id);
+    const marker = hasOptInMarker_(event);
+
+    // The Meet space is needed to know whether the meeting is recorded and to enforce standing objections
+    const needSpace = (config.joinMode === 'recorded' && !marker)
+        || (!!existing && config.disableRecording && hasObjection_(existing));
+    const space = needSpace ? getSpace_(context, organizerEmail, existing?.space || getMeetingCode_(event)) : null;
+    const autoArtifacts = getAutoArtifacts_(space);
+
+    let recorded;
+    if (config.joinMode === 'all' || marker) {
+        recorded = true;
+    } else if (space) {
+        // recording switched off by us due to an objection keeps the poll going
+        recorded = autoArtifacts.length > 0 || !!existing?.recOff;
+    } else {
+        recorded = !!existing?.active;   // unknown, keep as is
+    }
+
+    Logger.log('Event %s (%s) by %s: automatic %s, marker %s, poll %s', event.id, event.summary, organizerEmail,
+        space ? (autoArtifacts.join('/') || 'none') : '(unknown)', '' + marker, recorded ? 'active' : 'not needed');
+
+    if (!recorded) {
+        if (existing?.active) {
+            deactivatePoll_(event.id, 'no longer recorded');
+        }
+        if (existing?.objPending) {
+            enforceObjection_(context, event.id, space, 'objection');   // still tell the organizer
+        }
+        return;
+    }
+
+    upsertPoll_(context, event, space);
+
+    // Objections not handled yet (e.g. the notification failed) or automatic recording switched on again
+    const state = loadState_(event.id);
+    if (state.objPending || (config.disableRecording && autoArtifacts.length > 0 && hasObjection_(state))) {
+        try {
+            enforceObjection_(context, event.id, space, state.objPending ? 'objection' : 'reenabled');
+        } catch (e) {
+            Logger.log('Failed to handle the objection for event %s (%s): %s', event.id, event.summary, e);
+            context.firstError = context.firstError || e;
+        }
+    }
+
+    if (config.calendarNotice && !state.noticeAt) {
+        try {
+            addCalendarNotice_(context, calendar, event.id);
+        } catch (e) {
+            Logger.log('Failed to add the notice to event %s (%s): %s', event.id, event.summary, e);
+            context.firstError = context.firstError || e;
+        }
+    }
+
+    sendInvitations_(context, event.id);
+    sendSummaryIfDue_(context, event.id);
+}
+
+
+/** Create or update the poll state of an event from the event (attendees, time, title). */
+function upsertPoll_(context, event, space) {
+    const organizerEmail = event.organizer.email.toLowerCase();
+    const senderEmail = context.config.senderEmail;
+
+    // drop rooms/resources, people who declined the invitation and the sender
+    const attendees = (event.attendees || [])
+        .filter(a => !a.resource && a.responseStatus !== 'declined')
+        .map(a => ({email: (a.email || '').toLowerCase(), displayName: a.displayName}))
+        .filter(a => isValidEmail_(a.email) && !a.email.endsWith('calendar.google.com') && a.email !== senderEmail);
+
+    const directory = getDirectory_(context, organizerEmail);
+    const nameOf = a => ((directory?.emailToName[a.email]) || a.displayName || '').substring(0, 80);
+
+    return updateState_(event.id, state => {
+        state = state || {
+            v: STATE_VERSION,
+            id: event.id,
+            createdAt: context.now,
+            att: {}
+        };
+
+        Object.assign(state, {
+            org: organizerEmail,
+            title: (event.summary || '(No title)').substring(0, 200),
+            start: event.start.dateTime,
+            end: event.end?.dateTime || new Date(new Date(event.start.dateTime).getTime() + 60 * 60 * 1000).toISOString(),
+            tz: event.start.timeZone || undefined,
+            uri: getMeetUri_(event),
+            code: getMeetingCode_(event),
+            space: space?.name || state.space || undefined,
+            active: true,
+            why: undefined,
+            cancelled: undefined
+        });
+
+        const current = new Set(attendees.map(a => a.email));
+        for (const a of attendees) {
+            const entry = state.att[a.email];
+            if (!entry) {
+                state.att[a.email] = {t: newToken_()};
+            } else {
+                delete entry.x;
+            }
+            const name = nameOf(a);
+            if (name && name !== a.email) {
+                state.att[a.email].n = name;
+            }
+        }
+        // removed attendees are kept (marked), so they are not invited twice if added again
+        for (const email of Object.keys(state.att)) {
+            if (!current.has(email)) {
+                state.att[email].x = 1;
+            }
+        }
+        return state;
+    });
+}
+
+
+/** Mark a poll inactive (no invitations or summaries), e.g. because the meeting is no longer recorded. */
+function deactivatePoll_(eventId, reason, cancelled) {
+    const changed = updateState_(eventId, state => {
+        if (!state || (!state.active && !!state.cancelled === !!cancelled)) {
+            return null;
+        }
+        state.active = false;
+        state.why = reason;
+        if (cancelled) {
+            state.cancelled = Date.now();
+        }
+        return state;
+    });
+    if (changed) {
+        Logger.log('Deactivated the poll of event %s: %s', eventId, reason);
+    }
+}
+
+
+/** Whether the poll accepts answers (until the meeting ended, unless cancelled). */
+function isPollOpen_(state, now) {
+    return !state.cancelled && now < new Date(state.end).getTime();
+}
+
+
+/** Current (not removed) attendees as [email, entry] pairs. */
+function currentAttendees_(state) {
+    return Object.entries(state.att || {}).filter(([, entry]) => !entry.x);
+}
+
+
+/** Whether a current attendee does not consent. */
+function hasObjection_(state) {
+    return currentAttendees_(state).some(([, entry]) => entry.c === false);
+}
+
+
+/** Count answers of the current attendees. */
+function countAnswers_(state) {
+    const entries = currentAttendees_(state).map(([, entry]) => entry);
+    const consented = entries.filter(entry => entry.c === true).length;
+    const declined = entries.filter(entry => entry.c === false).length;
+    return {
+        invited: entries.length,
+        consented: consented,
+        declined: declined,
+        pending: entries.length - consented - declined
+    };
+}
+
+
+/** Email every current attendee who was not invited yet their personal link (each person exactly once). */
+function sendInvitations_(context, eventId) {
+    const state = loadState_(eventId);
+    if (!state?.active || !isPollOpen_(state, context.now)) {
+        return;
+    }
+
+    for (const [email, entry] of currentAttendees_(state)) {
+        if (entry.i) {
+            continue;
+        }
+        try {
+            sendMail_(context, email, state.org, 'Recording consent: ' + state.title,
+                buildInvitationText_(context, state, email, entry), buildInvitationHtml_(context, state, email, entry));
+        } catch (e) {
+            Logger.log('Failed to send the invitation for event %s (%s) to %s: %s', eventId, state.title, email, e);
+            context.firstError = context.firstError || e;
+            continue;
+        }
+        // persisted right after each mail, so a failing run does not invite anyone twice
+        updateState_(eventId, current => {
+            if (!current?.att?.[email]) {
+                return null;
+            }
+            current.att[email].i = Date.now();
+            return current;
+        });
+        Logger.log('Invited %s to the consent poll of event %s (%s)', email, eventId, state.title);
+    }
+}
+
+
+/** Send the organizer summary shortly before the meeting (once), and an update whenever answers change after that. */
+function sendSummaryIfDue_(context, eventId) {
+    const state = loadState_(eventId);
+    if (!state?.active || !isPollOpen_(state, context.now)) {
+        return;
+    }
+
+    const signature = answersSignature_(state);
+    const start = new Date(state.start).getTime();
+    let kind;
+    if (!state.summaryAt) {
+        if (context.now < start - context.config.summaryMinutes * 60 * 1000) {
+            return;
+        }
+        kind = 'summary';
+    } else if (state.sumSig !== signature) {
+        kind = 'update';
+    } else {
+        return;
+    }
+
+    const subject = (kind === 'summary' ? 'Recording consent summary: ' : 'Recording consent update: ') + state.title;
+    sendMail_(context, state.org, null, subject, buildSummaryText_(context, state, kind), buildSummaryHtml_(context, state, kind));
+
+    updateState_(eventId, current => {
+        if (!current) {
+            return null;
+        }
+        current.summaryAt = current.summaryAt || Date.now();
+        current.sumSig = signature;
+        return current;
+    });
+    Logger.log('Sent the %s for event %s (%s) to %s', kind, eventId, state.title, state.org);
+}
+
+
+/** A short signature of the current answers, to detect changes after the summary was sent. */
+function answersSignature_(state) {
+    const text = currentAttendees_(state)
+        .map(([email, entry]) => email + '=' + (entry.c === true ? 'y' : entry.c === false ? 'n' : '-'))
+        .sort()
+        .join(',');
+    return Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text,
+        Utilities.Charset.UTF_8)).substring(0, 16);
+}
+
+
+/** Handle an objection: switch off automatic recording/transcription/notes (if enabled) and email the organizer.
+ *
+ * @param context The context (config, creds).
+ * @param eventId The event ID.
+ * @param space The Meet space if already fetched, else null.
+ * @param reason 'objection' (new objection) or 'reenabled' (automatic artifacts were switched on again despite an objection).
+ */
+function enforceObjection_(context, eventId, space, reason) {
+    const state = loadState_(eventId);
+    if (!state || state.cancelled) {
+        return;
+    }
+
+    const result = {disabled: [], failed: null, attempted: false};
+    if (context.config.disableRecording && isPollOpen_(state, Date.now())) {
+        result.attempted = true;
+        try {
+            result.disabled = disableAutoArtifacts_(context, state, space);
+        } catch (e) {
+            Logger.log('Failed to switch off automatic recording for event %s (%s): %s', eventId, state.title, e);
+            result.failed = e;
+        }
+    }
+
+    if (reason === 'reenabled' && result.failed && state.offFailed) {
+        // the organizer was already told to check the settings, keep trying silently on the next runs
+        return;
+    }
+
+    try {
+        sendMail_(context, state.org, null, 'Recording consent: objection for ' + state.title,
+            buildObjectionText_(context, state, result, reason), buildObjectionHtml_(context, state, result, reason));
+    } catch (e) {
+        // retried by the next trigger run
+        Logger.log('Failed to notify the organizer %s about an objection for event %s (%s): %s', state.org, eventId, state.title, e);
+        updateState_(eventId, current => {
+            if (!current) {
+                return null;
+            }
+            current.objPending = current.objPending || Date.now();
+            addRecOff_(current, result.disabled);
+            return current;
+        });
+        throw e;
+    }
+
+    updateState_(eventId, current => {
+        if (!current) {
+            return null;
+        }
+        delete current.objPending;
+        addRecOff_(current, result.disabled);
+        // the organizer was told to check the settings, do not repeat that on every run
+        if (result.failed) {
+            current.offFailed = Date.now();
+        } else {
+            delete current.offFailed;
+        }
+        return current;
+    });
+    Logger.log('Handled %s for event %s (%s): notified %s, switched off %s', reason, eventId, state.title, state.org,
+        result.disabled.join('/') || 'nothing');
+}
+
+
+/** Remember which automatic artifacts were switched off (the poll then stays active even with joinMode 'recorded'). */
+function addRecOff_(state, disabled) {
+    if (disabled.length) {
+        state.recOff = {
+            at: Date.now(),
+            off: Array.from(new Set([...(state.recOff?.off || []), ...disabled]))
+        };
+    }
+}
+
+
+/** Switch off the automatic artifacts of the meeting's Meet space via spaces.patch, returns the labels switched off.
+ *
+ * Throws if the space can not be read or updated.
+ */
+function disableAutoArtifacts_(context, state, space) {
+    const meet = getMeetClient_(context, state.org);
+    const current = space || meet.getSpace(state.space || 'spaces/' + state.code);
+    const on = ARTIFACTS.filter(a => current?.config?.artifactConfig?.[a.config]?.[a.field] === 'ON');
+    if (!on.length) {
+        return [];
+    }
+
+    const artifactConfig = {};
+    for (const a of on) {
+        artifactConfig[a.config] = {[a.field]: 'OFF'};
+    }
+    // spaces.patch only accepts the server generated space name, not the meeting code
+    meet.patchSpace(current.name, {config: {artifactConfig: artifactConfig}},
+        on.map(a => 'config.artifactConfig.' + a.config + '.' + a.field).join(','));
+
+    Logger.log('Switched off automatic %s of %s for event %s (%s)', on.map(a => a.label).join('/'), current.name,
+        state.id, state.title);
+    return on.map(a => a.label);
+}
+
+
+/** Add a generic notice to the event description as the organizer (once, never clobbering concurrent edits). */
+function addCalendarNotice_(context, calendar, eventId) {
+    // read fresh and patch with If-Match, so a concurrent edit by the organizer is never overwritten
+    const event = calendar.get('primary', eventId);
+    const description = event.description || '';
+
+    if (!description.includes(NOTICE_MARKER)) {
+        const notice = buildCalendarNotice_(context);
+        const isHtml = /<\/?[a-z][^>]*>/i.test(description);
+        const updated = !description.trim() ? notice
+            : isHtml ? description + '<br><br>' + escapeHtml_(notice)
+                : description + '\n\n' + notice;
+        calendar.patch('primary', eventId, {description: updated}, {sendUpdates: 'none'}, event.etag);
+        Logger.log('Added the recording consent notice to event %s (%s)', eventId, event.summary);
+    }
+
+    updateState_(eventId, state => {
+        if (!state) {
+            return null;
+        }
+        state.noticeAt = Date.now();
+        return state;
+    });
+}
+
+
+/** Handle polls not seen in this run's scan: cancelled or moved meetings, pending objection notifications. */
+function reconcileUnseenPolls_(context, seenEventIds, scannedOrganizers, failedOrganizers) {
+    for (const eventId of listStateIds_()) {
+        const state = loadState_(eventId);
+        if (!state || seenEventIds.has(state.id) || state.cancelled || !isPollOpen_(state, context.now)) {
+            continue;
+        }
+        const organizer = state.org;
+        if (failedOrganizers.has(organizer) || !scannedOrganizers.has(organizer)) {
+            continue;   // unknown (organizer not scanned), leave it alone
+        }
+
+        try {
+            if (state.active) {
+                reconcileUnseenPoll_(context, state);
+            }
+            if (loadState_(state.id)?.objPending && !loadState_(state.id)?.cancelled) {
+                enforceObjection_(context, state.id, null, 'objection');
+            }
+        } catch (e) {
+            Logger.log('Failed to reconcile the poll of event %s (%s): %s', state.id, state.title, e);
+            context.firstError = context.firstError || e;
+        }
+    }
+}
+
+
+/** An active poll whose event was not in the scan: cancelled/deleted, moved out of the window or organizer changed. */
+function reconcileUnseenPoll_(context, state) {
+    let event = null;
+    try {
+        event = CalendarClient.withImpersonatingService(context.creds, state.org).get('primary', state.id);
+    } catch (e) {
+        const code = e.response?.getResponseCode?.();
+        if (code !== 404 && code !== 410) {
+            throw e;
+        }
+    }
+
+    if (!event || event.status === 'cancelled') {
+        deactivatePoll_(state.id, 'meeting cancelled', true);
+    } else if ((event.organizer?.email || '').toLowerCase() !== state.org) {
+        deactivatePoll_(state.id, 'organizer changed');
+    } else if (!isQualifyingEvent_(event, context.config.minAttendees)) {
+        deactivatePoll_(state.id, 'no longer a qualifying meeting');
+    } else if (event.start.dateTime !== state.start || event.end?.dateTime !== state.end) {
+        // moved out of the lookahead window: keep the poll (links stay valid), continue when it is due again
+        updateState_(state.id, current => {
+            if (!current) {
+                return null;
+            }
+            current.start = event.start.dateTime;
+            current.end = event.end?.dateTime || current.end;
+            return current;
+        });
+        Logger.log('Event %s (%s) moved to %s', state.id, state.title, event.start.dateTime);
+    }
 }
 
 
@@ -351,261 +839,328 @@ function isRecordedMeeting_(context, organizerEmail, event) {
 // Directory (email -> name resolution)
 // ---------------------------------------------------------------------------
 
-/** Load the domain directory once per run (impersonating the given user). */
+/** Load the domain directory once per run (impersonating the given user), null if that fails. */
 function getDirectory_(context, impersonatedEmail) {
-    if (context.directory) {
+    if (context.directory !== undefined) {
         return context.directory;
     }
 
-    const directoryClient = DirectoryClient.withImpersonatingService(context.creds, impersonatedEmail);
-    const people = directoryClient.listDirectoryPeople();
+    try {
+        const directoryClient = DirectoryClient.withImpersonatingService(context.creds, impersonatedEmail);
+        const people = directoryClient.listDirectoryPeople();
 
-    const idToPerson = {};
-    const emailToPerson = {};
-    for (const person of people) {
-        const id = (person.resourceName || '').replace(/^people\//, '');
-        const emails = (person.emailAddresses || []).map(e => (e.value || '').toLowerCase()).filter(e => !!e);
-        const name = (person.names || []).map(n => n.displayName).find(n => !!n) || emails[0] || id;
-        if (!id || !emails.length) {
-            continue;
+        const emailToName = {};
+        for (const person of people) {
+            const name = (person.names || []).map(n => n.displayName).find(n => !!n);
+            for (const email of (person.emailAddresses || []).map(e => (e.value || '').toLowerCase()).filter(e => !!e)) {
+                if (name) {
+                    emailToName[email] = name;
+                }
+            }
         }
-        const entry = {id: id, email: emails[0], name: name};
-        idToPerson[id] = entry;
-        for (const email of emails) {
-            emailToPerson[email] = entry;
-        }
+        Logger.log('Loaded %s directory email addresses', '' + Object.keys(emailToName).length);
+        context.directory = {emailToName: emailToName};
+    } catch (e) {
+        Logger.log('Failed to load the directory, using calendar display names only: %s', e);
+        context.directory = null;
     }
-
-    Logger.log('Loaded %s directory people', '' + Object.keys(idToPerson).length);
-    context.directory = {idToPerson: idToPerson, emailToPerson: emailToPerson};
     return context.directory;
 }
 
 
 // ---------------------------------------------------------------------------
-// Bot Remote Control
+// Email
 // ---------------------------------------------------------------------------
 
-/** Create or refresh the poll state of an event and tell the bot to join (idempotent). */
-function sendBot_(context, event) {
-    const organizerEmail = event.organizer.email;
-    const directory = getDirectory_(context, organizerEmail);
-    const botEmail = getBotEmail_();
-
-    // drop rooms/resources, people who declined the invitation and the bot
-    const attendees = (event.attendees || [])
-        .filter(a => !a.resource && a.responseStatus !== 'declined')
-        .map(a => (a.email || '').toLowerCase())
-        .filter(e => !!e && !e.endsWith('calendar.google.com') && e !== botEmail);
-
-    const names = {};
-    for (const email of attendees) {
-        const person = directory.emailToPerson[email];
-        names[email] = person ? person.name : email;
+/** Send an email (plain text and HTML) from the sender account via the Gmail API. */
+function sendMail_(context, to, replyTo, subject, text, html) {
+    if (!context.gmail) {
+        context.gmail = GmailClientV1.withImpersonatingService(context.creds, context.config.senderEmail, GMAIL_SEND_SCOPE);
     }
-
-    const state = updateState_(event.id, state => Object.assign(state || {
-        eventId: event.id,
-        token: Util.generateUUIDv4(),
-        organizerEmail: organizerEmail,
-        responses: {},
-        createdAt: Date.now()
-    }, {
-        botCancelled: false,
-        meetingTitle: event.summary || '(No title)',
-        meetingTime: event.start.dateTime,
-        meetingUri: getMeetUri_(event),
-        attendees: attendees,
-        names: names
-    }));
-
-    const start = new Date(event.start.dateTime).getTime();
-    const end = new Date(event.end?.dateTime || start + 60 * 60 * 1000).getTime();
-    const joinAt = Math.max(Date.now(), start - JOIN_LEAD_MS);
-    const leaveAt = Math.max(Math.min(joinAt + getStayMinutes_() * 60 * 1000, end), joinAt + 60 * 1000);
-
-    const session = callBot_('PUT', botSessionPath_(event.id), {
-        meetingUri: state.meetingUri,
-        title: state.meetingTitle,
-        joinAt: new Date(joinAt).toISOString(),
-        leaveAt: new Date(leaveAt).toISOString(),
-        greeting: buildGreetingText_(state, context.webAppUrl),
-        farewell: buildTallyText_(state, context.webAppUrl)
+    const raw = buildMimeMessage_({
+        from: context.config.senderEmail,
+        fromName: SENDER_NAME,
+        to: to,
+        replyTo: replyTo,
+        subject: subject,
+        text: text,
+        html: html
     });
-
-    Logger.log('Bot session for event %s (%s) by %s: %s, joining at %s',
-        event.id, event.summary, organizerEmail, session.state, session.joinAt);
+    context.gmail.sendUserMessage(context.config.senderEmail, raw, null);
 }
 
 
-/** Tell the bot about a new response: announce the first objection or full consent, update the tally. */
-function notifyBot_(previousState, state) {
-    const webAppUrl = getWebAppUrl_();
-    const before = countResponses_(previousState);
-    const after = countResponses_(state);
-
-    let say = undefined;
-    if (after.declined > 0 && before.declined === 0) {
-        say = '❌ A participant does not consent to being recorded. Please do not record this meeting.';
-    } else if (after.declined === 0 && after.allConsented && !before.allConsented) {
-        say = '✅ All ' + after.invited + ' invited participants consented to being recorded.';
+/** Assemble a multipart/alternative (plain text + HTML) RFC 5322 message, base64url encoded for the Gmail API. */
+function buildMimeMessage_(message) {
+    for (const address of [message.from, message.to, message.replyTo].filter(a => !!a)) {
+        if (!isValidEmail_(address)) {
+            throw new Error('Invalid email address: ' + address);
+        }
     }
 
-    callBot_('PATCH', botSessionPath_(state.eventId), {
-        say: say,
-        farewell: buildTallyText_(state, webAppUrl)
+    const boundary = 'consent-' + Utilities.getUuid().replace(/-/g, '');
+    const encodeBody = text => (Utilities.base64Encode(text, Utilities.Charset.UTF_8).match(/.{1,76}/g) || []).join('\r\n');
+
+    const lines = [
+        'From: ' + (message.fromName ? '"' + message.fromName.replace(/["\\\r\n]/g, '') + '" <' + message.from + '>' : message.from),
+        'To: ' + message.to
+    ];
+    if (message.replyTo) {
+        lines.push('Reply-To: ' + message.replyTo);
+    }
+    lines.push(
+        'Subject: ' + encodeHeaderText_(message.subject),
+        'MIME-Version: 1.0',
+        'Auto-Submitted: auto-generated',
+        'Content-Type: multipart/alternative;',
+        ' boundary="' + boundary + '"',
+        '',
+        '--' + boundary,
+        'Content-Type: text/plain; charset="UTF-8"',
+        'Content-Transfer-Encoding: base64',
+        '',
+        encodeBody(message.text),
+        '--' + boundary,
+        'Content-Type: text/html; charset="UTF-8"',
+        'Content-Transfer-Encoding: base64',
+        '',
+        encodeBody(message.html),
+        '--' + boundary + '--',
+        ''
+    );
+
+    return Utilities.base64EncodeWebSafe(Utilities.newBlob(lines.join('\r\n')).getBytes());
+}
+
+
+/** Encode a header value: control characters removed, RFC 2047 encoded words if it is not plain ASCII. */
+function encodeHeaderText_(value) {
+    const text = ('' + (value || '')).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+    if (/^[\x20-\x7e]*$/.test(text) && text.length <= 900) {
+        return text;
+    }
+
+    // lines should not exceed 78 characters: up to 42 bytes of UTF-8 become 56 base64 characters (68 per encoded word,
+    // plus 'Subject: ' on the first line), characters (code points) are never split
+    const chunks = [];
+    let chunk = '';
+    for (const c of Array.from(text)) {
+        if (chunk && Util.calculateUtf8Size(chunk + c) > 42) {
+            chunks.push(chunk);
+            chunk = '';
+        }
+        chunk += c;
+    }
+    if (chunk) {
+        chunks.push(chunk);
+    }
+    return chunks.map(c => '=?UTF-8?B?' + Utilities.base64Encode(c, Utilities.Charset.UTF_8) + '?=').join('\r\n ');
+}
+
+
+/** Check for a plain email address (nothing that could inject headers). */
+function isValidEmail_(email) {
+    return typeof email === 'string' && /^[^\s<>()",;:\\@]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(email);
+}
+
+
+/** The purpose clause, e.g. ' for AI generated meeting minutes' (or ''). */
+function purposeClause_(context) {
+    return context.config.recordingPurpose ? ' ' + context.config.recordingPurpose : '';
+}
+
+
+/** Personal poll link of an attendee. */
+function buildPollUrl_(context, state, entry) {
+    return context.config.webAppUrl + UrlFetchJsonClient.buildQuery({
+        [PARAM_EVENT]: state.id,
+        [PARAM_TOKEN]: entry.t
     });
 }
 
 
-function botSessionPath_(eventId) {
-    return '/v1/sessions/' + encodeURIComponent(eventId);
+function organizerLabel_(state) {
+    const name = state.att?.[state.org]?.n;
+    return name ? name + ' (' + state.org + ')' : state.org;
 }
 
 
-/** Cancel the bot for polls of meetings the bot has not joined yet that were not seen in this run.
- *
- * They were cancelled, moved out of the lookahead window or no longer qualify (e.g. recording switched
- * off). The poll state is kept: if the meeting shows up again, the bot is sent again with the same link.
- */
-function cancelVanishedSessions_(now, sentEventIds, failedOrganizers, scannedOrganizers) {
-    const properties = getScriptProperties_().getProperties() || {};
-    for (const key of Object.keys(properties)) {
-        if (!key.startsWith(STATE_KEY_PREFIX)) {
-            continue;
-        }
-        let state;
-        try {
-            state = JSON.parse(properties[key]);
-        } catch (e) {
-            continue;   // cleaned up by cleanupOldState_()
-        }
-        const organizer = (state.organizerEmail || '').toLowerCase();
-        const start = new Date(state.meetingTime).getTime();
-        if (state.botCancelled || sentEventIds.has(state.eventId) || !(start > now.getTime() + JOIN_LEAD_MS)   // not joined yet
-            || failedOrganizers.has(organizer) || !scannedOrganizers.has(organizer)) {
-            continue;
-        }
-
-        try {
-            callBot_('DELETE', botSessionPath_(state.eventId));
-        } catch (e) {
-            if (!/HTTP 404/.test('' + e)) {
-                throw e;
-            }
-        }
-        updateState_(state.eventId, current => current ? Object.assign(current, {botCancelled: true}) : null);
-        Logger.log('Cancelled the bot for event %s (%s): cancelled, moved or no longer qualifying', state.eventId, state.meetingTitle);
-    }
+function buildInvitationText_(context, state, email, entry) {
+    const policyUrl = context.config.policyUrl;
+    return [
+        'Hello' + (entry.n ? ' ' + entry.n : '') + ',',
+        '',
+        'you are invited to "' + state.title + '" on ' + formatMeetingTime_(state.start, state.tz)
+        + ', organized by ' + organizerLabel_(state) + '.',
+        '',
+        'This Google Meet meeting may be recorded, transcribed or summarized with AI notes (Gemini)' + purposeClause_(context)
+        + '. This only happens with the consent of everyone attending, so we ask you before the meeting:',
+        '',
+        'Do you consent? Please answer here (two buttons):',
+        buildPollUrl_(context, state, entry),
+        '',
+        '- Saying no has no disadvantages for you. If anyone objects, the organizer is notified and the meeting must not be '
+        + 'recorded' + (context.config.disableRecording ? ' (automatic recording is switched off)' : '') + '.',
+        '- You can change or withdraw your answer on that page until the meeting ends. Afterwards, please contact the organizer.',
+        '- The link is personal: it records the answer for ' + email + '. Please do not forward it.',
+        '- Your answer is documented (time, your email address, the answer) as proof of consent.',
+        ...(policyUrl ? ['- Recording policy: ' + policyUrl] : []),
+        '',
+        'Replies to this email go to the organizer.',
+        '',
+        '--',
+        'Sent automatically on behalf of the organizer by the meeting recording consent tool.'
+    ].join('\n');
 }
 
 
-/** Call the meet-bot control API with a signed request (see meet-bot/src/auth.mjs), returns the parsed response. */
-function callBot_(method, path, payload) {
-    const bot = getBotConfig_();
-    // ASCII only (non-ASCII escaped as \uXXXX), so the signed bytes are the same whatever charset UrlFetchApp uses
-    const body = payload === undefined ? '' : JSON.stringify(payload)
-        .replace(/[\u007f-\uffff]/g, c => '\\u' + ('000' + c.charCodeAt(0).toString(16)).slice(-4));
-    const timestamp = '' + Math.floor(Date.now() / 1000);
-    const signature = Utilities.computeHmacSha256Signature([timestamp, method, path, body].join('\n'), bot.secret,
-        Utilities.Charset.UTF_8)
-        .map(b => ('0' + (b & 0xff).toString(16)).slice(-2))
-        .join('');
-
-    const options = {
-        method: method.toLowerCase(),
-        headers: {
-            'X-MeetBot-Timestamp': timestamp,
-            'X-MeetBot-Signature': 'sha256=' + signature
-        },
-        muteHttpExceptions: true
-    };
-    if (body) {
-        options.contentType = 'application/json';
-        options.payload = body;
-    }
-
-    const response = UrlFetchApp.fetch(bot.url + path, options);
-    const code = response.getResponseCode();
-    const text = response.getContentText();
-    if (code < 200 || code >= 300) {
-        throw new Error('meet-bot ' + method + ' ' + path + ' failed with HTTP ' + code + ': ' + text);
-    }
-    return text ? JSON.parse(text) : null;
+function buildInvitationHtml_(context, state, email, entry) {
+    const policyUrl = context.config.policyUrl;
+    const url = buildPollUrl_(context, state, entry);
+    return '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#222">'
+        + '<p>Hello' + (entry.n ? ' ' + escapeHtml_(entry.n) : '') + ',</p>'
+        + '<p>you are invited to <b>' + escapeHtml_(state.title) + '</b> on ' + escapeHtml_(formatMeetingTime_(state.start, state.tz))
+        + ', organized by ' + escapeHtml_(organizerLabel_(state)) + '.</p>'
+        + '<p>This Google Meet meeting may be recorded, transcribed or summarized with AI notes (Gemini)'
+        + escapeHtml_(purposeClause_(context)) + '. This only happens with the consent of everyone attending, so we ask you '
+        + 'before the meeting:</p>'
+        + '<p><a href="' + escapeHtml_(url) + '" style="display:inline-block;padding:.6em 1.2em;border-radius:.4em;'
+        + 'background:#1a73e8;color:#fff;text-decoration:none;font-weight:bold">Answer: do you consent?</a></p>'
+        + '<ul>'
+        + '<li>Saying no has no disadvantages for you. If anyone objects, the organizer is notified and the meeting must not be '
+        + 'recorded' + (context.config.disableRecording ? ' (automatic recording is switched off)' : '') + '.</li>'
+        + '<li>You can change or withdraw your answer on that page until the meeting ends. Afterwards, please contact the organizer.</li>'
+        + '<li>The link is personal: it records the answer for ' + escapeHtml_(email) + '. Please do not forward it.</li>'
+        + '<li>Your answer is documented (time, your email address, the answer) as proof of consent.</li>'
+        + (policyUrl ? '<li><a href="' + escapeHtml_(policyUrl) + '">Recording policy</a></li>' : '')
+        + '</ul>'
+        + '<p>Replies to this email go to the organizer.</p>'
+        + '<p style="color:#666">Sent automatically on behalf of the organizer by the meeting recording consent tool.</p>'
+        + '</body></html>';
 }
 
 
-// ---------------------------------------------------------------------------
-// Message Text (plain text, Meet's chat links URLs automatically)
-// ---------------------------------------------------------------------------
-
-/** The consent question the bot posts after joining. */
-function buildGreetingText_(state, webAppUrl) {
-    const domain = state.organizerEmail.split('@')[1];
-    const purpose = (getScriptProperties_().getProperty(RECORDING_PURPOSE_KEY) || '').trim();
-    const policyUrl = (getScriptProperties_().getProperty(POLICY_URL_KEY) || '').trim();
-
-    const lines = [];
-    lines.push('👋 Hi, I am the recording consent bot. I do not record or listen to anything.');
-    lines.push('🎥 "' + state.meetingTitle + '" may be recorded' + (purpose ? ' ' + purpose : '') + '.');
-    lines.push('Do you consent to being recorded? Please answer here: ' + buildPollUrl_(webAppUrl, state));
-    lines.push('Saying no has no disadvantages for you. External guests: the link only works for ' + domain
-        + ' accounts, please answer in this chat.');
-    if (policyUrl) {
-        lines.push('Recording policy: ' + policyUrl);
-    }
-    return lines.join('\n');
+/** Summary lists: [{label, people: ['Name <email>', ...]}] */
+function summaryLists_(state) {
+    const label = (email, entry) => entry.n ? entry.n + ' <' + email + '>' : email;
+    const current = currentAttendees_(state);
+    return [
+        {label: 'Do NOT consent', people: current.filter(([, e]) => e.c === false).map(([m, e]) => label(m, e))},
+        {label: 'Consented', people: current.filter(([, e]) => e.c === true).map(([m, e]) => label(m, e))},
+        {label: 'No answer yet', people: current.filter(([, e]) => e.c !== true && e.c !== false).map(([m, e]) => label(m, e))}
+    ];
 }
 
 
-/** The summary the bot posts before leaving (kept up to date on every response). */
-function buildTallyText_(state, webAppUrl) {
-    const counts = countResponses_(state);
-    const lines = [];
-    lines.push('📋 Recording consent for "' + state.meetingTitle + '": ' + counts.responded + '/' + counts.invited
-        + ' responded, ' + counts.consented + ' consented, ' + counts.declined + ' declined.');
+/** The verdict line of a summary. */
+function summaryVerdict_(state) {
+    const counts = countAnswers_(state);
     if (counts.declined > 0) {
-        lines.push('❌ At least one participant does not consent. Please do not record this meeting.');
-    } else if (counts.allConsented) {
-        lines.push('✅ All invited participants consented.');
-    } else {
-        lines.push('⏳ Not everyone answered yet: please only record with everyone\'s consent.');
+        return 'At least one attendee does NOT consent: do not record, transcribe or take AI notes of this meeting.';
     }
-    lines.push('You can still answer or change your answer: ' + buildPollUrl_(webAppUrl, state));
-    lines.push('👋 Bye!');
+    if (counts.pending > 0) {
+        return 'Not everyone answered yet: only record if everyone present consented (ask in the meeting and make sure '
+            + 'they answer via their link).';
+    }
+    return 'All invited attendees consented.';
+}
+
+
+function recOffLine_(state) {
+    return state.recOff ? 'Automatic ' + state.recOff.off.join(', ') + ' was switched off on '
+        + formatMeetingTime_(new Date(state.recOff.at).toISOString(), state.tz) + ' because an attendee objected. '
+        + 'Do not switch it on again.' : '';
+}
+
+
+function buildSummaryText_(context, state, kind) {
+    const counts = countAnswers_(state);
+    const lines = [
+        (kind === 'summary' ? 'Recording consent summary' : 'Updated recording consent') + ' for "' + state.title + '" on '
+        + formatMeetingTime_(state.start, state.tz) + ':',
+        '',
+        counts.invited + ' attendees asked: ' + counts.consented + ' consented, ' + counts.declined + ' do not consent, '
+        + counts.pending + ' did not answer.',
+        summaryVerdict_(state)
+    ];
+    if (state.recOff) {
+        lines.push(recOffLine_(state));
+    }
+    for (const list of summaryLists_(state)) {
+        lines.push('', list.label + ' (' + list.people.length + '):', ...list.people.map(p => '- ' + p));
+    }
+    lines.push('',
+        'Guests joining without being on the invitation were not asked: ask them before recording, or add them to the event '
+        + '(they get their own link with the next run).',
+        'Please keep this list confidential: attendees were told that saying no has no disadvantages for them.',
+        'Every answer is documented in the consent log. You get an update email when answers change before the meeting ends.');
     return lines.join('\n');
 }
 
 
-/** Count responses (responders not on the invite, e.g. forwarded invitations, count towards the total). */
-function countResponses_(state) {
-    const responses = state?.responses || {};
-    const attendees = state?.attendees || [];
-    const emails = Object.keys(responses);
-    const consented = emails.filter(email => responses[email].consent).length;
-    const invited = attendees.length + emails.filter(email => !attendees.includes(email)).length;
-    return {
-        invited: invited,
-        responded: emails.length,
-        consented: consented,
-        declined: emails.length - consented,
-        allConsented: invited > 0 && attendees.every(email => responses[email]?.consent) && consented === emails.length
-    };
+function buildSummaryHtml_(context, state, kind) {
+    const counts = countAnswers_(state);
+    let html = '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#222">'
+        + '<p>' + (kind === 'summary' ? 'Recording consent summary' : 'Updated recording consent') + ' for <b>'
+        + escapeHtml_(state.title) + '</b> on ' + escapeHtml_(formatMeetingTime_(state.start, state.tz)) + ':</p>'
+        + '<p>' + counts.invited + ' attendees asked: ' + counts.consented + ' consented, ' + counts.declined
+        + ' do not consent, ' + counts.pending + ' did not answer.</p>'
+        + '<p><b>' + escapeHtml_(summaryVerdict_(state)) + '</b></p>'
+        + (state.recOff ? '<p>' + escapeHtml_(recOffLine_(state)) + '</p>' : '');
+    for (const list of summaryLists_(state)) {
+        html += '<p>' + escapeHtml_(list.label) + ' (' + list.people.length + '):</p>'
+            + (list.people.length ? '<ul>' + list.people.map(p => '<li>' + escapeHtml_(p) + '</li>').join('') + '</ul>' : '');
+    }
+    return html + '<p style="color:#666">Guests joining without being on the invitation were not asked: ask them before '
+        + 'recording, or add them to the event. Please keep this list confidential: attendees were told that saying no '
+        + 'has no disadvantages for them. Every answer is documented in the consent log. You get an update email when answers '
+        + 'change before the meeting ends.</p></body></html>';
 }
 
 
-/** Build the link to the poll page. */
-function buildPollUrl_(webAppUrl, state) {
-    return webAppUrl + UrlFetchJsonClient.buildQuery({
-        [PARAM_EVENT]: state.eventId,
-        [PARAM_TOKEN]: state.token
-    });
+/** Objection notice lines (without the objector's name, the summary/update lists names). */
+function objectionLines_(state, result, reason) {
+    const lines = [];
+    lines.push(reason === 'reenabled'
+        ? 'Automatic recording, transcription or notes were switched on again for "' + state.title + '" on '
+        + formatMeetingTime_(state.start, state.tz) + ', although an attendee does not consent to being recorded.'
+        : 'An attendee of "' + state.title + '" on ' + formatMeetingTime_(state.start, state.tz)
+        + ' does not consent to being recorded.');
+    lines.push('Do not record, transcribe or take AI notes of this meeting.');
+    if (result.disabled.length) {
+        lines.push('Automatic ' + result.disabled.join(', ') + ' of the Meet space was switched off. Do not switch it on again.');
+    } else if (result.failed) {
+        lines.push('Automatic recording/transcription/notes could NOT be switched off automatically. Please check the meeting '
+            + 'settings yourself (Google Calendar > event > Meet video conferencing settings).');
+    } else if (result.attempted) {
+        lines.push('Automatic recording, transcription and notes are not switched on for the Meet space.');
+    }
+    if (state.recOff && !result.disabled.length) {
+        lines.push(recOffLine_(state));
+    }
+    lines.push('Who answered what is listed in the summary sent before the meeting (and its updates) and documented in the consent log.');
+    return lines;
 }
 
 
-/** Resolve a display name for an email from the state. */
-function displayName_(state, email) {
-    return (state.responses?.[email]?.name) || (state.names?.[email]) || email;
+function buildObjectionText_(context, state, result, reason) {
+    return objectionLines_(state, result, reason).join('\n\n');
+}
+
+
+function buildObjectionHtml_(context, state, result, reason) {
+    return '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#222">'
+        + objectionLines_(state, result, reason).map(line => '<p>' + escapeHtml_(line) + '</p>').join('')
+        + '</body></html>';
+}
+
+
+/** The generic (non-personal) notice for the event description. */
+function buildCalendarNotice_(context) {
+    return NOTICE_MARKER + ' this meeting may be recorded, transcribed or summarized with AI notes'
+        + purposeClause_(context) + '. Every attendee gets a personal email from ' + context.config.senderEmail
+        + ' asking for consent. Saying no has no disadvantages; if anyone objects, the meeting must not be recorded.'
+        + (context.config.policyUrl ? ' Recording policy: ' + context.config.policyUrl : '');
 }
 
 
@@ -613,113 +1168,160 @@ function displayName_(state, email) {
 // Web App: Response Handling
 // ---------------------------------------------------------------------------
 
-/** Web app entry point: shows the question, the answer buttons and the current status.
+/** Web app entry point: shows the question, the answer buttons and the respondent's answer.
  *
- * Deployment: execute as the deploying user, access restricted to the domain, so that
- * Session.getActiveUser().getEmail() identifies the responding person.
+ * Deployment: execute as the deploying user, access for anyone (including anonymous users), since external
+ * attendees have no company account. The respondent is identified by the personal link (event ID + token)
+ * that was emailed to their address only.
  *
  * Query parameters: e=<eventId>, t=<token>. Answers are submitted with the buttons (submitConsent()),
- * never by just opening a link, so link previews or crafted links can not record an answer.
+ * never by just opening a link, so link previews or link scanners can not record an answer.
  */
 function doGet(e) {
     const params = (e && e.parameter) || {};
-    const eventId = params[PARAM_EVENT] || '';
-    const token = params[PARAM_TOKEN] || '';
+    const eventId = '' + (params[PARAM_EVENT] || '');
+    const token = '' + (params[PARAM_TOKEN] || '');
 
-    const state = eventId && token ? loadState_(eventId) : null;
-    if (!state || state.token !== token) {
-        return renderPage_('<p>This consent poll is no longer active or the link is invalid.</p>');
+    const found = findRespondent_(eventId, token);
+    if (!found) {
+        return renderPage_('<p>This consent poll link is invalid or the poll is no longer available. '
+            + 'If you have questions, please contact the meeting organizer.</p>');
     }
 
-    return renderPage_(buildQuestionHtml_(state) + '<div id="result">'
-        + buildStatusHtml_(state, getActiveUserEmail_()) + '</div>', {eventId: eventId, token: token});
+    const state = found.state;
+    const open = isPollOpen_(state, Date.now());
+    return renderPage_(buildQuestionHtml_(state, open) + '<div id="result">' + buildStatusHtml_(state, found.email) + '</div>',
+        open ? {eventId: eventId, token: token} : null);
 }
 
 
-/** Called from the web app page (google.script.run): records the answer of the signed in user, returns HTML. */
+/** Called from the web app page (google.script.run): records the answer of the link's owner, returns HTML. */
 function submitConsent(eventId, token, consent) {
-    const userEmail = getActiveUserEmail_();
-    if (typeof eventId !== 'string' || typeof token !== 'string' || typeof consent !== 'boolean') {
+    if (typeof eventId !== 'string' || typeof token !== 'string' || typeof consent !== 'boolean'
+        || eventId.length > 1024 || token.length > 100) {
         throw new Error('Invalid request');
     }
-    if (!userEmail) {
-        return '<p class="no">Could not determine your identity. Please open the link in a browser signed in with your '
-            + 'company account.</p>';
+
+    let result;
+    try {
+        result = recordResponse_(eventId, token, consent, getActiveUserEmail_());
+    } catch (e) {
+        Logger.log('Failed to record an answer for event %s: %s', eventId, e);
+        throw new Error('Your answer could not be documented, so it was not recorded. Please try again later or contact '
+            + 'the organizer.');
     }
 
-    const updated = recordResponse_(eventId, token, userEmail, consent);
-    if (!updated) {
-        return '<p class="no">This consent poll is no longer active or the link is invalid.</p>';
+    if (result.status === 'invalid') {
+        return '<p class="no">This consent poll link is invalid or the poll is no longer available.</p>';
+    }
+    if (result.status === 'closed') {
+        return '<p class="no">This poll is closed. To change or withdraw your answer, please contact the organizer '
+            + escapeHtml_(result.state.org) + '.</p>';
     }
 
     let notice = '';
-    try {
-        notifyBot_(updated.previous, updated.state);
-    } catch (err) {
-        Logger.log('Failed to notify the bot about a response for event %s: %s', eventId, err);
-        notice = consent ? '' : '<p class="muted">Your response was recorded, but the bot could not inform the meeting. '
-            + 'Please tell the organizer.</p>';
+    if (result.newObjection) {
+        try {
+            enforceObjection_(createContext_(loadConfig_()), eventId, null, 'objection');
+        } catch (e) {
+            Logger.log('Failed to handle the objection for event %s right away (retried later): %s', eventId, e);
+            notice = '<p class="muted">The organizer will be notified shortly.</p>';
+        }
     }
 
     const headline = consent
-        ? '<p class="ok">✅ Thank you, your consent has been recorded. You can withdraw it on this page for the next two days, later please contact the organizer.</p>'
-        : '<p class="no">❌ Thank you, your objection has been recorded. The meeting is informed (without your name).</p>';
+        ? '<p class="ok">Thank you, your consent has been recorded. You can withdraw it on this page until the meeting ends.</p>'
+        : '<p class="no">Thank you, your objection has been recorded. The organizer is notified and the meeting must not be '
+        + 'recorded.</p>';
 
-    return headline + notice + buildStatusHtml_(updated.state, userEmail);
+    return headline + notice + buildStatusHtml_(result.state, result.email);
 }
 
 
-/** The email of the person using the web app (lower case), or '' if unknown. */
+/** Find the poll and the attendee a personal link belongs to, null if invalid. */
+function findRespondent_(eventId, token) {
+    if (!eventId || !token) {
+        return null;
+    }
+    const state = loadState_(eventId);
+    const email = findAttendeeByToken_(state, token);
+    return email ? {state: state, email: email} : null;
+}
+
+
+function findAttendeeByToken_(state, token) {
+    if (!state || state.v !== STATE_VERSION || !token) {
+        return null;
+    }
+    return Object.keys(state.att || {}).find(email => state.att[email].t === token) || null;
+}
+
+
+/** The email of the signed in person using the web app (lower case), or '' if unknown (anonymous/external). */
 function getActiveUserEmail_() {
     try {
         return (Session.getActiveUser().getEmail() || '').toLowerCase();
     } catch (err) {
-        Logger.log('Failed to determine active user: %s', err);
         return '';
     }
 }
 
 
-/** Record a response under a script lock and document it, returns {previous, state} or null if the poll is gone. */
-function recordResponse_(eventId, token, userEmail, consent) {
-    let previous = null;
-    const state = updateState_(eventId, state => {
-        if (!state || state.token !== token) {
+/** Record an answer under the script lock, documenting it first.
+ *
+ * @return {{status: string, state: Object, email: string, newObjection: boolean}} status is 'ok', 'closed' or 'invalid'
+ */
+function recordResponse_(eventId, token, consent, signedInAs) {
+    const result = {status: 'invalid', state: null, email: null, newObjection: false};
+    updateState_(eventId, state => {
+        const email = findAttendeeByToken_(state, token);
+        if (!email) {
             return null;
         }
-        previous = JSON.parse(JSON.stringify(state));
-        const response = {
-            consent: consent,
-            name: state.names?.[userEmail] || userEmail,
-            respondedAt: Date.now()
-        };
+        result.email = email;
+        result.state = state;
+        if (!isPollOpen_(state, Date.now())) {
+            result.status = 'closed';
+            return null;
+        }
+
+        const entry = state.att[email];
+        const previous = entry.c;
+        const now = Date.now();
 
         // Document first: an answer that can not be documented is not recorded either (the user sees an error)
-        appendConsentLog_(state, userEmail, response, previous.responses?.[userEmail]);
+        appendConsentLog_(state, email, entry, consent, previous, now, signedInAs);
 
-        state.responses = state.responses || {};
-        state.responses[userEmail] = response;
+        entry.c = consent;
+        entry.a = now;
+        if (!consent && previous !== false) {
+            state.objPending = now;
+            result.newObjection = true;
+        }
+        result.status = 'ok';
         return state;
     });
-    return state ? {previous: previous, state: state} : null;
+    return result;
 }
 
 
-/** Append a response to the consent log spreadsheet (the durable documentation, kept after the poll state is gone). */
-function appendConsentLog_(state, userEmail, response, previousResponse) {
-    const previousAnswer = !previousResponse ? '' : (previousResponse.consent ? 'consent' : 'no consent');
+/** Append an answer to the consent log spreadsheet (the durable documentation, kept after the poll state is gone). */
+function appendConsentLog_(state, email, entry, consent, previous, respondedAt, signedInAs) {
+    const answer = c => c === true ? 'consent' : c === false ? 'no consent' : '';
     getConsentLogSheet_().appendRow([
-        new Date(response.respondedAt),
-        userEmail,
-        response.name,
-        response.consent ? 'consent' : 'no consent',
-        state.meetingTitle,
-        state.meetingTime ? new Date(state.meetingTime) : '',
-        state.meetingUri || '',
-        state.organizerEmail,
-        state.eventId,
-        previousAnswer
-    ].map(value => typeof value === 'string' && /^[=+\-@]/.test(value) ? "'" + value : value));   // no formula injection
+        new Date(respondedAt),
+        email,
+        entry.n || '',
+        answer(consent),
+        state.title,
+        new Date(state.start),
+        state.uri || '',
+        state.org,
+        state.id,
+        answer(previous),
+        'personal link emailed to the respondent' + (entry.i ? ' on ' + new Date(entry.i).toISOString() : ''),
+        signedInAs || ''
+    ].map(value => typeof value === 'string' && /^[=+\-@\t\r]/.test(value) ? "'" + value : value));   // no formula injection
 }
 
 
@@ -740,54 +1342,52 @@ function getConsentLogSheet_() {
 }
 
 
-/** Render the question with the answer buttons. */
-function buildQuestionHtml_(state) {
+/** Render the question (with the answer buttons while the poll is open). */
+function buildQuestionHtml_(state, open) {
     const purpose = (getScriptProperties_().getProperty(RECORDING_PURPOSE_KEY) || '').trim();
     const policyUrl = (getScriptProperties_().getProperty(POLICY_URL_KEY) || '').trim();
 
     // HtmlService pages run in an iframe, links must navigate the top window
-    return '<h2>' + escapeHtml_(state.meetingTitle) + '</h2>'
-        + '<p class="muted">' + escapeHtml_(formatMeetingTime_(state.meetingTime)) + '</p>'
-        + '<p>This meeting may be recorded' + (purpose ? ' ' + escapeHtml_(purpose) : '') + '. '
-        + 'Do you consent to being recorded? Saying no has no disadvantages for you. '
-        + 'You can change your answer on this page for two days after the meeting was scheduled.'
+    let html = '<h2>' + escapeHtml_(state.title) + '</h2>'
+        + '<p class="muted">' + escapeHtml_(formatMeetingTime_(state.start, state.tz)) + ', organized by '
+        + escapeHtml_(state.org) + '</p>'
+        + '<p>This meeting may be recorded, transcribed or summarized with AI notes' + (purpose ? ' ' + escapeHtml_(purpose) : '')
+        + '. Do you consent? Saying no has no disadvantages for you. If anyone objects, the meeting must not be recorded.'
         + (policyUrl ? ' See the <a target="_top" href="' + escapeHtml_(policyUrl) + '">recording policy</a>.' : '')
-        + '</p><p>'
-        + '<button class="button ok" onclick="answer(true)">✅ I consent</button> '
-        + '<button class="button no" onclick="answer(false)">❌ I do not consent</button>'
+        + '</p>';
+
+    if (state.cancelled) {
+        return html + '<p class="no">This meeting was cancelled, the poll is closed.</p>';
+    }
+    if (!open) {
+        return html + '<p class="no">This poll is closed. To change or withdraw your answer, please contact the organizer '
+            + escapeHtml_(state.org) + '.</p>';
+    }
+    return html + '<p class="muted">You can change or withdraw your answer on this page until the meeting ends.</p><p>'
+        + '<button class="button ok" onclick="answer(true)">I consent</button> '
+        + '<button class="button no" onclick="answer(false)">I do not consent</button>'
         + '</p>';
 }
 
 
-/** Render the status part of the web app page. */
-function buildStatusHtml_(state, userEmail) {
-    const responses = state.responses || {};
-    const attendees = state.attendees || [];
-    const rows = [];
-
-    const all = attendees.slice();
-    for (const email of Object.keys(responses)) {
-        if (!all.includes(email)) {
-            all.push(email);
-        }
-    }
-
-    for (const email of all) {
-        const resp = responses[email];
-        const status = !resp ? '⏳ pending' : (resp.consent ? '✅ consented' : '❌ declined');
-        const me = email === userEmail ? ' <span class="muted">(you)</span>' : '';
-        rows.push('<tr><td>' + escapeHtml_(displayName_(state, email)) + me + '</td><td>' + status + '</td></tr>');
-    }
-
-    return '<p>' + Object.keys(responses).length + '/' + all.length + ' responded</p>'
-        + '<table>' + rows.join('') + '</table>';
+/** Render the respondent's own answer and the aggregate counts (never other attendees' names or answers). */
+function buildStatusHtml_(state, email) {
+    const entry = state.att[email] || {};
+    const counts = countAnswers_(state);
+    const own = entry.c === true ? '<span class="ok">you consent</span>'
+        : entry.c === false ? '<span class="no">you do not consent</span>' : 'not answered yet';
+    return '<p>Your answer (' + escapeHtml_(email) + '): ' + own
+        + (entry.a ? ' <span class="muted">(' + escapeHtml_(formatMeetingTime_(new Date(entry.a).toISOString(), state.tz))
+            + ')</span>' : '') + '</p>'
+        + '<p class="muted">All attendees: ' + (counts.consented + counts.declined) + ' of ' + counts.invited + ' answered, '
+        + counts.consented + ' consent, ' + counts.declined + ' do not consent.</p>';
 }
 
 
 /** Wrap body HTML into a minimal page, with poll = {eventId, token} including the answer script. */
 function renderPage_(bodyHtml, poll) {
     const title = 'Recording Consent';
-    // answer() submits via google.script.run (a POST as the signed in user) and shows the result
+    // answer() submits via google.script.run (a POST) and shows the result
     const script = !poll ? '' : '<script>const poll = ' + JSON.stringify(poll).replace(/</g, '\\u003c') + ';'
         + 'function answer(consent) {'
         + '  const result = document.getElementById("result");'
@@ -802,8 +1402,7 @@ function renderPage_(bodyHtml, poll) {
     const html = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
         + '<title>' + title + '</title>'
         + '<style>body{font-family:system-ui,sans-serif;max-width:40em;margin:2em auto;padding:0 1em;color:#222}'
-        + 'table{border-collapse:collapse}td{padding:.25em .75em .25em 0}.ok{color:#1b7f3b;font-weight:bold}'
-        + '.no{color:#b3261e;font-weight:bold}.muted{color:#666}'
+        + '.ok{color:#1b7f3b;font-weight:bold}.no{color:#b3261e;font-weight:bold}.muted{color:#666}'
         + '.button{display:inline-block;padding:.5em 1em;margin:0 .5em .5em 0;border:2px solid;border-radius:.5em;'
         + 'background:#fff;font:inherit;cursor:pointer}.button:disabled{opacity:.5;cursor:wait}</style>' + script + '</head>'
         + '<body><h1>' + title + '</h1>' + bodyHtml + '</body></html>';
@@ -825,29 +1424,72 @@ function escapeHtml_(text) {
 // ---------------------------------------------------------------------------
 // State Management
 // ---------------------------------------------------------------------------
+//
+// One ScriptProperties entry per event ('state.<eventId>'), compact JSON (split into 'chunk.<eventId>.<n>' if large):
+//   {v, id, org, title, start, end, tz, uri, code, space, createdAt, active, why, cancelled,
+//    att: {<email>: {t: token, n: name, i: invitedAt, c: consent (true/false), a: answeredAt, x: 1 if removed}},
+//    noticeAt, summaryAt, sumSig, objPending, offFailed, recOff: {at, off: [labels]}}
 
-/** Load consent poll state from ScriptProperties. */
-function loadState_(eventId) {
-    const raw = getScriptProperties_().getProperty(STATE_KEY_PREFIX + eventId);
-    if (!raw) {
-        return null;
-    }
+/** A new unguessable personal token (122 random bits from a secure random UUID). */
+function newToken_() {
+    return Utilities.getUuid().replace(/-/g, '');
+}
+
+
+/** Parse a serialized state, null if malformed or of another version. */
+function parseState_(raw) {
     try {
-        return JSON.parse(raw);
+        const state = raw ? JSON.parse(raw) : null;
+        return state && state.v === STATE_VERSION ? state : null;
     } catch (e) {
-        Logger.log('Failed to parse state for event %s: %s', eventId, e);
         return null;
     }
 }
 
-/** Update consent poll state under a script lock: updater(state or null) returns the new state (null: no change). */
+
+/** The event IDs of all stored poll states. */
+function listStateIds_() {
+    return Object.keys(getScriptProperties_().getProperties() || {})
+        .filter(key => key.startsWith(STATE_KEY_PREFIX))
+        .map(key => key.substring(STATE_KEY_PREFIX.length));
+}
+
+
+function chunkKey_(eventId, index) {
+    return CHUNK_KEY_PREFIX + eventId + '.' + index;
+}
+
+
+/** The number of parts of a stored state value (0 if not split). */
+function chunkCount_(value) {
+    return (value || '').startsWith(CHUNKED_MARKER) ? (+value.substring(CHUNKED_MARKER.length) || 0) : 0;
+}
+
+
+/** Load poll state from ScriptProperties (joining the parts of a split state), null if missing or malformed. */
+function loadState_(eventId) {
+    const properties = getScriptProperties_();
+    const value = properties.getProperty(STATE_KEY_PREFIX + eventId);
+    const chunks = chunkCount_(value);
+    if (!chunks) {
+        return parseState_(value);
+    }
+    const parts = [];
+    for (let i = 0; i < chunks; ++i) {
+        parts.push(properties.getProperty(chunkKey_(eventId, i)) || '');
+    }
+    return parseState_(parts.join(''));
+}
+
+
+/** Update poll state under a script lock: updater(state or null) returns the new state (null: no change). */
 function updateState_(eventId, updater) {
     const lock = LockService.getScriptLock();
     lock.waitLock(15000);
     try {
         const state = updater(loadState_(eventId));
         if (state) {
-            getScriptProperties_().setProperty(STATE_KEY_PREFIX + eventId, JSON.stringify(state));
+            writeState_(eventId, state);
         }
         return state;
     } finally {
@@ -855,25 +1497,99 @@ function updateState_(eventId, updater) {
     }
 }
 
-/** Clean up state entries older than STATE_MAX_AGE_MS. */
-function cleanupOldState_() {
-    const now = Date.now();
-    const properties = getScriptProperties_().getProperties() || {};
 
-    for (const key in properties) {
-        if (key.startsWith(STATE_KEY_PREFIX)) {
-            try {
-                const state = JSON.parse(properties[key]);
-                const createdAt = state.createdAt || state.pollSentAt;
-                if (!createdAt || (now - createdAt) > STATE_MAX_AGE_MS) {
-                    getScriptProperties_().deleteProperty(key);
-                    Logger.log('Cleaned up old state: %s', key);
-                }
-            } catch (e) {
-                // Malformed state, clean it up
+/** Store poll state, split into parts if it exceeds the ScriptProperties value size limit (call with the script lock). */
+function writeState_(eventId, state) {
+    const properties = getScriptProperties_();
+    const json = JSON.stringify(state);
+    const previousChunks = chunkCount_(properties.getProperty(STATE_KEY_PREFIX + eventId));
+
+    const values = {};
+    let chunks = 0;
+    if (Util.calculateUtf8Size(json) <= MAX_STATE_BYTES) {
+        values[STATE_KEY_PREFIX + eventId] = json;
+    } else {
+        const parts = splitUtf8_(json, MAX_STATE_BYTES);
+        if (parts.length > MAX_STATE_CHUNKS) {
+            throw new Error('Poll state of event ' + eventId + ' (' + state.title + ') too large ('
+                + Object.keys(state.att || {}).length + ' attendees)');
+        }
+        parts.forEach((part, i) => values[chunkKey_(eventId, i)] = part);
+        values[STATE_KEY_PREFIX + eventId] = CHUNKED_MARKER + parts.length;
+        chunks = parts.length;
+    }
+
+    properties.setProperties(values, false);
+    for (let i = chunks; i < previousChunks; ++i) {
+        properties.deleteProperty(chunkKey_(eventId, i));
+    }
+}
+
+
+/** Delete a poll state (with all its parts). */
+function deleteState_(eventId) {
+    const properties = getScriptProperties_();
+    const chunks = chunkCount_(properties.getProperty(STATE_KEY_PREFIX + eventId));
+    properties.deleteProperty(STATE_KEY_PREFIX + eventId);
+    for (let i = 0; i < chunks; ++i) {
+        properties.deleteProperty(chunkKey_(eventId, i));
+    }
+}
+
+
+/** Split text into parts of at most maxBytes UTF-8 bytes (never splitting a character). */
+function splitUtf8_(text, maxBytes) {
+    const parts = [];
+    let part = '';
+    let size = 0;
+    for (const c of text) {
+        const charSize = Util.calculateUtf8Size(c);
+        if (size + charSize > maxBytes) {
+            parts.push(part);
+            part = '';
+            size = 0;
+        }
+        part += c;
+        size += charSize;
+    }
+    if (part) {
+        parts.push(part);
+    }
+    return parts;
+}
+
+
+/** Delete poll state a day after the meeting ended (and malformed/outdated entries), warn about the size limit. */
+function cleanupOldState_(now) {
+    const lock = LockService.getScriptLock();
+    lock.waitLock(15000);
+    try {
+        for (const eventId of listStateIds_()) {
+            const state = loadState_(eventId);
+            const end = state ? new Date(state.end).getTime() : NaN;
+            if (!state || !(now <= end + STATE_RETENTION_AFTER_END_MS)) {
+                deleteState_(eventId);
+                Logger.log('Cleaned up poll state of event %s', eventId);
+            }
+        }
+
+        // parts left behind (e.g. a failed write)
+        const properties = getScriptProperties_().getProperties() || {};
+        for (const key of Object.keys(properties)) {
+            const match = key.startsWith(CHUNK_KEY_PREFIX) && key.substring(CHUNK_KEY_PREFIX.length).match(/^(.*)\.(\d+)$/);
+            if (match && !(+match[2] < chunkCount_(properties[STATE_KEY_PREFIX + match[1]]))) {
                 getScriptProperties_().deleteProperty(key);
             }
         }
+    } finally {
+        lock.releaseLock();
+    }
+
+    const properties = getScriptProperties_().getProperties() || {};
+    const totalBytes = Object.keys(properties)
+        .reduce((sum, key) => sum + Util.calculateUtf8Size(key) + Util.calculateUtf8Size(properties[key] || ''), 0);
+    if (totalBytes > PROPERTIES_WARN_BYTES) {
+        Logger.log('WARNING: script properties use %s bytes, the limit is 500 KB', '' + totalBytes);
     }
 }
 
@@ -889,6 +1605,33 @@ function getScriptProperties_() {
         throw new Error('ScriptProperties not accessible');
     }
     return scriptProperties;
+}
+
+/** Load and validate the configuration from the script properties. */
+function loadConfig_() {
+    const properties = getScriptProperties_();
+    const get = key => (properties.getProperty(key) || '').trim();
+    const list = key => get(key).split(',').map(v => v.trim()).filter(v => !!v);
+
+    const senderEmail = get(SENDER_EMAIL_KEY).toLowerCase();
+    if (!isValidEmail_(senderEmail)) {
+        throw new Error('Sender account not configured, set ' + SENDER_EMAIL_KEY);
+    }
+
+    return {
+        allowedDomains: list(ALLOWED_DOMAINS_KEY),
+        emailWhiteList: list(EMAIL_WHITELIST_KEY),
+        lookaheadHours: getPositiveIntProperty_(LOOKAHEAD_HOURS_KEY, 24),
+        summaryMinutes: getPositiveIntProperty_(SUMMARY_MINUTES_KEY, 15),
+        minAttendees: getPositiveIntProperty_(MIN_ATTENDEES_KEY, 2),
+        joinMode: get(JOIN_MODE_KEY).toLowerCase() === 'all' ? 'all' : 'recorded',
+        senderEmail: senderEmail,
+        calendarNotice: getBooleanProperty_(CALENDAR_NOTICE_KEY, true),
+        disableRecording: getBooleanProperty_(DISABLE_RECORDING_KEY, true),
+        recordingPurpose: get(RECORDING_PURPOSE_KEY),
+        policyUrl: get(POLICY_URL_KEY),
+        webAppUrl: getWebAppUrl_()
+    };
 }
 
 /** Get the service account credentials. */
@@ -908,27 +1651,6 @@ function getPersonioCreds_() {
     return {clientId: credentialFields[0], clientSecret: credentialFields[1]};
 }
 
-/** Get the email account white-list (optional, leave empty to process all suitable accounts). */
-function getEmailWhiteList_() {
-    return (getScriptProperties_().getProperty(EMAIL_WHITELIST_KEY) || '').trim()
-        .split(',').map(email => email.trim()).filter(email => !!email);
-}
-
-/** Get the lookahead minutes or the default (15 minutes). */
-function getLookaheadMinutes_() {
-    return getPositiveIntProperty_(LOOKAHEAD_MINUTES_KEY, 15);
-}
-
-/** Get the minimum number of attendees or the default (2). */
-function getMinAttendees_() {
-    return getPositiveIntProperty_(MIN_ATTENDEES_KEY, 2);
-}
-
-/** Get the minutes the bot stays in a meeting or the default (10 minutes). */
-function getStayMinutes_() {
-    return getPositiveIntProperty_(STAY_MINUTES_KEY, 10);
-}
-
 /** Read a positive integer property, else the default. */
 function getPositiveIntProperty_(key, defaultValue) {
     const raw = (getScriptProperties_().getProperty(key) || '').trim();
@@ -939,26 +1661,16 @@ function getPositiveIntProperty_(key, defaultValue) {
     return value;
 }
 
-/** Get the join mode ('recorded' or 'all', default 'recorded'). */
-function getJoinMode_() {
-    const mode = (getScriptProperties_().getProperty(JOIN_MODE_KEY) || '').trim().toLowerCase();
-    return mode === 'all' ? 'all' : 'recorded';
-}
-
-/** Get the bot control API base URL and secret, throws if not configured. */
-function getBotConfig_() {
-    const url = (getScriptProperties_().getProperty(BOT_URL_KEY) || '').trim().replace(/\/+$/, '');
-    const secret = (getScriptProperties_().getProperty(BOT_SECRET_KEY) || '').trim();
-    if (!url.startsWith('https://') || secret.length < 32) {
-        throw new Error('Bot not configured, set ' + BOT_URL_KEY + ' (https://...) and ' + BOT_SECRET_KEY + ' (32+ characters)');
+/** Read a boolean property ('true'/'false', 'yes'/'no', '1'/'0', 'on'/'off'), else the default. */
+function getBooleanProperty_(key, defaultValue) {
+    const raw = (getScriptProperties_().getProperty(key) || '').trim().toLowerCase();
+    if (['true', 'yes', '1', 'on'].includes(raw)) {
+        return true;
     }
-    return {url: url, secret: secret};
-}
-
-/** Get the bot account email ('' if not configured). */
-function getBotEmail_() {
-    const configured = (getScriptProperties_().getProperty(BOT_EMAIL_KEY) || '').trim().toLowerCase();
-    return configured;
+    if (['false', 'no', '0', 'off'].includes(raw)) {
+        return false;
+    }
+    return defaultValue;
 }
 
 /** Get the web app URL (property override, else the deployed web app URL, else null). */
@@ -975,14 +1687,16 @@ function getWebAppUrl_() {
     }
 }
 
-/** Format a meeting time for display. */
-function formatMeetingTime_(isoTime) {
+/** Format a meeting time in the event's time zone (else the script's) and UTC, e.g. 'Tue, 17 Nov 2026 10:00 Europe/Berlin (09:00 UTC)'. */
+function formatMeetingTime_(isoTime, timeZone) {
     if (!isoTime) {
         return '(Unknown time)';
     }
     try {
         const date = new Date(isoTime);
-        return Utilities.formatDate(date, Session.getScriptTimeZone(), 'EEE, dd MMM yyyy HH:mm');
+        const tz = timeZone || Session.getScriptTimeZone();
+        const local = Utilities.formatDate(date, tz, 'EEE, d MMM yyyy HH:mm') + ' ' + tz;
+        return tz === 'UTC' || tz === 'Etc/UTC' ? local : local + ' (' + Utilities.formatDate(date, 'UTC', 'HH:mm') + ' UTC)';
     } catch (e) {
         return isoTime;
     }
