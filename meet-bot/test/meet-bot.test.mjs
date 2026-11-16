@@ -150,6 +150,24 @@ test('scheduled sessions can be rescheduled and cancelled, failures are reported
 });
 
 
+test('messages received before joining survive rescheduling and follow the greeting', async () => {
+    const driver = new FakeDriver();
+    const sessions = new SessionManager({driver, pollIntervalMs: 10, log: quiet});
+    const meetingUri = 'https://meet.google.com/abc-defg-hij';
+    const leaveAt = new Date(Date.now() + 200).toISOString();
+
+    sessions.upsert(parseSessionSpec('e1', {meetingUri, joinAt: new Date(Date.now() + 60000).toISOString(), greeting: 'old'}));
+    sessions.update('e1', {say: 'someone objected'});
+    // the next trigger run re-sends the (now earlier) spec
+    sessions.upsert(parseSessionSpec('e1', {meetingUri, leaveAt, greeting: 'hello', farewell: 'bye'}));
+    assert.equal(sessions.get('e1').pendingMessages, 1);
+
+    await sleep(300);
+    assert.equal(sessions.get('e1').state, 'left');
+    assert.deepEqual(driver.said, ['hello', 'someone objected', 'bye']);
+});
+
+
 test('chat messages are split at line boundaries below the Meet limit', () => {
     assert.deepEqual(splitChatMessage('a\nb', 10), ['a\nb']);
     assert.deepEqual(splitChatMessage('aaaa\nbbbb\ncccc', 9), ['aaaa\nbbbb', 'cccc']);
@@ -189,7 +207,7 @@ test('API authenticates and routes requests', async () => {
         assert.equal((await call('PATCH', '/v1/sessions/missing', {say: 'x'})).status, 404);
 
         const list = await (await call('GET', '/v1/sessions')).json();
-        assert.deepEqual(list.sessions.map(s => [s.id, s.pendingMessages]), [['e1', 2]]);
+        assert.deepEqual(list.sessions.map(s => [s.id, s.pendingMessages]), [['e1', 1]]);   // the greeting is posted on joining, not queued
 
         assert.equal((await (await call('DELETE', '/v1/sessions/e1')).json()).state, 'cancelled');
     } finally {

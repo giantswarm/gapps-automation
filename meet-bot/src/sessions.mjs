@@ -2,7 +2,7 @@
  * Meeting sessions: one per calendar event, scheduled, joined, talked into and left by a driver.
  *
  * The driver (see meet.mjs) is injected so the scheduling logic can be tested without a browser:
- *   driver.join(session) -> call
+ *   driver.join(session) -> call (gives up waiting to be admitted at session.leaveAt)
  *   call.say(text), call.isActive() -> boolean, call.leave()
  */
 
@@ -112,8 +112,9 @@ export class SessionManager {
         const existing = this.sessions.get(spec.id);
         if (existing && existing.state !== 'failed') {
             if (existing.state === 'scheduled') {
+                // keep messages queued via PATCH (e.g. an objection received before joining)
                 clearTimeout(existing.timer);
-                Object.assign(existing, spec, {queue: spec.greeting ? [spec.greeting] : []});
+                Object.assign(existing, spec);
                 this.schedule_(existing);
             }
             return {session: view_(existing), created: false};
@@ -121,7 +122,7 @@ export class SessionManager {
 
         const session = Object.assign({}, spec, {
             state: 'scheduled',
-            queue: spec.greeting ? [spec.greeting] : [],
+            queue: [],   // messages to post after the greeting
             createdAt: this.now(),
             joinedAt: null,
             endedAt: null,
@@ -229,6 +230,9 @@ export class SessionManager {
             session.state = 'in-call';
             session.joinedAt = this.now();
             this.log.info(`session ${session.id}: joined ${session.meetingUri}`);
+            if (session.greeting) {
+                session.queue.unshift(session.greeting);
+            }
 
             while (!session.leaveRequested && this.now() < session.leaveAt) {
                 await this.flush_(session, call);

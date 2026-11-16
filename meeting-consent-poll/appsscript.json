@@ -10,7 +10,8 @@
     "https://www.googleapis.com/auth/logging.write",
     "https://www.googleapis.com/auth/script.external_request",
     "https://www.googleapis.com/auth/script.scriptapp",
-    "https://www.googleapis.com/auth/script.storage"
+    "https://www.googleapis.com/auth/script.storage",
+    "https://www.googleapis.com/auth/spreadsheets"
   ],
   "exceptionLogging": "STACKDRIVER",
   "runtimeVersion": "V8",

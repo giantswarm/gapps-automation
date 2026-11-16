@@ -18,8 +18,10 @@
  *   - Creates the poll state (keyed by event ID) and tells the bot to join (idempotent PUT, re-sent
  *     on every run until shortly after the meeting started, so bot restarts are survived)
  *   - The bot greets the meeting with the consent question and a link to this script's web app
- *   - doGet() records responses (identifying the user via Session.getActiveUser()) and tells the bot
- *     about the first objection right away; the tally is posted when the bot leaves
+ *   - doGet() shows the question, the answer buttons call submitConsent() (identifying the user via
+ *     Session.getActiveUser()), which records the response, appends it to the consent log spreadsheet
+ *     (the durable documentation of consent) and tells the bot about the first objection right away;
+ *     the tally is posted when the bot leaves
  *
  * Note on async: lib.js is assembled with async/await stripped, so all lib calls are synchronous in
  * Apps Script. This file is written synchronously as well, which doGet() requires anyway.
@@ -74,9 +76,9 @@ const BOT_URL_KEY = PROPERTY_PREFIX + 'botUrl';
 /** Shared HMAC secret of the meet-bot control API (MEETBOT_SECRET, at least 32 characters). */
 const BOT_SECRET_KEY = PROPERTY_PREFIX + 'botSecret';
 
-/** Email of the bot account, excluded from the attendees.
+/** Email of the bot account, excluded from the attendees (in case it is invited).
  *
- * Default: the account executing the script (Session.getEffectiveUser())
+ * Default: none
  */
 const BOT_EMAIL_KEY = PROPERTY_PREFIX + 'botEmail';
 
@@ -97,6 +99,19 @@ const POLICY_URL_KEY = PROPERTY_PREFIX + 'policyUrl';
  * Default: ScriptApp.getService().getUrl()
  */
 const WEB_APP_URL_KEY = PROPERTY_PREFIX + 'webAppUrl';
+
+/** ID of the spreadsheet every response is appended to (the durable documentation of consent).
+ *
+ * The poll state in ScriptProperties is deleted after 48 hours, this log is kept. Required.
+ */
+const CONSENT_LOG_SPREADSHEET_ID_KEY = PROPERTY_PREFIX + 'consentLogSpreadsheetId';
+
+/** Name of the sheet in the consent log spreadsheet (created if missing). */
+const CONSENT_LOG_SHEET_NAME = 'Consent Log';
+
+/** Columns of the consent log. */
+const CONSENT_LOG_HEADER = ['Responded At', 'Respondent Email', 'Respondent Name', 'Consent', 'Meeting Title',
+    'Meeting Start', 'Meeting Link', 'Organizer', 'Event ID', 'Previous Answer'];
 
 /** The trigger handler function to call in time based triggers. */
 const TRIGGER_HANDLER_FUNCTION = 'checkUpcomingMeetings';
@@ -119,7 +134,6 @@ const JOIN_GRACE_MS = 10 * 60 * 1000;
 /** Web app query parameter names. */
 const PARAM_EVENT = 'e';
 const PARAM_TOKEN = 't';
-const PARAM_CONSENT = 'c';
 
 
 // ---------------------------------------------------------------------------
@@ -173,6 +187,7 @@ function checkUpcomingMeetings() {
         throw new Error('Web app URL unknown, deploy the web app or set ' + WEB_APP_URL_KEY);
     }
     getBotConfig_();   // fail early if the bot is not configured
+    getConsentLogSheet_();   // fail early if responses can not be documented
 
     Logger.log('Configured to handle accounts %s on domains %s, lookahead %s min, min attendees %s, join mode %s, web app %s',
         emailWhiteList.length ? emailWhiteList : '(all)', allowedDomains, '' + lookaheadMinutes, '' + minAttendees, joinMode, webAppUrl);
@@ -200,6 +215,8 @@ function checkUpcomingMeetings() {
 
     let firstError = null;
     let processedCount = 0;
+    const sentEventIds = new Set();
+    const failedOrganizers = new Set();
 
     for (const employee of activeEmployees) {
         const email = employee.attributes.email.value;
@@ -228,14 +245,17 @@ function checkUpcomingMeetings() {
                 try {
                     if (joinMode === 'all' || isRecordedMeeting_(context, email, event)) {
                         sendBot_(context, event);
+                        sentEventIds.add(event.id);
                     }
                 } catch (e) {
                     Logger.log('Failed to send the bot to event %s (%s): %s', event.id, event.summary, e);
+                    sentEventIds.add(event.id);   // unknown, leave the bot session alone
                     firstError = firstError || e;
                 }
             }
         } catch (e) {
             Logger.log('Failed to process calendar for user %s: %s', email, e);
+            failedOrganizers.add(email.toLowerCase());
             firstError = firstError || e;
         }
 
@@ -243,6 +263,15 @@ function checkUpcomingMeetings() {
     }
 
     Logger.log('Completed scanning %s of %s accounts', '' + processedCount, '' + activeEmployees.length);
+
+    // Meetings that were cancelled, moved or no longer qualify must not be joined
+    try {
+        cancelVanishedSessions_(now, sentEventIds, failedOrganizers, new Set(activeEmployees
+            .map(employee => employee.attributes.email.value.toLowerCase())));
+    } catch (e) {
+        Logger.log('Failed to cancel bot sessions of vanished meetings: %s', e);
+        firstError = firstError || e;
+    }
 
     // Cleanup old state entries
     cleanupOldState_();
@@ -363,9 +392,11 @@ function sendBot_(context, event) {
     const directory = getDirectory_(context, organizerEmail);
     const botEmail = getBotEmail_();
 
+    // drop rooms/resources, people who declined the invitation and the bot
     const attendees = (event.attendees || [])
+        .filter(a => !a.resource && a.responseStatus !== 'declined')
         .map(a => (a.email || '').toLowerCase())
-        .filter(e => !!e && !e.endsWith('calendar.google.com') && e !== botEmail);   // drop rooms/resources and the bot
+        .filter(e => !!e && !e.endsWith('calendar.google.com') && e !== botEmail);
 
     const names = {};
     for (const email of attendees) {
@@ -380,6 +411,7 @@ function sendBot_(context, event) {
         responses: {},
         createdAt: Date.now()
     }, {
+        botCancelled: false,
         meetingTitle: event.summary || '(No title)',
         meetingTime: event.start.dateTime,
         meetingUri: getMeetUri_(event),
@@ -431,10 +463,49 @@ function botSessionPath_(eventId) {
 }
 
 
+/** Cancel the bot for polls of meetings the bot has not joined yet that were not seen in this run.
+ *
+ * They were cancelled, moved out of the lookahead window or no longer qualify (e.g. recording switched
+ * off). The poll state is kept: if the meeting shows up again, the bot is sent again with the same link.
+ */
+function cancelVanishedSessions_(now, sentEventIds, failedOrganizers, scannedOrganizers) {
+    const properties = getScriptProperties_().getProperties() || {};
+    for (const key of Object.keys(properties)) {
+        if (!key.startsWith(STATE_KEY_PREFIX)) {
+            continue;
+        }
+        let state;
+        try {
+            state = JSON.parse(properties[key]);
+        } catch (e) {
+            continue;   // cleaned up by cleanupOldState_()
+        }
+        const organizer = (state.organizerEmail || '').toLowerCase();
+        const start = new Date(state.meetingTime).getTime();
+        if (state.botCancelled || sentEventIds.has(state.eventId) || !(start > now.getTime() + JOIN_LEAD_MS)   // not joined yet
+            || failedOrganizers.has(organizer) || !scannedOrganizers.has(organizer)) {
+            continue;
+        }
+
+        try {
+            callBot_('DELETE', botSessionPath_(state.eventId));
+        } catch (e) {
+            if (!/HTTP 404/.test('' + e)) {
+                throw e;
+            }
+        }
+        updateState_(state.eventId, current => current ? Object.assign(current, {botCancelled: true}) : null);
+        Logger.log('Cancelled the bot for event %s (%s): cancelled, moved or no longer qualifying', state.eventId, state.meetingTitle);
+    }
+}
+
+
 /** Call the meet-bot control API with a signed request (see meet-bot/src/auth.mjs), returns the parsed response. */
 function callBot_(method, path, payload) {
     const bot = getBotConfig_();
-    const body = payload === undefined ? '' : JSON.stringify(payload);
+    // ASCII only (non-ASCII escaped as \uXXXX), so the signed bytes are the same whatever charset UrlFetchApp uses
+    const body = payload === undefined ? '' : JSON.stringify(payload)
+        .replace(/[\u007f-\uffff]/g, c => '\\u' + ('000' + c.charCodeAt(0).toString(16)).slice(-4));
     const timestamp = '' + Math.floor(Date.now() / 1000);
     const signature = Utilities.computeHmacSha256Signature([timestamp, method, path, body].join('\n'), bot.secret,
         Utilities.Charset.UTF_8)
@@ -523,16 +594,12 @@ function countResponses_(state) {
 }
 
 
-/** Build the link to the poll page, with consent = true/false a link that records the answer. */
-function buildPollUrl_(webAppUrl, state, consent) {
-    const params = {
+/** Build the link to the poll page. */
+function buildPollUrl_(webAppUrl, state) {
+    return webAppUrl + UrlFetchJsonClient.buildQuery({
         [PARAM_EVENT]: state.eventId,
         [PARAM_TOKEN]: state.token
-    };
-    if (consent !== undefined) {
-        params[PARAM_CONSENT] = consent ? '1' : '0';
-    }
-    return webAppUrl + UrlFetchJsonClient.buildQuery(params);
+    });
 }
 
 
@@ -546,51 +613,43 @@ function displayName_(state, email) {
 // Web App: Response Handling
 // ---------------------------------------------------------------------------
 
-/** Web app entry point.
+/** Web app entry point: shows the question, the answer buttons and the current status.
  *
  * Deployment: execute as the deploying user, access restricted to the domain, so that
  * Session.getActiveUser().getEmail() identifies the responding person.
  *
- * Query parameters: e=<eventId>, t=<token>, c=1|0 (omit c to show the question and status).
+ * Query parameters: e=<eventId>, t=<token>. Answers are submitted with the buttons (submitConsent()),
+ * never by just opening a link, so link previews or crafted links can not record an answer.
  */
 function doGet(e) {
     const params = (e && e.parameter) || {};
     const eventId = params[PARAM_EVENT] || '';
     const token = params[PARAM_TOKEN] || '';
-    const consentParam = params[PARAM_CONSENT];
 
-    let userEmail = '';
-    try {
-        userEmail = (Session.getActiveUser().getEmail() || '').toLowerCase();
-    } catch (err) {
-        Logger.log('Failed to determine active user: %s', err);
+    const state = eventId && token ? loadState_(eventId) : null;
+    if (!state || state.token !== token) {
+        return renderPage_('<p>This consent poll is no longer active or the link is invalid.</p>');
     }
 
-    if (!eventId) {
-        return renderPage_('Recording Consent', '<p>Missing poll reference.</p>');
+    return renderPage_(buildQuestionHtml_(state) + '<div id="result">'
+        + buildStatusHtml_(state, getActiveUserEmail_()) + '</div>', {eventId: eventId, token: token});
+}
+
+
+/** Called from the web app page (google.script.run): records the answer of the signed in user, returns HTML. */
+function submitConsent(eventId, token, consent) {
+    const userEmail = getActiveUserEmail_();
+    if (typeof eventId !== 'string' || typeof token !== 'string' || typeof consent !== 'boolean') {
+        throw new Error('Invalid request');
     }
-
-    const state = loadState_(eventId);
-    if (!state || !token || state.token !== token) {
-        return renderPage_('Recording Consent', '<p>This consent poll is no longer active or the link is invalid.</p>');
-    }
-
-    const webAppUrl = getWebAppUrl_();
-
-    if (consentParam === undefined) {
-        return renderPage_('Recording Consent', buildQuestionHtml_(state, webAppUrl) + buildStatusHtml_(state, userEmail));
-    }
-
     if (!userEmail) {
-        return renderPage_('Recording Consent',
-            '<p>Could not determine your identity. Please open this link in a browser signed in with your '
-            + escapeHtml_(state.organizerEmail.split('@')[1]) + ' account.</p>');
+        return '<p class="no">Could not determine your identity. Please open the link in a browser signed in with your '
+            + 'company account.</p>';
     }
 
-    const consent = consentParam === '1';
-    const updated = recordResponse_(eventId, userEmail, consent);
+    const updated = recordResponse_(eventId, token, userEmail, consent);
     if (!updated) {
-        return renderPage_('Recording Consent', '<p>This consent poll is no longer active.</p>');
+        return '<p class="no">This consent poll is no longer active or the link is invalid.</p>';
     }
 
     let notice = '';
@@ -603,36 +662,86 @@ function doGet(e) {
     }
 
     const headline = consent
-        ? '<p class="ok">✅ Thank you, your consent has been recorded.</p>'
-        : '<p class="no">❌ Thank you, your objection has been recorded. The meeting has been informed (without your name).</p>';
+        ? '<p class="ok">✅ Thank you, your consent has been recorded. You can withdraw it on this page for the next two days, later please contact the organizer.</p>'
+        : '<p class="no">❌ Thank you, your objection has been recorded. The meeting is informed (without your name).</p>';
 
-    return renderPage_('Recording Consent', headline + notice + buildQuestionHtml_(updated.state, webAppUrl)
-        + buildStatusHtml_(updated.state, userEmail));
+    return headline + notice + buildStatusHtml_(updated.state, userEmail);
 }
 
 
-/** Record a response under a script lock, returns {previous, state} or null if the poll is gone. */
-function recordResponse_(eventId, userEmail, consent) {
+/** The email of the person using the web app (lower case), or '' if unknown. */
+function getActiveUserEmail_() {
+    try {
+        return (Session.getActiveUser().getEmail() || '').toLowerCase();
+    } catch (err) {
+        Logger.log('Failed to determine active user: %s', err);
+        return '';
+    }
+}
+
+
+/** Record a response under a script lock and document it, returns {previous, state} or null if the poll is gone. */
+function recordResponse_(eventId, token, userEmail, consent) {
     let previous = null;
     const state = updateState_(eventId, state => {
-        if (!state) {
+        if (!state || state.token !== token) {
             return null;
         }
         previous = JSON.parse(JSON.stringify(state));
-        state.responses = state.responses || {};
-        state.responses[userEmail] = {
+        const response = {
             consent: consent,
             name: state.names?.[userEmail] || userEmail,
             respondedAt: Date.now()
         };
+
+        // Document first: an answer that can not be documented is not recorded either (the user sees an error)
+        appendConsentLog_(state, userEmail, response, previous.responses?.[userEmail]);
+
+        state.responses = state.responses || {};
+        state.responses[userEmail] = response;
         return state;
     });
     return state ? {previous: previous, state: state} : null;
 }
 
 
+/** Append a response to the consent log spreadsheet (the durable documentation, kept after the poll state is gone). */
+function appendConsentLog_(state, userEmail, response, previousResponse) {
+    const previousAnswer = !previousResponse ? '' : (previousResponse.consent ? 'consent' : 'no consent');
+    getConsentLogSheet_().appendRow([
+        new Date(response.respondedAt),
+        userEmail,
+        response.name,
+        response.consent ? 'consent' : 'no consent',
+        state.meetingTitle,
+        state.meetingTime ? new Date(state.meetingTime) : '',
+        state.meetingUri || '',
+        state.organizerEmail,
+        state.eventId,
+        previousAnswer
+    ].map(value => typeof value === 'string' && /^[=+\-@]/.test(value) ? "'" + value : value));   // no formula injection
+}
+
+
+/** The consent log sheet (created with a header row if missing), throws if not configured. */
+function getConsentLogSheet_() {
+    const spreadsheetId = (getScriptProperties_().getProperty(CONSENT_LOG_SPREADSHEET_ID_KEY) || '').trim();
+    if (!spreadsheetId) {
+        throw new Error('Consent log not configured, set ' + CONSENT_LOG_SPREADSHEET_ID_KEY);
+    }
+    const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+    let sheet = spreadsheet.getSheetByName(CONSENT_LOG_SHEET_NAME);
+    if (!sheet) {
+        sheet = spreadsheet.insertSheet(CONSENT_LOG_SHEET_NAME);
+        sheet.appendRow(CONSENT_LOG_HEADER);
+        sheet.setFrozenRows(1);
+    }
+    return sheet;
+}
+
+
 /** Render the question with the answer buttons. */
-function buildQuestionHtml_(state, webAppUrl) {
+function buildQuestionHtml_(state) {
     const purpose = (getScriptProperties_().getProperty(RECORDING_PURPOSE_KEY) || '').trim();
     const policyUrl = (getScriptProperties_().getProperty(POLICY_URL_KEY) || '').trim();
 
@@ -640,11 +749,12 @@ function buildQuestionHtml_(state, webAppUrl) {
     return '<h2>' + escapeHtml_(state.meetingTitle) + '</h2>'
         + '<p class="muted">' + escapeHtml_(formatMeetingTime_(state.meetingTime)) + '</p>'
         + '<p>This meeting may be recorded' + (purpose ? ' ' + escapeHtml_(purpose) : '') + '. '
-        + 'Do you consent to being recorded? Saying no has no disadvantages for you.'
+        + 'Do you consent to being recorded? Saying no has no disadvantages for you. '
+        + 'You can change your answer on this page for two days after the meeting was scheduled.'
         + (policyUrl ? ' See the <a target="_top" href="' + escapeHtml_(policyUrl) + '">recording policy</a>.' : '')
         + '</p><p>'
-        + '<a class="button ok" target="_top" href="' + escapeHtml_(buildPollUrl_(webAppUrl, state, true)) + '">✅ I consent</a> '
-        + '<a class="button no" target="_top" href="' + escapeHtml_(buildPollUrl_(webAppUrl, state, false)) + '">❌ I do not consent</a>'
+        + '<button class="button ok" onclick="answer(true)">✅ I consent</button> '
+        + '<button class="button no" onclick="answer(false)">❌ I do not consent</button>'
         + '</p>';
 }
 
@@ -674,15 +784,29 @@ function buildStatusHtml_(state, userEmail) {
 }
 
 
-/** Wrap body HTML into a minimal page. */
-function renderPage_(title, bodyHtml) {
+/** Wrap body HTML into a minimal page, with poll = {eventId, token} including the answer script. */
+function renderPage_(bodyHtml, poll) {
+    const title = 'Recording Consent';
+    // answer() submits via google.script.run (a POST as the signed in user) and shows the result
+    const script = !poll ? '' : '<script>const poll = ' + JSON.stringify(poll).replace(/</g, '\\u003c') + ';'
+        + 'function answer(consent) {'
+        + '  const result = document.getElementById("result");'
+        + '  document.querySelectorAll("button").forEach(b => b.disabled = true);'
+        + '  result.innerHTML = "<p class=\\"muted\\">Saving ...</p>";'
+        + '  google.script.run'
+        + '    .withSuccessHandler(html => { result.innerHTML = html; document.querySelectorAll("button").forEach(b => b.disabled = false); })'
+        + '    .withFailureHandler(err => { result.textContent = "Your answer could not be saved, please try again: " + err.message;'
+        + '      document.querySelectorAll("button").forEach(b => b.disabled = false); })'
+        + '    .submitConsent(poll.eventId, poll.token, consent);'
+        + '}</script>';
     const html = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
-        + '<title>' + escapeHtml_(title) + '</title>'
+        + '<title>' + title + '</title>'
         + '<style>body{font-family:system-ui,sans-serif;max-width:40em;margin:2em auto;padding:0 1em;color:#222}'
         + 'table{border-collapse:collapse}td{padding:.25em .75em .25em 0}.ok{color:#1b7f3b;font-weight:bold}'
         + '.no{color:#b3261e;font-weight:bold}.muted{color:#666}'
-        + '.button{display:inline-block;padding:.5em 1em;margin:0 .5em .5em 0;border:2px solid;border-radius:.5em;text-decoration:none}</style></head>'
-        + '<body><h1>' + escapeHtml_(title) + '</h1>' + bodyHtml + '</body></html>';
+        + '.button{display:inline-block;padding:.5em 1em;margin:0 .5em .5em 0;border:2px solid;border-radius:.5em;'
+        + 'background:#fff;font:inherit;cursor:pointer}.button:disabled{opacity:.5;cursor:wait}</style>' + script + '</head>'
+        + '<body><h1>' + title + '</h1>' + bodyHtml + '</body></html>';
     return HtmlService.createHtmlOutput(html).setTitle(title);
 }
 
@@ -831,18 +955,10 @@ function getBotConfig_() {
     return {url: url, secret: secret};
 }
 
-/** Get the bot account email (property override, else the executing account). */
+/** Get the bot account email ('' if not configured). */
 function getBotEmail_() {
     const configured = (getScriptProperties_().getProperty(BOT_EMAIL_KEY) || '').trim().toLowerCase();
-    if (configured) {
-        return configured;
-    }
-    try {
-        return (Session.getEffectiveUser().getEmail() || '').trim().toLowerCase();
-    } catch (e) {
-        Logger.log('Failed to determine the executing account: %s', e);
-        return '';
-    }
+    return configured;
 }
 
 /** Get the web app URL (property override, else the deployed web app URL, else null). */

@@ -135,7 +135,11 @@ export class MeetDriver {
 
             // Either joined directly (same domain, trusted access) or waiting in the lobby until admitted
             const leaveButton = page.getByRole('button', {name: LEAVE_CALL});
-            await leaveButton.or(refused).first().waitFor({timeout: this.admitTimeoutMs});
+            const admitTimeout = Math.max(1000, Math.min(this.admitTimeoutMs, session.leaveAt - Date.now()));
+            await leaveButton.or(refused).first().waitFor({timeout: admitTimeout})
+                .catch(() => {
+                    throw new Error('not admitted to the meeting in time');
+                });
             await throwIfRefused_(refused);
             await turnOffMedia_(page);
 

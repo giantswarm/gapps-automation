@@ -29,16 +29,23 @@ visibly and writes into the meeting chat, remote controlled by this script.
 2. With `joinMode` `recorded` (default) only meetings that will be recorded qualify: automatic
    recording, transcription or Gemini notes are enabled for the Meet space (Meet REST API
    `spaces.get`, impersonating the organizer), or the event description contains `#consent-poll`.
-3. The poll state (attendees, names, responses, random token) is stored in ScriptProperties keyed by
-   event ID and the bot is told to join (`PUT /v1/sessions/{eventId}`, signed with `botSecret`).
-   This is repeated on every run, the bot ignores sessions it already knows.
+3. The poll state (attendees who did not decline, names, responses, random token) is stored in
+   ScriptProperties keyed by event ID and the bot is told to join (`PUT /v1/sessions/{eventId}`, signed
+   with `botSecret`). This is repeated on every run, the bot ignores sessions it already joined.
+   Meetings that have not started yet and disappear from the scan (cancelled, moved later, recording
+   switched off) are cancelled at the bot (`DELETE`).
 4. The bot joins one minute before the meeting starts and posts the question with a link to this
    script's web app. External guests are asked to answer in the chat.
-5. `doGet()` shows the question with "I consent" / "I do not consent" buttons, identifies the person
-   via `Session.getActiveUser()`, records the answer (it can be changed later) and updates the bot:
-   the first objection is announced in the meeting right away (without the name), as is consent of
-   all invited participants. The tally is posted when the bot leaves (after `stayMinutes`).
-6. State is cleaned up after 48 hours.
+5. `doGet()` shows the question with "I consent" / "I do not consent" buttons. Only pressing a button
+   records an answer (`submitConsent()` via `google.script.run`), opening a link never does. The
+   person is identified via `Session.getActiveUser()`. The answer can be changed (withdrawn) later.
+6. Every answer is appended to the **consent log** spreadsheet (time, person, answer, meeting, previous
+   answer) before it counts: this is the documentation of consent, if the log can not be written the
+   answer is rejected. Then the bot is updated: the first objection is announced in the meeting right
+   away (without the name), as is consent of all invited participants. The tally is posted when the
+   bot leaves (after `stayMinutes`).
+7. Poll state is cleaned up after 48 hours, the consent log is kept (define its retention in the
+   recording policy).
 
 ## Deployment
 
@@ -62,7 +69,11 @@ visibly and writes into the meeting chat, remote controlled by this script.
    cd meeting-consent-poll && clasp deploy --description "consent web app"
    ```
 
-5. Set properties:
+5. Create the consent log spreadsheet (e.g. in an HR shared drive with restricted access), share it
+   with edit access to the account deploying the script and note its ID (from the URL). The sheet
+   `Consent Log` is created on first use.
+
+6. Set properties:
    ```bash
    clasp run 'setProperties' --params '[{
      "ConsentPoll.personioToken": "CLIENT_ID|CLIENT_SECRET",
@@ -71,7 +82,8 @@ visibly and writes into the meeting chat, remote controlled by this script.
      "ConsentPoll.emailWhiteList": "tester@example.com",
      "ConsentPoll.webAppUrl": "https://script.google.com/a/macros/example.com/s/.../exec",
      "ConsentPoll.botUrl": "https://meet-bot.example.com",
-     "ConsentPoll.botSecret": "SAME AS MEETBOT_SECRET"
+     "ConsentPoll.botSecret": "SAME AS MEETBOT_SECRET",
+     "ConsentPoll.consentLogSpreadsheetId": "SPREADSHEET ID"
    }, false]'
    ```
    Optional:
@@ -80,17 +92,17 @@ visibly and writes into the meeting chat, remote controlled by this script.
    - `ConsentPoll.policyUrl`: link to the recording policy
    - `ConsentPoll.stayMinutes` (default 10), `ConsentPoll.lookaheadMinutes` (default 15),
      `ConsentPoll.minAttendees` (default 2)
-   - `ConsentPoll.botEmail`: the bot account, excluded from the attendees (default: the account
-     running the script)
+   - `ConsentPoll.botEmail`: the bot account, excluded from the attendees in case it is invited
 
-6. Test: `clasp run 'listBotSessions'` checks the connection to the bot. Then create a meeting
+7. Test: `clasp run 'listBotSessions'` checks the connection to the bot. Then create a meeting
    with a Meet link and `#consent-poll` in the description, starting in a few minutes, and run
    ```bash
    clasp run 'checkUpcomingMeetings'
    ```
-   Join the meeting, the bot should show up a minute before the start and ask. Answer via the link.
+   Join the meeting, the bot should show up a minute before the start and ask. Answer via the link
+   and check the consent log.
 
-7. Install the trigger (the interval must be shorter than `lookaheadMinutes`):
+8. Install the trigger (the interval must be shorter than `lookaheadMinutes`):
    ```bash
    clasp run 'install' --params '[5]'
    ```

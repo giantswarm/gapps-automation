@@ -14,9 +14,10 @@ nor heard, and it records nothing.
 1. The Apps Script `PUT`s a session per calendar event (re-sent on every trigger run, idempotent).
 2. At `joinAt` (1 minute before the meeting) the bot opens the Meet link signed in as the bot
    account, continues without camera and microphone and joins (or asks to join and waits up to
-   10 minutes to be admitted).
+   10 minutes, at most until `leaveAt`, to be admitted).
 3. It posts the `greeting` (the consent question with a link to the poll web app) into the chat.
-4. Messages sent with `PATCH {say}` are posted right away (e.g. "a participant does not consent").
+4. Messages sent with `PATCH {say}` are posted right away, or right after the greeting when they
+   arrive before joining (e.g. "a participant does not consent").
 5. At `leaveAt` (default 10 minutes, at the latest at the meeting end) it posts the latest
    `farewell` (the tally) and leaves. It leaves without a farewell when removed from the call or on `DELETE`.
 

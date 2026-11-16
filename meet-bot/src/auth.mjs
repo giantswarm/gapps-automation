@@ -5,7 +5,7 @@
  *   X-MeetBot-Timestamp: <unix seconds>
  *   X-MeetBot-Signature: sha256=<hex HMAC-SHA256(secret, timestamp + "\n" + METHOD + "\n" + path + "\n" + body)>
  *
- * The Apps Script side (meeting-consent-poll/ConsentPoll.js, signBotRequest_()) computes the same.
+ * The Apps Script side (meeting-consent-poll/ConsentPoll.js, callBot_()) computes the same.
  */
 import {createHmac, timingSafeEqual} from 'node:crypto';
 
