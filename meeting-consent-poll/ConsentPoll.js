@@ -2,8 +2,8 @@
  * Meeting Recording Consent Poll
  *
  * Asks every attendee of Google Meet meetings that may be recorded (automatic recording, transcription
- * or Gemini notes enabled, or opted in via a marker in the event description) for consent before the
- * meeting, by email with a personal link to this script's web app, and documents every answer.
+ * or Gemini notes enabled) for consent before the meeting, by email with a personal link to this script's
+ * web app, and documents every answer.
  *
  * Runs entirely in Apps Script:
  *   - checkUpcomingMeetings() (time trigger) scans the primary calendars of the organizers for qualifying
@@ -68,7 +68,7 @@ const MIN_ATTENDEES_KEY = PROPERTY_PREFIX + 'minAttendees';
 /** Which meetings get a consent poll: 'recorded' or 'all'.
  *
  * 'recorded': automatic recording, transcription or notes are enabled for the Meet space (Meet REST API,
- * impersonating the organizer), or the event description contains OPT_IN_MARKER.
+ * impersonating the organizer). 'all': every qualifying meeting.
  *
  * Default: 'recorded'
  */
@@ -145,9 +145,6 @@ const MAX_STATE_CHUNKS = 12;
 
 /** Log a warning when the script properties grow beyond this size (ScriptProperties allow 500 KB in total). */
 const PROPERTIES_WARN_BYTES = 400 * 1024;
-
-/** Event description marker to request a poll for a meeting without automatic recording. */
-const OPT_IN_MARKER = '#consent-poll';
 
 /** Start of the notice added to event descriptions, also used to detect it. */
 const NOTICE_MARKER = 'Recording consent notice:';
@@ -359,10 +356,6 @@ function getMeetingCode_(event) {
 }
 
 
-/** Whether the event description contains the opt-in marker. */
-function hasOptInMarker_(event) {
-    return (event.description || '').toLowerCase().includes(OPT_IN_MARKER);
-}
 
 
 /** The labels of the automatic artifacts switched on for a Meet space (e.g. ['recording', 'Gemini notes']). */
@@ -402,16 +395,15 @@ function processEvent_(context, calendar, event) {
     const config = context.config;
     const organizerEmail = event.organizer.email.toLowerCase();
     const existing = loadState_(event.id);
-    const marker = hasOptInMarker_(event);
 
     // The Meet space is needed to know whether the meeting is recorded and to enforce standing objections
-    const needSpace = (config.joinMode === 'recorded' && !marker)
+    const needSpace = config.joinMode === 'recorded'
         || (!!existing && config.disableRecording && hasObjection_(existing));
     const space = needSpace ? getSpace_(context, organizerEmail, existing?.space || getMeetingCode_(event)) : null;
     const autoArtifacts = getAutoArtifacts_(space);
 
     let recorded;
-    if (config.joinMode === 'all' || marker) {
+    if (config.joinMode === 'all') {
         recorded = true;
     } else if (space) {
         // recording switched off by us due to an objection keeps the poll going
@@ -420,8 +412,8 @@ function processEvent_(context, calendar, event) {
         recorded = !!existing?.active;   // unknown, keep as is
     }
 
-    Logger.log('Event %s (%s) by %s: automatic %s, marker %s, poll %s', event.id, event.summary, organizerEmail,
-        space ? (autoArtifacts.join('/') || 'none') : '(unknown)', '' + marker, recorded ? 'active' : 'not needed');
+    Logger.log('Event %s (%s) by %s: automatic %s, poll %s', event.id, event.summary, organizerEmail,
+        space ? (autoArtifacts.join('/') || 'none') : '(unknown)', recorded ? 'active' : 'not needed');
 
     if (!recorded) {
         if (existing?.active) {

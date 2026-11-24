@@ -1,8 +1,7 @@
 # Meeting Recording Consent Poll
 
 Asks every attendee of Google Meet meetings that may be recorded (automatic recording, transcription or
-Gemini notes enabled, or opted in with `#consent-poll` in the event description) for consent **before
-the meeting**, by email with a personal link, and documents every answer. Runs entirely in Google Apps
+Gemini notes enabled) for consent **before the meeting**, by email with a personal link, and documents every answer. Runs entirely in Google Apps
 Script, no external service.
 
 Legal background: [giantswarm/giantswarm#35534](https://github.com/giantswarm/giantswarm/issues/35534)
@@ -25,8 +24,7 @@ browser-based bot; that was dropped in favour of asking by email ahead of time.
    timed, not cancelled, have a Google Meet link and at least `minAttendees` attendees.
 2. **Qualify**: with `joinMode` `recorded` (the default), a meeting qualifies when automatic recording,
    transcription or Gemini notes are `ON` for its Meet space, read via Meet REST API `spaces.get` as the
-   organizer. It also qualifies when the description contains `#consent-poll`. `joinMode` `all` polls
-   every meeting.
+   organizer. `joinMode` `all` polls every meeting.
 3. **Poll state**: stored in ScriptProperties as `state.<eventId>`. It holds the meeting data and, for
    each attendee, a random personal token (122-bit secure UUID), the name, the invitation time and the
    answer. Rooms, declined attendees and the sender account are skipped. Updates happen under a script
@@ -191,8 +189,8 @@ REST API, Gmail API.
 
 With `emailWhiteList` set to the tester as organizer:
 
-1. Create a meeting starting in 2 hours with a Meet link, `#consent-poll` in the description, a second
-   internal attendee and a private external address as guest. Run `clasp run checkUpcomingMeetings`.
+1. Create a meeting starting in 2 hours with a Meet link and automatic recording, transcription or
+   Gemini notes switched on (or set `joinMode` `all` for the test), a second internal attendee and a private external address as guest. Run `clasp run checkUpcomingMeetings`.
    Expect: one invitation per attendee from the sender (check subject umlauts, `Reply-To`, time zone),
    the notice in the event description, and no update email to attendees. Running again sends nothing
    new.
@@ -221,7 +219,7 @@ With `emailWhiteList` set to the tester as organizer:
 - Recording or transcription started manually during the meeting isn't prevented. Switching off
   automatic recording only changes the space configuration for when someone with recording rights
   joins; a recording that is already running isn't stopped. The organizer remains responsible. Meetings
-  that are only recorded manually are covered with `#consent-poll` or `joinMode` `all`.
+  that are only recorded manually are only covered with `joinMode` `all`.
 - Switching off fails if the organizer doesn't own the Meet space (for example a link pasted from
   another meeting). The organizer is then told to check the settings themselves.
 - Only meetings organized by active employees on `allowedDomains` are handled. Recurring meetings are
