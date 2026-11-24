@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Added
 
 - Fall back to `out` time-off type if calendar event type is `outOfOffice` https://github.com/giantswarm/giantswarm/issues/26484 
+- ai-cost: ChatGPT Business invoices update the `chatgpt` seat rows like the Claude Team invoices (#436).
+- ai-cost: temporary `backfillChatGptInvoices2026()` to import the 2026 ChatGPT Business invoices.
+
+## Fixed
+
+- ai-cost: invoices are recorded whatever their date of issue, so invoices forwarded weeks later are no longer skipped.
 
 ## [0.1.1] - 2023-04-26
 

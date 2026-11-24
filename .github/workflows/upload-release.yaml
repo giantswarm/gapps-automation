@@ -6,6 +6,8 @@ jobs:
   upload_release_files:
     name: Upload Release Files
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout Sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -13,7 +15,7 @@ jobs:
         run: make lib
       - name: Upload Files to Release
         env:
-          GITHUB_TOKEN: "${{ secrets.TAYLORBOT_GITHUB_ACTION }}"
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
           VERSION: "${{ github.event.release.name }}"
         run: |
           RELEASE="$(gh release list | grep "$VERSION")"

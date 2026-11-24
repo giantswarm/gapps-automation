@@ -776,7 +776,7 @@ async function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeCon
                     // need to convert to be able to compare start/end timestamps (Personio is whole-day/half-day only)
                     const updatedTimeOff = convertOutOfOfficeToTimeOff_(timeOffTypeConfig, employee, event, timeOff);
                     if (updatedTimeOff
-                        && (!updatedTimeOff.startAt.equals(timeOff.startAt) || !updatedTimeOff.endAt.equals(timeOff.endAt) || updatedTimeOff.typeId !== timeOff.typeId)) {
+                        && (timeOff.isOpenEnded || !updatedTimeOff.startAt.equals(timeOff.startAt) || !updatedTimeOff.endAt.equals(timeOff.endAt) || updatedTimeOff.typeId !== timeOff.typeId)) {
                         // start/end timestamps differ, now check which (Personio/Google Calendar) has more recent changes
                         if (timeOff.updatedAt >= eventUpdatedAt) {
                             isOk = await syncActionUpdateEvent_(calendar, primaryEmail, event, timeOff);
@@ -822,7 +822,8 @@ async function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeCon
         const skipDueToFail = syncFailUpdatedAt != null && syncFailUpdatedAt === +timeOff.updatedAt;
 
         // check for dead zone
-        if (!skipDueToFail && timeOff.employeeId === employeeId && timeOff.updatedAt <= updateMax && !processedTimeOffIds[timeOff.id]) {
+        if (!skipDueToFail && timeOff.employeeId === employeeId && timeOff.updatedAt <= updateMax && !processedTimeOffIds[timeOff.id]
+            && !isOpenEndedBeforeTimeMin_(timeOff, fetchTimeMin)) {
 
             if (Date.now() >= deadlineTs) {
                 if (failCount > 0) {
@@ -842,6 +843,16 @@ async function syncTimeOffs_(personio, calendar, employee, epoch, timeOffTypeCon
         putFailedSyncs_(primaryEmail, failedSyncs);
     }
     return true;
+}
+
+
+/** Check if an open-ended time-off's assumed single day lies before the event fetch window.
+ *
+ * Such time-offs may still be returned by Personio, but the corresponding event would never be found again
+ * in Google Calendar, leading to a new event being inserted on every run.
+ */
+function isOpenEndedBeforeTimeMin_(timeOff, timeMin) {
+    return !!timeOff.isOpenEnded && new Date(timeOff.endAt.switchHour24ToHour0().toISOString()) <= timeMin;
 }
 
 
@@ -1006,9 +1017,13 @@ function normalizePersonioTimeOffPeriod_(timeOffPeriod) {
 
     const attributes = timeOffPeriod.attributes || {};
 
+    // Personio supports open-ended time-offs (no end_date), which we can't represent in Google Calendar.
+    // Assume a single day, to get the event synced to Google Calendar, from where it then overwrites the time-off.
+    const isOpenEnded = !attributes.end_date;
+
     // parse start/end dates assuming whole-days
     const startAt = PeopleTime.fromISO8601(attributes.start_date, 0);
-    const endAt = PeopleTime.fromISO8601(attributes.end_date, 24);
+    const endAt = PeopleTime.fromISO8601(isOpenEnded ? attributes.start_date : attributes.end_date, 24);
 
     // Handle "half day logic"
     // NOTE: Full addHours() calculations shouldn't be required,
@@ -1041,8 +1056,14 @@ function normalizePersonioTimeOffPeriod_(timeOffPeriod) {
         Util.addDateMillies(updatedAt, -1 * 60 * 60 * 1000);
     }
 
+    if (isOpenEnded) {
+        // very early modification date, so the Google Calendar event always wins
+        updatedAt.setTime(0);
+    }
+
     return {
         id: attributes.id,
+        isOpenEnded: isOpenEnded,
         startAt: startAt,
         endAt: endAt,
         typeId: attributes.time_off_type?.attributes.id,
