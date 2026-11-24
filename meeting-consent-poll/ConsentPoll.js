@@ -219,8 +219,11 @@ function checkUpcomingMeetings_() {
     }
     getConsentLogSheet_();   // fail early if responses can not be documented
 
-    const isEmailAllowed = email => (!config.emailWhiteList.length || config.emailWhiteList.includes(email))
-        && config.allowedDomains.some(domain => email.endsWith('@' + domain));
+    const isEmailAllowed = rawEmail => {
+        const email = (rawEmail || '').trim().toLowerCase();
+        return (!config.emailWhiteList.length || config.emailWhiteList.includes(email))
+            && config.allowedDomains.some(domain => email.endsWith('@' + domain));
+    };
 
     Logger.log('Configured to handle accounts %s on domains %s, lookahead %s h, summary %s min before, min attendees %s, '
         + 'join mode %s, sender %s, calendar notice %s, disable recording on objection %s, web app %s',
@@ -248,7 +251,7 @@ function checkUpcomingMeetings_() {
     const fail = (e) => context.firstError = context.firstError || e;
 
     for (const employee of activeEmployees) {
-        const email = employee.attributes.email.value.toLowerCase();
+        const email = employee.attributes.email.value.trim().toLowerCase();
         try {
             const calendar = CalendarClient.withImpersonatingService(context.creds, email);
             // lists events ending after timeMin, so ongoing meetings are included
@@ -1619,8 +1622,8 @@ function loadConfig_() {
     }
 
     return {
-        allowedDomains: list(ALLOWED_DOMAINS_KEY),
-        emailWhiteList: list(EMAIL_WHITELIST_KEY),
+        allowedDomains: list(ALLOWED_DOMAINS_KEY).map(v => v.toLowerCase()),
+        emailWhiteList: list(EMAIL_WHITELIST_KEY).map(v => v.toLowerCase()),
         lookaheadHours: getPositiveIntProperty_(LOOKAHEAD_HOURS_KEY, 24),
         summaryMinutes: getPositiveIntProperty_(SUMMARY_MINUTES_KEY, 15),
         minAttendees: getPositiveIntProperty_(MIN_ATTENDEES_KEY, 2),
